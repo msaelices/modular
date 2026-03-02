@@ -2650,10 +2650,16 @@ fn _to_string_list[
 
 
 @always_inline
-fn _unsafe_strlen(
-    ptr: UnsafePointer[mut=False, Byte], max: Optional[UInt] = None
-) -> UInt:
+fn _unsafe_strlen[
+    simd_width: Int = simd_width_of[DType.bool]()
+](ptr: UnsafePointer[mut=False, Byte], max: Optional[UInt] = None) -> UInt:
     """Get the length of a null-terminated string from a pointer.
+
+    Parameters:
+        simd_width: The SIMD vector width to use for bulk scanning. Defaults
+            to `simd_width_of[DType.bool]()`. Callers can pass a smaller value
+            (e.g. 32) on platforms where the widest SIMD width is slower than
+            narrower alternatives (e.g. early AVX-512 CPUs).
 
     Args:
         ptr: The null-terminated pointer to the string.
@@ -2675,23 +2681,22 @@ fn _unsafe_strlen(
         while offset < bound and ptr[offset]:
             offset += 1
         return offset
-    return _unsafe_strlen_impl(ptr, bound)
+    return _unsafe_strlen_impl[simd_width](ptr, bound)
 
 
-fn _unsafe_strlen_impl(
-    ptr: UnsafePointer[mut=False, Byte], max: UInt
-) -> UInt:
+fn _unsafe_strlen_impl[
+    simd_width: Int
+](ptr: UnsafePointer[mut=False, Byte], max: UInt) -> UInt:
     """SIMD-accelerated helper for `_unsafe_strlen`.
 
     Scans for a null byte using SIMD-width blocks, then a scalar tail for any
     remaining bytes within `max`. When `max == UInt.MAX` the scan is
     unbounded; all other values cap the scan to at most `max` bytes.
 
-    The SIMD width matches `_memchr_impl` (`simd_width_of[DType.bool]()`),
-    keeping SIMD behaviour consistent across stdlib string search helpers.
+    Parameters:
+        simd_width: The SIMD vector width to use for bulk scanning.
     """
-    comptime bool_mask_width = simd_width_of[DType.bool]()
-    var zero = SIMD[DType.uint8, bool_mask_width](0)
+    var zero = SIMD[DType.uint8, simd_width](0)
 
     # UInt.MAX is the sentinel for "no bound" (see _unsafe_strlen docstring).
     if max == UInt.MAX:
@@ -2700,17 +2705,17 @@ fn _unsafe_strlen_impl(
         # containing a null is found.
         var i = 0
         while True:
-            var block = ptr.load[width=bool_mask_width](i)
+            var block = ptr.load[width=simd_width](i)
             var bool_mask = block.eq(zero)
             var mask = pack_bits(bool_mask)
             if mask:
                 return UInt(i) + UInt(count_trailing_zeros(mask))
-            i += bool_mask_width
+            i += simd_width
 
     # Bounded case: process only complete SIMD blocks that fit within max.
-    var vectorized_end = align_down(Int(max), bool_mask_width)
-    for i in range(0, vectorized_end, bool_mask_width):
-        var block = ptr.load[width=bool_mask_width](i)
+    var vectorized_end = align_down(Int(max), simd_width)
+    for i in range(0, vectorized_end, simd_width):
+        var block = ptr.load[width=simd_width](i)
         var bool_mask = block.eq(zero)
         var mask = pack_bits(bool_mask)
         if mask:
