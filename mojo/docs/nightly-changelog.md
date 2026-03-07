@@ -58,6 +58,10 @@ This version is still a work in progress.
 - Subscripting `String` and `StringSlice` now requires a named parameter for range
   indexing, for example `s[1:3]` is now `s[byte=1:3]`.
 
+- Added `bit_mask[dtype](start, end)` to `std.bit`. Returns a `Scalar[dtype]`
+  with bits in the half-open range `[start, end)` set to 1 and all other bits
+  set to 0. Asserts that `0 <= start < end <= bitwidth(dtype)`.
+
 ## Tooling changes
 
 ## ❌ Removed
