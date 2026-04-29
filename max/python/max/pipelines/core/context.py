@@ -100,6 +100,16 @@ class TextContext:
     which blocks are available in the external BlockStore system.
     """
 
+    cached_prefix_length: int | None = field(default=None)
+    """How many prompt tokens were served from the KV prefix cache.
+
+    Set by the block manager when a request is admitted to a CE batch
+    (0 if the cache had no matching prefix). ``BatchMetrics.create``
+    consumes the value to emit a per-request cache hit rate observation,
+    then resets it to ``None`` so chunked-prefill follow-up calls do not
+    re-emit.
+    """
+
     def __post_init__(self) -> None:
         """Initialize context state after deserialization.
 
@@ -243,7 +253,6 @@ class TextContext:
         self,
         new_token: int,
         log_probabilities: LogProbabilities | None = None,
-        mark_previous_as_processed: bool = True,
     ) -> None:
         """Advance the token buffer without touching FSM state.
 
@@ -260,9 +269,6 @@ class TextContext:
         Args:
             new_token: The token to append to the buffer.
             log_probabilities: Optional log probabilities for this token.
-            mark_previous_as_processed: If True, mark previous tokens as
-                processed (standard behavior). If False, keep them unprocessed
-                so they're returned to the user (used for jump-ahead tokens).
         """
         if self.tokens.actively_chunked:
             self.tokens.advance_chunk()
@@ -276,9 +282,7 @@ class TextContext:
         if self.tokens.all[-1] == FUTURE_TOKEN:
             raise ValueError("Cannot append a token after a future token.")
 
-        self.tokens.advance_with_token(
-            new_token, mark_previous_as_processed=mark_previous_as_processed
-        )
+        self.tokens.advance_with_token(new_token)
 
         if self.eos_tracker.is_eos_from_tokens(self.tokens.generated):
             self.status = GenerationStatus.END_OF_SEQUENCE
@@ -335,17 +339,21 @@ class TextContext:
     def update_with_future_token(self) -> None:
         """Append a placeholder future token to the generated tokens.
 
-        This is primarily used for overlap scheduling.
+        This is primarily used for overlap scheduling. For structured output
+        contexts (those with a matcher), only the token buffer is advanced.
+        The FSM will be advanced later when the future token is realized
+        with the actual generated token.
         """
-        if self.matcher:
-            raise ValueError(
-                "Cannot use future tokens when a matcher is present."
-            )
-
         if self.tokens.all[-1] == FUTURE_TOKEN:
             raise ValueError("Cannot have multiple future tokens.")
 
-        self.update(new_token=FUTURE_TOKEN)
+        if self.matcher is not None:
+            # For structured output, only advance the token buffer.
+            # The FSM cannot accept placeholder tokens and will be
+            # advanced with the real token in sync_and_process_outputs().
+            self.advance_token_buffer(FUTURE_TOKEN)
+        else:
+            self.update(new_token=FUTURE_TOKEN)
 
     def realize_future_token(
         self, new_token: int, log_probabilities: LogProbabilities | None = None
@@ -375,24 +383,6 @@ class TextContext:
 
         if self.eos_tracker.is_eos_from_tokens(self.tokens.generated):
             self.status = GenerationStatus.END_OF_SEQUENCE
-
-    def jump_ahead(self, new_token: int) -> None:
-        """Advance both token buffer and FSM, keeping token visible to user.
-
-        Unlike ``update()``, this method does not mark previous tokens as
-        processed, so the new token will be included in the output returned
-        to the user. This is used for grammar-forced tokens that the model
-        didn't generate but need to be part of the response.
-
-        Args:
-            new_token: The forced token to append and consume.
-        """
-        self.advance_token_buffer(
-            new_token,
-            log_probabilities=None,
-            mark_previous_as_processed=False,
-        )
-        self.advance_fsm(new_token)
 
     def reset(self) -> None:
         """Resets the context's state by combining all tokens into a new prompt."""
