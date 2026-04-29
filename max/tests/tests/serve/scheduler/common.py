@@ -17,7 +17,7 @@ import queue
 from dataclasses import dataclass
 
 import numpy as np
-from max.driver import CPU, Device
+from max.driver import CPU, Accelerator, Device
 from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef
@@ -74,8 +74,29 @@ def create_kv_cache(
     dp: int = 1,
     device: Device = CPU(),
     num_speculative_tokens: int = 0,
+    is_mla: bool = False,
+    tp_per_replica: int = 1,
 ) -> PagedKVCacheManager:
     dtype = DType.float32
+
+    if tp_per_replica > 1:
+        # Simulate multiple TP shards per replica by allocating distinct
+        # device ids (used to exercise the MLA flatten path).
+        n_devices = dp * tp_per_replica
+        if isinstance(device, CPU):
+            session_devices: list[Device] = [
+                CPU(id=i) for i in range(n_devices)
+            ]
+        elif isinstance(device, Accelerator):
+            session_devices = [Accelerator(id=i) for i in range(n_devices)]
+        else:
+            raise TypeError(
+                f"tp_per_replica > 1 not supported for {type(device).__name__}"
+            )
+        device_refs = [DeviceRef.from_device(d) for d in session_devices]
+    else:
+        device_refs = [DeviceRef.from_device(device) for _ in range(dp)]
+        session_devices = [device]
 
     kv_params = KVCacheParams(
         dtype=dtype,
@@ -87,11 +108,15 @@ def create_kv_cache(
         kv_connector=kv_connector,
         host_kvcache_swap_space_gb=999,
         data_parallel_degree=dp,
-        devices=[DeviceRef.from_device(device) for i in range(dp)],
+        devices=device_refs,
         num_eagle_speculative_tokens=num_speculative_tokens,
+        is_mla=is_mla,
+        # num_q_heads must be divisible by the per-replica device count
+        # (TP shards) when MLA is enabled.
+        num_q_heads=tp_per_replica if is_mla else None,
     )
 
-    session = InferenceSession(devices=[device])
+    session = InferenceSession(devices=session_devices)
 
     # CPU swap space is 100x the device cache memory
     num_blocks = num_blocks
@@ -261,32 +286,6 @@ class FakeTokenGeneratorPipeline(
         pass
 
 
-class FakeSpecDecodePipeline(FakeTokenGeneratorPipeline):
-    """Mimics OverlapTextGenerationPipeline with speculative decoding.
-
-    Like the real Eagle unified pipeline, overlap is disabled so execute()
-    returns results synchronously.  Draft tokens are populated on each
-    context's spec_decoding_state after execution.
-    """
-
-    def __init__(
-        self,
-        kv_manager: PagedKVCacheManager,
-        max_seq_len: int,
-        start_token_id: int = 99,
-        num_speculative_tokens: int = 2,
-    ) -> None:
-        super().__init__(
-            kv_manager,
-            max_seq_len,
-            start_token_id,
-            num_speculative_tokens=num_speculative_tokens,
-        )
-
-    def has_pending_outputs(self) -> bool:
-        return False
-
-
 class FakeOverlapPipeline(FakeTokenGeneratorPipeline):
     """Mimics OverlapTextGenerationPipeline's one-batch output lag.
 
@@ -294,6 +293,11 @@ class FakeOverlapPipeline(FakeTokenGeneratorPipeline):
     FUTURE_TOKEN placeholders in-place (matching the real pipeline's
     sync_and_process_outputs behavior), appends FUTURE_TOKEN to current-batch
     contexts, and stores their real tokens for the next call.
+
+    ``disable_overlap=True`` mirrors the real pipeline's ``_disable_overlap``:
+    execute() runs synchronously and has_pending_outputs() returns False.
+    ``num_speculative_tokens > 0`` populates draft_tokens_to_verify on each
+    context to mimic unified Eagle / MTP output.
     """
 
     def __init__(
@@ -301,19 +305,32 @@ class FakeOverlapPipeline(FakeTokenGeneratorPipeline):
         kv_manager: PagedKVCacheManager,
         max_seq_len: int,
         start_token_id: int = 99,  # test sentinel; no semantic meaning
+        num_speculative_tokens: int = 0,
+        disable_overlap: bool = False,
     ) -> None:
-        super().__init__(kv_manager, max_seq_len, start_token_id)
+        super().__init__(
+            kv_manager,
+            max_seq_len,
+            start_token_id,
+            num_speculative_tokens=num_speculative_tokens,
+        )
+        self._disable_overlap = disable_overlap
         self._pending_outputs: dict[RequestID, TextGenerationOutput] | None = (
             None
         )
         self._pending_contexts: list[TextContext] = []
 
     def has_pending_outputs(self) -> bool:
+        if self._disable_overlap:
+            return False
         return self._pending_outputs is not None
 
     def execute(
         self, inputs: TextGenerationInputs[TextContext]
     ) -> dict[RequestID, TextGenerationOutput]:
+        if self._disable_overlap:
+            return super().execute(inputs)
+
         # Return the previous batch's real outputs (one-batch lag) and resolve
         # their FUTURE_TOKEN placeholders, matching sync_and_process_outputs.
         outputs: dict[RequestID, TextGenerationOutput] = {}
@@ -359,6 +376,14 @@ class FakeOverlapPipeline(FakeTokenGeneratorPipeline):
                     tokens=[real_token],
                     final_status=GenerationStatus.ACTIVE,
                 )
+
+            # Publish draft tokens on the deferred contexts, matching the
+            # real unified Eagle/MTP overlap CE output.
+            if self.num_speculative_tokens > 0:
+                for context in inputs.flat_batch:
+                    context.spec_decoding_state.draft_tokens_to_verify = [
+                        123
+                    ] * self.num_speculative_tokens
 
             self.kv_manager.step(inputs.batches)
             self._pending_outputs = new_outputs
