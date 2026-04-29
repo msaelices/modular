@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import logging
@@ -114,6 +115,7 @@ from max.benchmark.benchmark_shared.request import (
     RequestFuncInput,
     RequestFuncOutput,
     get_request_driver_class,
+    measured_window_duration,
 )
 from max.benchmark.benchmark_shared.server_metrics import (
     collect_benchmark_metrics,
@@ -520,7 +522,6 @@ def print_lora_benchmark_results(
 
 def print_benchmark_summary(
     metrics: BenchmarkMetrics | PixelGenerationBenchmarkMetrics,
-    benchmark_duration: float,
     request_rate: float,
     max_concurrency: int | None,
     achieved_request_rate: float,
@@ -536,7 +537,7 @@ def print_benchmark_summary(
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10}".format("Failed requests:", metrics.failures))
     print(
-        "{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration)
+        "{:<40} {:<10.2f}".format("Benchmark duration (s):", metrics.duration)
     )
     if isinstance(metrics, BenchmarkMetrics):
         print(
@@ -1055,13 +1056,8 @@ def calculate_metrics(
     max_concurrent_conversations: int | None,
     collect_gpu_stats: bool,
     metrics_by_endpoint: Mapping[str, ParsedMetrics] | None = None,
-) -> tuple[BenchmarkMetrics, list[int]]:
+) -> BenchmarkMetrics:
     actual_output_lens: list[int] = []
-    nonempty_response_chunks = 0
-    total_input = 0
-    max_input = 0
-    max_output = 0
-    max_total = 0
     failures = 0
     failed_responses: list[RequestFuncOutput] = []
     itls: list[float] = []
@@ -1082,25 +1078,37 @@ def calculate_metrics(
             failures += 1
             failed_responses.append(o)
 
-    completed = len(successful)
+    total_successful = len(successful)
 
-    for o, output_len in successful:
-        total_input += o.prompt_len
+    for _, output_len in successful:
         actual_output_lens.append(output_len)
+
+    end = (
+        total_successful - skip_last_n_requests
+        if skip_last_n_requests > 0
+        else total_successful
+    )
+    measured = successful[skip_first_n_requests:end]
+
+    # Aggregate token/chunk stats over the measured slice only. Skipped
+    # warmup/tail requests contribute neither their tokens nor their wall
+    # time to throughput metrics, so TPM-style numbers reflect the
+    # intended steady-state portion of the run.
+    total_input = 0
+    total_output = 0
+    nonempty_response_chunks = 0
+    max_input = 0
+    max_output = 0
+    max_total = 0
+    for o, output_len in measured:
+        total_input += o.prompt_len
+        total_output += output_len
         nonempty_response_chunks += 1 if o.ttft != 0 else 0
         nonempty_response_chunks += len(o.itl)
         max_input = max(max_input, o.prompt_len)
         max_output = max(max_output, output_len)
         max_total = max(max_total, o.prompt_len + output_len)
 
-    end = (
-        completed - skip_last_n_requests
-        if skip_last_n_requests > 0
-        else completed
-    )
-    measured = successful[skip_first_n_requests:end]
-
-    for o, output_len in measured:
         tpots += o.tpot
         itls += o.itl
         ttfts.append(o.ttft)
@@ -1112,17 +1120,17 @@ def calculate_metrics(
 
     _warn_on_request_failures(
         outputs=outputs,
-        completed=completed,
+        completed=total_successful,
         failures=failures,
         failed_responses=failed_responses,
     )
 
-    measured_count = len(ttfts)
-    if measured_count == 0 and completed > 0:
+    measured_count = len(measured)
+    if measured_count == 0 and total_successful > 0:
         warnings.warn(
             (
-                f"All {completed} successful requests were excluded by"
-                f" skip_first_n_requests={skip_first_n_requests} and"
+                f"All {total_successful} successful requests were excluded"
+                f" by skip_first_n_requests={skip_first_n_requests} and"
                 f" skip_last_n_requests={skip_last_n_requests}."
                 " Consider running a longer benchmark."
             ),
@@ -1140,6 +1148,13 @@ def calculate_metrics(
             stacklevel=2,
         )
 
+    # Duration over the measured window: first measured submit to last
+    # measured complete. Mirrors the steady-state block's window math so
+    # skipped warmup/tail wall time does not pollute throughput.
+    measured_duration = measured_window_duration(
+        (o for o, _ in measured), fallback=dur_s
+    )
+
     (
         peak_gpu_memory_mib,
         available_gpu_memory_mib,
@@ -1150,15 +1165,15 @@ def calculate_metrics(
     )
 
     metrics = BenchmarkMetrics(
-        duration=dur_s,
-        completed=completed,
+        duration=measured_duration,
+        completed=measured_count,
         failures=failures,
         total_input=total_input,
-        total_output=sum(actual_output_lens),
+        total_output=total_output,
         nonempty_response_chunks=nonempty_response_chunks,
         max_concurrency=max_concurrency or len(outputs),
         max_concurrent_conversations=max_concurrent_conversations,
-        request_throughput=completed / dur_s,
+        request_throughput=measured_count / measured_duration,
         # Use specialized metric classes that handle percentile calculations automatically
         input_throughput=ThroughputMetrics(
             input_throughputs or [float("nan")], unit="tok/s"
@@ -1186,18 +1201,26 @@ def calculate_metrics(
         gpu_utilization=gpu_utilization,
         cpu_metrics=cpu_metrics,
         metrics_by_endpoint=metrics_by_endpoint or {},
+        skip_first_n_requests=skip_first_n_requests,
+        skip_last_n_requests=skip_last_n_requests,
+        input_lens=[o.prompt_len for o in outputs],
+        output_lens=actual_output_lens,
+        ttfts=[o.ttft for o in outputs],
+        itls=[o.itl for o in outputs],
+        generated_texts=[o.generated_text for o in outputs],
+        errors=[o.error for o in outputs],
+        request_submit_times=[o.request_submit_time for o in outputs],
+        request_complete_times=[o.request_complete_time for o in outputs],
     )
 
     # Override TPOT mean with weighted average: sum(ITL) / decode_tokens.
-    # This is more accurate than mean-of-means since it properly weights
-    # by tokens returned per response. Decode tokens = total output - completed,
-    # since each request's first token is from prefill (TTFT), not decode.
-    total_output_tokens = sum(actual_output_lens)
-    decode_tokens = total_output_tokens - completed
+    # Decode tokens = measured output - measured count, since each
+    # request's first token is prefill (TTFT), not decode.
+    decode_tokens = total_output - measured_count
     if decode_tokens > 0 and itls:
         metrics.tpot_ms._metrics.mean = sum(itls) / decode_tokens * 1000.0
 
-    return metrics, actual_output_lens
+    return metrics
 
 
 def calculate_pixel_generation_metrics(
@@ -1214,6 +1237,7 @@ def calculate_pixel_generation_metrics(
     latencies: list[float] = []
     total_generated_outputs = 0
     failed_responses: list[PixelGenerationRequestFuncOutput] = []
+    successful: list[PixelGenerationRequestFuncOutput] = []
 
     for output in outputs:
         if output.cancelled:
@@ -1222,6 +1246,7 @@ def calculate_pixel_generation_metrics(
             completed += 1
             latencies.append(output.latency)
             total_generated_outputs += output.num_generated_outputs
+            successful.append(output)
         else:
             failures += 1
             failed_responses.append(output)
@@ -1241,12 +1266,16 @@ def calculate_pixel_generation_metrics(
         gpu_metrics=gpu_metrics,
     )
 
+    # Use the first-submit -> last-complete window so setup/teardown
+    # around the actual requests doesn't inflate the denominator.
+    measured_duration = measured_window_duration(successful, fallback=dur_s)
+
     return PixelGenerationBenchmarkMetrics(
-        duration=dur_s,
+        duration=measured_duration,
         completed=completed,
         failures=failures,
         max_concurrency=max_concurrency or len(outputs),
-        request_throughput=completed / dur_s,
+        request_throughput=completed / measured_duration,
         total_generated_outputs=total_generated_outputs,
         latency_ms=StandardPercentileMetrics(
             latencies or [float("nan")], scale_factor=1000.0, unit="ms"
@@ -1493,6 +1522,90 @@ async def run_single_turn_benchmark(
     return outputs
 
 
+async def prime_prefix_turns(
+    sessions: Sequence[ChatSession],
+    request_driver: RequestDriver,
+    model_id: str,
+    api_url: str,
+    max_chat_len: int,
+    temperature: float | None,
+    top_p: float | None,
+    top_k: int | None,
+    max_sessions: int | None = None,
+) -> None:
+    """Prime the server's KV cache for sessions with prefix turns.
+
+    Sends one request per session with the full prefix context and
+    max_tokens=1. Runs before the benchmark timer so priming doesn't
+    affect measured throughput or duration.
+
+    Sessions beyond ``max_sessions`` are skipped because the multiturn /
+    kv-cache-stress runners reset ``prefix_turns=0`` for them anyway
+    (they represent new conversations arriving mid-benchmark).
+    """
+    if max_sessions is not None:
+        sessions = sessions[:max_sessions]
+    sessions_with_prefix = [s for s in sessions if s.prefix_turns > 0]
+    if not sessions_with_prefix:
+        return
+
+    logger.info(
+        f"Priming prefix turns for {len(sessions_with_prefix)} sessions..."
+    )
+
+    async def _prime_session(session: ChatSession) -> None:
+        messages = session.messages
+        prefix_end_idx = session.prefix_turns * 2
+        message_history: list[dict[str, Any]] = []
+        chat_len = 0
+        content_idx = 0
+        while content_idx < prefix_end_idx and content_idx + 1 < len(messages):
+            chat_len += messages[content_idx].num_tokens
+            output_len = messages[content_idx + 1].num_tokens
+            if chat_len + output_len > max_chat_len:
+                break
+            message_history.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": messages[content_idx].content,
+                        }
+                    ],
+                }
+            )
+            assistant_content = messages[content_idx + 1].content
+            if not assistant_content:
+                assistant_content = " ".join(["token"] * max(output_len, 1))
+            message_history.append(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": assistant_content}],
+                }
+            )
+            chat_len += output_len
+            content_idx += 2
+        if message_history:
+            prime_input = RequestFuncInput(
+                model=model_id,
+                session_id=str(session.id),
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                prompt=message_history,
+                images=[],
+                api_url=api_url,
+                prompt_len=chat_len,
+                max_tokens=1,
+                ignore_eos=True,
+            )
+            await request_driver.request(prime_input)
+
+    await asyncio.gather(*(_prime_session(s) for s in sessions_with_prefix))
+    logger.info("Prefix turns priming complete.")
+
+
 async def run_multiturn_benchmark(
     *,
     chat_sessions: Sequence[ChatSession],
@@ -1572,8 +1685,16 @@ async def run_multiturn_benchmark(
                 run_prefix_len=run_prefix_len,
             )
 
+    # New conversations arriving mid-benchmark start from turn 0.
+    sessions = [
+        dataclasses.replace(s, prefix_turns=0)
+        if max_concurrency and idx >= max_concurrency
+        else s
+        for idx, s in enumerate(chat_sessions)
+    ]
+
     tasks: list[asyncio.Task[list[RequestFuncOutput]]] = []
-    for idx, chat_session in enumerate(chat_sessions):
+    for idx, chat_session in enumerate(sessions):
         if warmup_delay_ms > 0 and max_concurrency and idx < max_concurrency:
             await asyncio.sleep(warmup_delay_ms / 1000)
         tasks.append(
@@ -1707,6 +1828,10 @@ async def run_kv_cache_stress_benchmark(
                 idx, chat_session = session_queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
+
+            # New conversations arriving mid-benchmark start from turn 0.
+            if idx >= max_concurrent_conversations:
+                chat_session = dataclasses.replace(chat_session, prefix_turns=0)
 
             lora_id = (
                 lora_manager.get_lora_for_request(idx) if lora_manager else None
@@ -1905,7 +2030,7 @@ def _build_text_generation_result(
             "Expected all outputs to be RequestFuncOutput"
             " in text-generation benchmark flow."
         )
-    text_metrics, actual_output_lens = calculate_metrics(
+    text_metrics = calculate_metrics(
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
@@ -1920,24 +2045,6 @@ def _build_text_generation_result(
     )
 
     result = text_metrics.to_result_dict()
-    result.update(
-        {
-            "skip_first_n_requests": skip_first_n_requests,
-            "skip_last_n_requests": skip_last_n_requests,
-            "input_lens": [output.prompt_len for output in outputs],
-            "output_lens": actual_output_lens,
-            "ttfts": [output.ttft for output in outputs],
-            "itls": [output.itl for output in outputs],
-            "generated_texts": [output.generated_text for output in outputs],
-            "errors": [output.error for output in outputs],
-            "request_submit_times": [
-                output.request_submit_time for output in outputs
-            ],
-            "request_complete_times": [
-                output.request_complete_time for output in outputs
-            ],
-        }
-    )
 
     _add_spec_decode_result(result, spec_decode_stats)
 
@@ -1972,12 +2079,17 @@ def _add_steady_state_result(
     metrics_by_endpoint: Mapping[str, ParsedMetrics] | None,
 ) -> None:
     """Detect steady-state window and add its metrics to *result*."""
-    steady = detect_steady_state(outputs)
+    steady = detect_steady_state(outputs, max_concurrency=max_concurrency)
     result["steady_state_detected"] = steady.detected
     result["steady_state_start_index"] = steady.start_index
     result["steady_state_end_index"] = steady.end_index
     result["steady_state_count"] = steady.steady_state_count
     result["steady_state_warning"] = steady.warning
+    # Persist detection mode for downstream consumers; skip it when
+    # detection was skipped (concurrency=1) so the default "full"
+    # isn't mistaken for a real result.
+    if steady.detected or steady.warning is not None:
+        result["steady_state_mode"] = steady.mode
 
     if steady.detected:
         ss_index_set = set(steady.steady_state_indices)
@@ -2000,7 +2112,7 @@ def _add_steady_state_result(
             ss_duration = last_complete - first_submit
             ss_duration = max(ss_duration, 1e-9)
 
-            ss_metrics, _ = calculate_metrics(
+            ss_metrics = calculate_metrics(
                 outputs=ss_outputs,
                 dur_s=ss_duration,
                 tokenizer=tokenizer,
@@ -2020,10 +2132,31 @@ def _add_steady_state_result(
                 result.update(
                     pm.confidence_to_flat_dict(f"steady_state_{name}")
                 )
+        # start_index and end_index are in original dispatch order and
+        # may span requests filtered out by detect_steady_state (failed,
+        # missing TPOT, etc.), particularly in multi-turn runs where
+        # sessions interleave. Call out the valid-count separately so
+        # the gap isn't mistaken for a bug.
+        assert steady.start_index is not None and steady.end_index is not None
+        dispatch_span = steady.end_index - steady.start_index
+        # Only show dispatch_span when it differs from the valid count
+        # (multi-turn interleaving); single-turn matches would be noise.
+        span_note = (
+            f" spans {dispatch_span} positions"
+            if dispatch_span != steady.steady_state_count
+            else ""
+        )
+        mode_note = (
+            " [TTFT-only fallback; TPOT absent across run]"
+            if steady.mode == "ttft_only"
+            else ""
+        )
         logger.info(
-            f"Steady-state detected: requests [{steady.start_index},"
-            f" {steady.end_index}) ({steady.steady_state_count} of"
-            f" {steady.total_requests} requests)"
+            f"Steady-state detected: {steady.steady_state_count} valid"
+            f" requests (dispatch range [{steady.start_index},"
+            f" {steady.end_index}){span_note};"
+            f" {steady.total_requests} total valid in the run)"
+            f"{mode_note}"
         )
     elif steady.warning:
         logger.warning(f"Steady-state detection: {steady.warning}")
@@ -2286,15 +2419,44 @@ async def benchmark(
         if trace_path:
             start_trace(trace_path, trace_session)
 
-        benchmark_start_time = time.perf_counter_ns()
-        if max_benchmark_duration_s is None:
-            benchmark_should_end_time = None
-        else:
-            benchmark_should_end_time = benchmark_start_time + int(
-                max_benchmark_duration_s * 1e9
+        # Create pbar for actual benchmark runs
+        pbar = create_benchmark_pbar(disable_tqdm=disable_tqdm, samples=samples)
+
+        # Create base driver and wrap with ProgressBarRequestDriver if pbar is provided
+        base_driver: RequestDriver = request_driver_class(tokenizer=tokenizer)
+        request_driver: RequestDriver = (
+            ProgressBarRequestDriver(base_driver, pbar)
+            if pbar is not None
+            else base_driver
+        )
+
+        # Prime prefix turns before the benchmark timer starts. Only the
+        # initial concurrent population keeps its prefix_turns; sessions
+        # arriving mid-benchmark get reset to 0 and don't need priming.
+        # Bound: kv-cache-stress uses max_concurrent_conversations;
+        # multiturn uses max_concurrency (may be None for unbounded, in
+        # which case all sessions keep prefix_turns and are all primed).
+        if isinstance(samples, ChatSamples):
+            assert tokenizer is not None
+            prime_bound = (
+                max_concurrent_conversations
+                if max_concurrent_conversations is not None
+                else max_concurrency
+            )
+            await prime_prefix_turns(
+                sessions=samples.chat_sessions,
+                request_driver=base_driver,
+                model_id=model_id,
+                api_url=api_url,
+                max_chat_len=tokenizer.model_max_length,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                max_sessions=prime_bound,
             )
 
-        # Capture baseline server metrics before benchmark starts
+        # Capture baseline server metrics after priming so priming requests
+        # don't affect the delta calculation.
         baseline_endpoints: Mapping[str, ParsedMetrics] = {}
         if collect_server_stats:
             try:
@@ -2307,20 +2469,25 @@ async def benchmark(
                     f"Failed to capture baseline server metrics: {e}"
                 )
 
-        # Create pbar for actual benchmark runs
-        pbar = create_benchmark_pbar(disable_tqdm=disable_tqdm, samples=samples)
-
-        # Create base driver and wrap with ProgressBarRequestDriver if pbar is provided
-        base_driver: RequestDriver = request_driver_class(tokenizer=tokenizer)
-        request_driver: RequestDriver = (
-            ProgressBarRequestDriver(base_driver, pbar)
-            if pbar is not None
-            else base_driver
-        )
-
         if benchmark_task == "text-generation" and _is_vllm_backend(backend):
             spec_decode_metrics_before = fetch_spec_decode_metrics(
                 backend, base_url
+            )
+
+        # Marker consumed by utils/benchmarking/serving/analyze_batch_logs.py
+        # to slice the batch log by concurrency and exclude warmup/test-prompt
+        # phases.
+        logger.info(
+            f"=== BATCH LOG MARKER: Benchmark started "
+            f"(max_concurrency={max_concurrency}, "
+            f"request_rate={request_rate}) ==="
+        )
+        benchmark_start_time = time.perf_counter_ns()
+        if max_benchmark_duration_s is None:
+            benchmark_should_end_time = None
+        else:
+            benchmark_should_end_time = benchmark_start_time + int(
+                max_benchmark_duration_s * 1e9
             )
 
         try:
@@ -2530,7 +2697,6 @@ async def benchmark(
 
     print_benchmark_summary(
         metrics=metrics,
-        benchmark_duration=benchmark_duration,
         request_rate=request_rate,
         max_concurrency=max_concurrency,
         achieved_request_rate=achieved_request_rate,
@@ -2550,7 +2716,7 @@ async def benchmark(
 
 
 def validate_task_and_endpoint(
-    benchmark_task: BenchmarkTask, endpoint: Endpoint, backend: str
+    benchmark_task: BenchmarkTask, endpoint: Endpoint
 ) -> None:
     if benchmark_task == "text-generation":
         if endpoint in ("/v1/responses", "/v1/images/generations"):
@@ -2630,6 +2796,28 @@ def flush_prefix_cache(
             " skipping cache flush."
         )
     elif response.status_code != 200:
+        # Mammoth's proxy wraps engine 404s in a 502 with per-endpoint statuses
+        # in the JSON body; treat unanimous 404s the same as a direct 404 above
+        # (e.g. vLLM builds without /reset_prefix_cache exposed).
+        try:
+            body = response.json() if response.content else None
+        except ValueError:
+            body = None
+        results = body.get("results") if isinstance(body, dict) else None
+        if (
+            isinstance(results, list)
+            and results
+            and all(
+                isinstance(r, dict) and r.get("statusCode") == 404
+                for r in results
+            )
+        ):
+            logger.warning(
+                f"Prefix cache reset is not supported at {api_url} "
+                "(proxy reported 404 from all engine endpoints);"
+                " skipping cache flush."
+            )
+            return
         raise RuntimeError(
             f"Failed to flush prefix cache for backend {backend} at {api_url}: "
             f"status={response.status_code} body={response.text}"
@@ -2670,8 +2858,8 @@ class BenchmarkSession:
     samples: Samples
     lora_manager: LoRABenchmarkManager | None
     trace_path: str | None
-    orig_skip_first: int | None
-    orig_skip_last: int | None
+    skip_first: int
+    skip_last: int
 
 
 def _execute_benchmark(
@@ -2680,39 +2868,10 @@ def _execute_benchmark(
     max_concurrency: int | None,
     request_rate: float,
 ) -> tuple[dict[str, Any], ServingBenchmarkMetrics]:
-    """Run a single benchmark invocation and return *(result_dict, metrics)*.
-
-    ``session.orig_skip_first`` / ``session.orig_skip_last`` are the
-    user-supplied values (``None`` = auto-derive from *max_concurrency*).
-    """
+    """Run a single benchmark invocation and return *(result_dict, metrics)*."""
     backend: Backend = args.backend
-
-    skip_first = session.orig_skip_first
-    skip_last = session.orig_skip_last
-    if request_rate != float("inf"):
-        # Finite rate → steady drip with no ramp-up / ramp-down artifacts,
-        # so skip nothing (PERF-878).
-        if skip_first is None:
-            skip_first = 0
-        if skip_last is None:
-            skip_last = 0
-    elif max_concurrency is not None:
-        if skip_first is None:
-            skip_first = max_concurrency
-            logger.info(
-                f"Auto-setting skip_first_n_requests={skip_first}"
-                f" (max_concurrency={max_concurrency})"
-            )
-        if skip_last is None:
-            skip_last = max_concurrency
-            logger.info(
-                f"Auto-setting skip_last_n_requests={skip_last}"
-                f" (max_concurrency={max_concurrency})"
-            )
-    if skip_first is None:
-        skip_first = 0
-    if skip_last is None:
-        skip_last = 0
+    skip_first = session.skip_first
+    skip_last = session.skip_last
 
     if args.warm_shared_prefix:
         if args.dataset_name not in ("random", "synthetic"):
@@ -2780,6 +2939,7 @@ def _execute_benchmark(
 
 
 def save_result_json(
+    result_filename: str | None,
     args: ServingBenchmarkConfig,
     benchmark_result: dict[str, Any],
     benchmark_metrics: ServingBenchmarkMetrics,
@@ -2789,8 +2949,8 @@ def save_result_json(
     tokenizer_id: str,
     request_rate: float,
 ) -> None:
-    """Persist benchmark results to the JSON file at *args.result_filename*."""
-    if not args.result_filename:
+    """Persist benchmark results to *result_filename*."""
+    if not result_filename:
         return
     backend: Backend = args.backend
     client_args = args.model_dump()
@@ -2813,15 +2973,14 @@ def save_result_json(
         **_parse_metadata(args.metadata),
         **benchmark_result,
     }
-    file_name = args.result_filename
-    logger.info(f"Writing file: {file_name}")
-    if os.path.isfile(file_name):
+    logger.info(f"Writing file: {result_filename}")
+    if os.path.isfile(result_filename):
         logger.warning(
             "This is going to overwrite an existing file.  "
-            f"The existing file will be moved to {file_name}.orig."
+            f"The existing file will be moved to {result_filename}.orig."
         )
-        os.rename(file_name, f"{file_name}.orig")
-    with open(file_name, "w") as outfile:
+        os.rename(result_filename, f"{result_filename}.orig")
+    with open(result_filename, "w") as outfile:
         json.dump(result_json, outfile)
 
 
@@ -2867,7 +3026,7 @@ def main_with_parsed_args(
     logging.basicConfig(
         format="%(asctime)s.%(msecs)03d %(levelname)s: %(name)s: %(message)s",
         datefmt="%H:%M:%S",
-        level=logging.INFO,
+        level=logging.DEBUG if args.verbose else logging.INFO,
     )
 
     logger.info(args)
@@ -2995,7 +3154,7 @@ def main_with_parsed_args(
                 f" with one of {sorted(PIXEL_GENERATION_ENDPOINTS)}."
             )
 
-    validate_task_and_endpoint(benchmark_task, endpoint, args.backend)
+    validate_task_and_endpoint(benchmark_task, endpoint)
     # chat is only meaningful for text-generation (enables chat template
     # formatting). For pixel generation via /v1/chat/completions
     # (vllm pixel gen), the pixel-gen code path ignores this flag.
@@ -3385,8 +3544,8 @@ def main_with_parsed_args(
         samples=samples,
         lora_manager=lora_manager,
         trace_path=trace_path,
-        orig_skip_first=args.skip_first_n_requests,
-        orig_skip_last=args.skip_last_n_requests,
+        skip_first=args.skip_first_n_requests,
+        skip_last=args.skip_last_n_requests,
     )
 
     # ---- Sweep loop ----
@@ -3433,6 +3592,7 @@ def main_with_parsed_args(
 
             # JSON result file (for the median iteration).
             save_result_json(
+                args.result_filename,
                 args,
                 best_result,
                 best_metrics,
