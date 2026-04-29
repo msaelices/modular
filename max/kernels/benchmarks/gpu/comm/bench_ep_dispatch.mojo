@@ -21,8 +21,6 @@
 # NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 # br --run_under="mpirun -n $NUM_GPUS --allow-run-as-root --bind-to none" //max/kernels/benchmarks:gpu/bench_ep_dispatch
 
-from std.collections import OptionalReg
-
 from std.random import randint, randn, seed
 from std.sys import (
     get_defined_int,
@@ -60,7 +58,7 @@ def legalize_topk_ids[
 
         # The top-k ids for a token should be unique. If not, we will assign a
         # random id to the duplicate id.
-        def is_duplicate() unified {read} -> Int:
+        def is_duplicate() {read} -> Int:
             for i in range(top_k):
                 for j in range(i + 1, top_k):
                     if topk_ids_for_token[i] == topk_ids_for_token[j]:
@@ -269,13 +267,6 @@ def bench_dispatch[
                 recv_count,
                 EPLocalSyncCounters[n_experts](atomic_counter),
                 Int32(my_rank),
-                OptionalReg[
-                    TileTensor[
-                        DType.bfloat16,
-                        type_of(row_major(Idx(Int64(1)), Idx(Int64(1)))),
-                        ImmutAnyOrigin,
-                    ]
-                ](),
                 grid_dim=hw_info.sm_count,
                 block_dim=hw_info.max_thread_block_size,
             )
