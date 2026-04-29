@@ -62,7 +62,7 @@ def make_string[
 @parameter
 def bench_string_init(mut b: Bencher) raises:
     @always_inline
-    def call_fn() unified {}:
+    def call_fn():
         for _ in range(1000):
             var string = String()
             keep(string)
@@ -82,7 +82,7 @@ def bench_string_count[
     var items = make_string[length](filename + ".txt")
 
     @always_inline
-    def call_fn() unified {read}:
+    def call_fn() {read}:
         var amnt = black_box(items).count(black_box(sequence))
         keep(amnt)
 
@@ -103,7 +103,7 @@ def bench_string_split[
     ).get_immutable()
 
     @always_inline
-    def call_fn() unified {read}:
+    def call_fn() {read}:
         var res: List[type_of(items)]
 
         comptime if sequence:
@@ -162,7 +162,7 @@ def bench_string_join[short: Bool](mut b: Bencher) raises:
     var separator = String(",")
 
     @always_inline
-    def call_fn() unified {read}:
+    def call_fn() {read}:
         for _ in range(1_000):
             var res = black_box(separator).join(black_box(word_list))
             keep(res)
@@ -180,7 +180,7 @@ def bench_string_splitlines[
     var items = StringSlice(make_string[length](filename + ".txt"))
 
     @always_inline
-    def call_fn() unified {read}:
+    def call_fn() {read}:
         for _ in range(1_000_000 // length):
             var res = black_box(items).splitlines()
             keep(res)
@@ -198,7 +198,7 @@ def bench_string_lower[
     var items = make_string[length](filename + ".txt")
 
     @always_inline
-    def call_fn() unified {read}:
+    def call_fn() {read}:
         var res = black_box(items).lower()
         keep(res)
 
@@ -215,7 +215,7 @@ def bench_string_upper[
     var items = make_string[length](filename + ".txt")
 
     @always_inline
-    def call_fn() unified {read}:
+    def call_fn() {read}:
         var res = black_box(items).upper()
         keep(res)
 
@@ -235,7 +235,7 @@ def bench_string_replace[
     var items = make_string[length](filename + ".txt")
 
     @always_inline
-    def call_fn() unified {read}:
+    def call_fn() {read}:
         var res = black_box(items).replace(black_box(old), black_box(new))
         keep(res)
 
@@ -252,7 +252,7 @@ def bench_string_count_codepoints[
     var items = make_string[length](filename + ".txt")
 
     @always_inline
-    def call_fn() unified {read}:
+    def call_fn() {read}:
         var res = black_box(items).count_codepoints()
         keep(res)
 
@@ -269,7 +269,7 @@ def bench_string_find_single[
     var items = make_string[length](filename + ".txt")
 
     @always_inline
-    def call_fn() unified {read}:
+    def call_fn() {read}:
         # this is to help with instability when measuring small strings
         for _ in range(10**6 // length):
             var res = black_box(items).find(
@@ -291,7 +291,7 @@ def bench_string_find_multiple[
     var sequence = "ZZZZ"  # something that probably won't be there
 
     @always_inline
-    def call_fn() unified {read}:
+    def call_fn() {read}:
         # this is to help with instability when measuring small strings
         for _ in range(10**6 // length):
             var res = black_box(items).find(black_box(sequence))
@@ -310,7 +310,7 @@ def bench_string_is_valid_utf8[
     var items = make_string[length](filename + ".html")
 
     @always_inline
-    def call_fn() unified {read}:
+    def call_fn() {read}:
         var res = _is_valid_utf8(black_box(items).as_bytes())
         keep(res)
 
@@ -332,7 +332,7 @@ def bench_write_utf8[
         codepoints.append(c)
 
     @always_inline
-    def call_fn() unified {read}:
+    def call_fn() {read}:
         var data = InlineArray[Byte, 4](uninitialized=True)
         # this is to help with instability when measuring small strings
         for _ in range(10**6 // length):
@@ -359,7 +359,7 @@ def bench_string_write[short: Bool](mut b: Bencher) raises:
     var items_5 = items.copy()
 
     @always_inline
-    def call_fn() unified {read}:
+    def call_fn() {read}:
         for _ in range(1_000_000):
             var res: String
 
@@ -402,7 +402,7 @@ def bench_string_repr[
     var items = make_string[length](filename + ".txt")
 
     @always_inline
-    def call_fn() unified {read}:
+    def call_fn() {read}:
         # this is to help with instability when measuring small strings
         for _ in range(10**6 // length):
             var writer = NullWriter()
