@@ -47,12 +47,17 @@ class UnifiedMTPDeepseekV3Inputs(DeepseekV3Inputs):
     draft_tokens: Buffer | None = None
     draft_kv_blocks: list[Buffer] | None = None
     seed: Buffer | None = None
-    """Per-execute int64 scalar seed reserved for stochastic sub-modules.
+    """Per-execute int64 scalar seed consumed by the stochastic acceptance
+    sampler (and, when enabled, the synthetic benchmarking sampler)."""
 
-    Currently only consumed by synthetic acceptance sampling, but always
-    bound so the graph signature is stable and additional stochastic
-    paths can reuse the same input.
-    """
+    temperature: Buffer | None = None
+    top_k: Buffer | None = None
+    max_k: Buffer | None = None
+    top_p: Buffer | None = None
+    min_top_p: Buffer | None = None
+    """Per-batch sampling parameters consumed by the stochastic acceptance
+    sampler. ``max_k`` and ``min_top_p`` are 0-d CPU scalars; the rest are
+    ``[batch_size]`` tensors on the primary device."""
 
     @property
     def buffers(self) -> tuple[Buffer, ...]:
@@ -63,6 +68,22 @@ class UnifiedMTPDeepseekV3Inputs(DeepseekV3Inputs):
             buffers += tuple(self.draft_kv_blocks)
         assert self.seed is not None
         buffers += (self.seed,)
+        if self.draft_tokens is not None:
+            # Sampling params are only required when the spec-decode path
+            # is active (i.e. draft_tokens was bound). They mirror the
+            # graph's input signature exactly in that case.
+            assert self.temperature is not None
+            assert self.top_k is not None
+            assert self.max_k is not None
+            assert self.top_p is not None
+            assert self.min_top_p is not None
+            buffers += (
+                self.temperature,
+                self.top_k,
+                self.max_k,
+                self.top_p,
+                self.min_top_p,
+            )
         return buffers
 
 
@@ -288,6 +309,11 @@ class UnifiedMTPDeepseekV3Model(DeepseekV3Model):
                     )
 
                 seed = next(variadic_args_iter).tensor
+                temperature = next(variadic_args_iter).tensor
+                top_k = next(variadic_args_iter).tensor
+                max_k = next(variadic_args_iter).tensor
+                top_p = next(variadic_args_iter).tensor
+                min_top_p = next(variadic_args_iter).tensor
 
                 outputs = nn_model(
                     tokens=tokens.tensor,
@@ -300,6 +326,11 @@ class UnifiedMTPDeepseekV3Model(DeepseekV3Model):
                     data_parallel_splits=data_parallel_splits.tensor,
                     batch_context_lengths=batch_context_lengths,
                     seed=seed,
+                    temperature=temperature,
+                    top_k=top_k,
+                    max_k=max_k,
+                    top_p=top_p,
+                    min_top_p=min_top_p,
                     ep_inputs=target_ep_inputs,
                     draft_kv_collections=draft_kv_collections,
                 )
@@ -316,6 +347,7 @@ class UnifiedMTPDeepseekV3Model(DeepseekV3Model):
         model_inputs: ModelInputs,
     ) -> UnifiedEagleOutputs:
         """Execute and return all 3 graph outputs for speculative decoding."""
+        assert isinstance(model_inputs, UnifiedMTPDeepseekV3Inputs)
         model_outputs = self.model.execute(*model_inputs.buffers)
         assert len(model_outputs) == 3, (
             f"Expected 3 outputs, got {len(model_outputs)}"
@@ -332,6 +364,9 @@ class UnifiedMTPDeepseekV3Model(DeepseekV3Model):
         replica_batches: Sequence[Sequence[TextContext]],
         kv_cache_inputs: KVCacheInputs[Buffer, Buffer] | None = None,
         return_n_logits: int = 1,
+        draft_tokens: Buffer | None = None,
+        draft_kv_cache_buffers: list[Buffer] | None = None,
+        **kwargs,
     ) -> UnifiedMTPDeepseekV3Inputs:
         base = DeepseekV3Model.prepare_initial_token_inputs(
             self, replica_batches, kv_cache_inputs, return_n_logits
@@ -347,6 +382,8 @@ class UnifiedMTPDeepseekV3Model(DeepseekV3Model):
             return_n_logits=base.return_n_logits,
             data_parallel_splits=base.data_parallel_splits,
             ep_inputs=base.ep_inputs,
+            draft_tokens=draft_tokens,
+            draft_kv_blocks=draft_kv_cache_buffers,
             seed=self._next_seed(),
         )
 
