@@ -20,6 +20,7 @@ from std.collections.string._utf8 import UTF8Chunks, _is_valid_utf8
 from std.collections.string.format import _FormatUtils
 from std.collections.string.string_slice import (
     CodepointSliceIter,
+    GraphemeSliceIter,
     _to_string_list,
     _unsafe_strlen,
 )
@@ -40,6 +41,7 @@ from std.sys.info import is_32bit
 from std.bit import count_leading_zeros
 from std.memory import memcmp, memcpy, memset
 from std.python import ConvertibleFromPython, ConvertibleToPython, PythonObject
+from std.reflection.traits import AllWritable
 
 # ===----------------------------------------------------------------------=== #
 # String
@@ -476,6 +478,8 @@ struct String(
         _ = variadic_pack_to_string(1, ", ", 2.0, ", ", "three")
         ```
         """
+        comptime assert AllWritable[*Ts]  # satisfy where clause.
+
         var total_bytes = _TotalWritableBytes()
         args._write_to(total_bytes, end=end, sep=sep)
 
@@ -505,6 +509,8 @@ struct String(
         Returns:
             A string formed by formatting the argument sequence.
         """
+        comptime assert AllWritable[*Ts]  # satisfy where clause.
+
         var total_bytes = _TotalWritableBytes()
         args._write_to(total_bytes, end=end, sep=sep)
 
@@ -528,6 +534,8 @@ struct String(
         Args:
             args: Sequence of arguments to write to this Writer.
         """
+        comptime assert AllWritable[*Ts]  # satisfy where clause.
+
         var total_bytes = _TotalWritableBytes()
         total_bytes.size += self.byte_length()
         args._write_to(total_bytes, sep="")
@@ -1154,6 +1162,41 @@ struct String(
             A reversed iterator of references to the string elements.
         """
         return CodepointSliceIter[origin_of(self), forward=False](self)
+
+    def graphemes(self) -> GraphemeSliceIter[origin_of(self)]:
+        """Return an iterator over the grapheme clusters in this string.
+
+        A grapheme cluster is what a user would typically think of as a
+        single "character" on screen.
+
+        Returns:
+            An iterator yielding each grapheme cluster as a `StringSlice`.
+        """
+        return StringSlice(self).graphemes()
+
+    def graphemes_reversed(
+        self,
+    ) -> GraphemeSliceIter[origin_of(self), False]:
+        """Return an iterator over the grapheme clusters in this string,
+        yielding them in reverse order.
+
+        See `graphemes()` for the definition of a grapheme cluster.
+
+        Returns:
+            A reverse iterator yielding each grapheme cluster as a
+            `StringSlice`.
+        """
+        return StringSlice(self).graphemes_reversed()
+
+    def count_graphemes(self) -> Int:
+        """Count the number of grapheme clusters in this string.
+
+        This is an O(n) operation.
+
+        Returns:
+            The number of grapheme clusters.
+        """
+        return StringSlice(self).count_graphemes()
 
     @always_inline("nodebug")
     def unsafe_ptr(

@@ -20,12 +20,13 @@ from typing import Any, Literal
 
 import numpy as np
 from max._core.engine import Model
-from max.driver import Buffer
+from max.driver import Buffer, DevicePinnedBuffer
 from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph
 from max.graph.weights import Weights, WeightsAdapter
 from max.nn.comm.ep import EPCommInitializer, EPConfig
+from max.nn.comm.ep.ep_config import calculate_ep_max_tokens_per_rank
 from max.nn.kv_cache import KVCacheParams
 from max.pipelines.core import TextContext
 from max.pipelines.lib import (
@@ -35,7 +36,11 @@ from max.pipelines.lib import (
 )
 from max.pipelines.lib.interfaces import AlwaysSignalBuffersMixin
 from max.pipelines.lib.interfaces.pipeline_model import ModelInputs
-from max.pipelines.lib.utils import parse_state_dict_from_weights
+from max.pipelines.lib.utils import (
+    compute_data_parallel_splits,
+    parse_state_dict_from_weights,
+)
+from max.support.algorithm import flatten2d
 from transformers import AutoConfig
 from typing_extensions import override
 
@@ -111,26 +116,106 @@ class MiniMaxM2Model(AlwaysSignalBuffersMixin, LlamaModelBase):
         kv_cache_inputs: Any = None,
         return_n_logits: int = 1,
     ) -> MiniMaxM2Inputs:
-        llama_inputs = super().prepare_initial_token_inputs(
-            replica_batches, kv_cache_inputs, return_n_logits
+        dp = self.pipeline_config.model.data_parallel_degree
+        if len(replica_batches) != dp:
+            raise ValueError(
+                "Number of replica batches must match data parallel degree"
+            )
+
+        context_batch = flatten2d(replica_batches)
+        device0 = self.devices[0]
+        pinned = not device0.is_host
+
+        batch_size = len(context_batch)
+        total_seq_len = sum(ctx.tokens.active_length for ctx in context_batch)
+        buffer_key = (batch_size, total_seq_len)
+        buffers = self._execution_input_buffers.get(buffer_key)
+        if buffers is None:
+            host_tokens: Buffer
+            if pinned:
+                host_tokens = DevicePinnedBuffer(
+                    dtype=DType.int64,
+                    shape=(total_seq_len,),
+                    device=device0,
+                )
+            else:
+                host_tokens = Buffer(
+                    shape=(total_seq_len,),
+                    dtype=DType.int64,
+                    device=device0,
+                )
+
+            host_row_offsets: Buffer
+            if pinned:
+                host_row_offsets = DevicePinnedBuffer(
+                    dtype=DType.uint32,
+                    shape=(batch_size + 1,),
+                    device=device0,
+                )
+            else:
+                host_row_offsets = Buffer(
+                    shape=(batch_size + 1,),
+                    dtype=DType.uint32,
+                    device=device0,
+                )
+
+            device_tokens = host_tokens.to(device0)
+            device_row_offsets = host_row_offsets.to(device0)
+            buffers = (
+                host_tokens,
+                host_row_offsets,
+                device_tokens,
+                device_row_offsets,
+            )
+            self._execution_input_buffers[buffer_key] = buffers
+        (
+            host_tokens,
+            host_row_offsets,
+            device_tokens,
+            device_row_offsets,
+        ) = buffers
+
+        np.cumsum(
+            [0] + [ctx.tokens.active_length for ctx in context_batch],
+            dtype=np.uint32,
+            out=host_row_offsets.to_numpy(),
         )
+
+        return_n_logits_tensor = Buffer.from_numpy(
+            np.array([return_n_logits], dtype=np.int64)
+        )
+
+        tokens_np = host_tokens.to_numpy()
+        if context_batch:
+            np.concatenate(
+                [ctx.tokens.active for ctx in context_batch],
+                out=tokens_np,
+            )
+        device_tokens.inplace_copy_from(host_tokens)
+        device_row_offsets.inplace_copy_from(host_row_offsets)
+
+        if dp > 1:
+            data_parallel_splits = Buffer.from_numpy(
+                compute_data_parallel_splits(replica_batches)
+            )
+        else:
+            data_parallel_splits = None
+
         ep_inputs = (
             ()
             if self.ep_comm_initializer is None
             else tuple(self.ep_comm_initializer.model_inputs())
         )
-        host_input_row_offsets = Buffer.from_numpy(
-            llama_inputs.input_row_offsets.to_numpy()
-        )
+
         return MiniMaxM2Inputs(
-            tokens=llama_inputs.tokens,
-            input_row_offsets=llama_inputs.input_row_offsets,
-            signal_buffers=llama_inputs.signal_buffers,
-            kv_cache_inputs=llama_inputs.kv_cache_inputs,
-            return_n_logits=llama_inputs.return_n_logits,
-            data_parallel_splits=llama_inputs.data_parallel_splits,
+            tokens=device_tokens,
+            input_row_offsets=device_row_offsets,
+            signal_buffers=self.signal_buffers,
+            kv_cache_inputs=kv_cache_inputs,
+            return_n_logits=return_n_logits_tensor,
+            data_parallel_splits=data_parallel_splits,
             ep_inputs=ep_inputs,
-            host_input_row_offsets=host_input_row_offsets,
+            host_input_row_offsets=host_row_offsets,
         )
 
     @override
@@ -195,7 +280,7 @@ class MiniMaxM2Model(AlwaysSignalBuffersMixin, LlamaModelBase):
             attention_bias=self.attention_bias,
         )
 
-        # Detect gate dtype and correction bias dtype from state dict
+        # Detect dtypes from state dict
         for k, v in state_dict.items():
             if k.endswith("mlp.gate.gate_score.weight"):
                 model_config.gate_dtype = v.dtype
@@ -206,19 +291,23 @@ class MiniMaxM2Model(AlwaysSignalBuffersMixin, LlamaModelBase):
                 model_config.correction_bias_dtype = v.dtype
                 break
 
+        for k, v in state_dict.items():
+            if k.endswith("self_attn.q_proj.weight"):
+                model_config.attn_dtype = v.dtype
+                break
+
         # Create EP config for multi-GPU MoE
         # Each GPU sends the full batch through EP dispatch (attention is
         # replicated, so all GPUs have identical tokens).
         num_devices = len(self.devices)
         ep_size = num_devices
-        attn_tp_size = (
-            ep_size // self.pipeline_config.model.data_parallel_degree
-        )
-        ep_max_rank_send_tokens = (
-            self.pipeline_config.runtime.max_batch_input_tokens // attn_tp_size
+        ep_max_rank_send_tokens = calculate_ep_max_tokens_per_rank(
+            max_batch_input_tokens=self.pipeline_config.runtime.max_batch_input_tokens,
+            ep_size=ep_size,
+            data_parallel_degree=self.pipeline_config.model.data_parallel_degree,
         )
         model_config.ep_config = EPConfig(
-            dispatch_dtype=DType.float8_e4m3fn,
+            dispatch_dtype=model_config.dtype,
             combine_dtype=DType.bfloat16,
             hidden_size=model_config.hidden_size,
             top_k=model_config.num_experts_per_tok,

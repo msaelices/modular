@@ -505,76 +505,6 @@ struct Struct_ep_dispatch_wait:
         )
 
 
-@compiler.register("ep.dispatch_wait.fused_shared_expert")
-struct Struct_ep_dispatch_wait_fused_shared_expert:
-    @always_inline
-    @staticmethod
-    def execute[
-        hidden_size: Int,
-        top_k: Int,
-        n_experts: Int,
-        max_token_per_rank: Int,
-        n_gpus_per_node: Int,
-        n_nodes: Int,
-        //,
-        target: StaticString,
-    ](
-        output_tokens: OutputTensor[dtype=DType.bfloat16, rank=2, ...],
-        row_offsets: OutputTensor[dtype=DType.uint32, rank=1, ...],
-        expert_ids: OutputTensor[dtype=DType.int32, rank=1, ...],
-        src_info: OutputTensor[dtype=DType.int32, rank=2, ...],
-        atomic_counters: MutableInputTensor[dtype=DType.int32, rank=1, ...],
-        recv_ptrs: InputTensor[dtype=DType.uint64, rank=1, ...],
-        recv_count_ptrs: InputTensor[dtype=DType.uint64, rank=1, ...],
-        input_tokens: InputTensor[dtype=DType.bfloat16, rank=2, ...],
-        context: DeviceContextPtr,
-    ) raises:
-        """Execute the Expert Parallelism dispatch completion kernel. Received
-        tokens are in BF16 format. This kernel also packs the shared expert's
-        inputs with the routed experts' inputs.
-        """
-
-        # Ensure the shape for the input tensors are correct
-        comptime assert (
-            Int(output_tokens.static_spec.shape_tuple[1]) == hidden_size
-        ), "EP dispatch_wait: output tokens shape doesn't match hidden size."
-
-        var format_handler = BF16TokenFormat[hidden_size, top_k](
-            output_tokens.to_tile_tensor[DType.int64]()
-        )
-
-        var input_tokens_tensor = TileTensor[
-            DType.bfloat16, RT_LAYOUT_2D, ImmutAnyOrigin
-        ](
-            ptr=input_tokens._ptr,
-            layout=row_major(
-                (
-                    Idx(Int64(input_tokens.dim_size(0))),
-                    Idx(Int64(input_tokens.dim_size(0))),
-                )
-            ),
-        )
-
-        ep_dispatch_wait_kernel_api[
-            n_experts,
-            max_token_per_rank,
-            n_gpus_per_node,
-            n_nodes,
-            target,
-            fused_shared_expert=True,
-        ](
-            format_handler,
-            row_offsets.to_tile_tensor[DType.int64](),
-            expert_ids.to_tile_tensor[DType.int64](),
-            src_info.to_tile_tensor[DType.int64](),
-            recv_ptrs.to_tile_tensor[DType.int64](),
-            recv_count_ptrs.to_tile_tensor[DType.int64](),
-            atomic_counters.to_tile_tensor[DType.int64](),
-            context,
-            input_tokens_tensor,
-        )
-
-
 @compiler.register("ep.dispatch_wait.fp8")
 struct Struct_ep_dispatch_wait_fp8:
     @always_inline
@@ -633,82 +563,6 @@ struct Struct_ep_dispatch_wait_fp8:
             recv_count_ptrs.to_tile_tensor[DType.int64](),
             atomic_counters.to_tile_tensor[DType.int64](),
             context,
-        )
-
-
-@compiler.register("ep.dispatch_wait.fp8.fused_shared_expert")
-struct Struct_ep_dispatch_wait_fp8_fused_shared_expert:
-    @always_inline
-    @staticmethod
-    def execute[
-        dispatch_dtype: DType,
-        dispatch_scale_dtype: DType,
-        hidden_size: Int,
-        top_k: Int,
-        n_experts: Int,
-        max_token_per_rank: Int,
-        n_gpus_per_node: Int,
-        n_nodes: Int,
-        dispatch_scale_granularity: StaticString,
-        //,
-        target: StaticString,
-    ](
-        output_tokens: OutputTensor[dtype=dispatch_dtype, rank=2, ...],
-        output_scales: OutputTensor[dtype=dispatch_scale_dtype, rank=2, ...],
-        row_offsets: OutputTensor[dtype=DType.uint32, rank=1, ...],
-        expert_ids: OutputTensor[dtype=DType.int32, rank=1, ...],
-        src_info: OutputTensor[dtype=DType.int32, rank=2, ...],
-        atomic_counters: MutableInputTensor[dtype=DType.int32, rank=1, ...],
-        recv_ptrs: InputTensor[dtype=DType.uint64, rank=1, ...],
-        recv_count_ptrs: InputTensor[dtype=DType.uint64, rank=1, ...],
-        input_tokens: InputTensor[dtype=DType.bfloat16, rank=2, ...],
-        context: DeviceContextPtr,
-    ) raises:
-        """Execute the Expert Parallelism dispatch completion kernel. Received
-        tokens are in Blockwise FP8 format. This kernel also packs the shared
-        expert's inputs with the routed experts' inputs.
-        """
-
-        var output_tokens_tensor = output_tokens.to_tile_tensor[DType.int64]()
-        var output_scales_tensor = output_scales.to_tile_tensor[DType.int64]()
-        var _input_tokens = TileTensor[
-            DType.bfloat16, RT_LAYOUT_2D, ImmutAnyOrigin
-        ](
-            ptr=input_tokens._ptr,
-            layout=row_major(
-                (
-                    Idx(Int64(input_tokens.dim_size(0))),
-                    Idx(Int64(input_tokens.dim_size(0))),
-                )
-            ),
-        )
-
-        # Ensure the shape for the input tensors are correct
-        comptime assert (
-            output_tokens_tensor.static_shape[1] == hidden_size
-        ), "EP dispatch_wait: output tokens shape doesn't match hidden size."
-
-        var format_handler = BlockwiseFP8TokenFormat[hidden_size, top_k](
-            output_tokens_tensor, output_scales_tensor
-        )
-
-        ep_dispatch_wait_kernel_api[
-            n_experts,
-            max_token_per_rank,
-            n_gpus_per_node,
-            n_nodes,
-            target,
-            fused_shared_expert=True,
-        ](
-            format_handler,
-            row_offsets.to_tile_tensor[DType.int64](),
-            expert_ids.to_tile_tensor[DType.int64](),
-            src_info.to_tile_tensor[DType.int64](),
-            recv_ptrs.to_tile_tensor[DType.int64](),
-            recv_count_ptrs.to_tile_tensor[DType.int64](),
-            atomic_counters.to_tile_tensor[DType.int64](),
-            context,
-            _input_tokens,
         )
 
 
@@ -793,6 +647,8 @@ struct Struct_ep_dispatch:
         n_gpus_per_node: Int,
         n_nodes: Int,
         fused_shared_expert: Bool,
+        skip_a2a: Bool,
+        allreduce_world_size: Int,
         //,
         target: StaticString,
     ](
@@ -824,6 +680,8 @@ struct Struct_ep_dispatch:
             n_nodes,
             fused_shared_expert,
             target,
+            skip_a2a=skip_a2a,
+            allreduce_world_size=allreduce_world_size,
         ](
             format_handler,
             row_offsets.to_tile_tensor[DType.int64](),
@@ -855,6 +713,8 @@ struct Struct_ep_dispatch_fp8:
         n_nodes: Int,
         dispatch_scale_granularity: StaticString,
         fused_shared_expert: Bool,
+        skip_a2a: Bool,
+        allreduce_world_size: Int,
         //,
         target: StaticString,
     ](
@@ -888,6 +748,8 @@ struct Struct_ep_dispatch_fp8:
             n_nodes,
             fused_shared_expert,
             target,
+            skip_a2a=skip_a2a,
+            allreduce_world_size=allreduce_world_size,
         ](
             format_handler,
             row_offsets.to_tile_tensor[DType.int64](),
@@ -919,6 +781,8 @@ struct Struct_ep_dispatch_nvfp4:
         n_gpus_per_node: Int,
         n_nodes: Int,
         fused_shared_expert: Bool,
+        skip_a2a: Bool,
+        allreduce_world_size: Int,
         //,
         target: StaticString,
     ](
@@ -968,6 +832,8 @@ struct Struct_ep_dispatch_nvfp4:
             fused_shared_expert,
             target,
             input_scales_wrapper=input_scales_fn,
+            skip_a2a=skip_a2a,
+            allreduce_world_size=allreduce_world_size,
         ](
             format_handler,
             row_offsets.to_tile_tensor[DType.int64](),
@@ -1045,7 +911,7 @@ struct DistributedEPDispatchNVFP4:
         @always_inline
         def launch_dispatch[
             index: Int
-        ]() raises unified {
+        ]() raises {
             read output_tokens,
             read output_scales,
             read row_offsets,
@@ -1165,7 +1031,7 @@ struct DistributedEPDispatchMXFP4:
         @always_inline
         def launch_dispatch[
             index: Int
-        ]() raises unified {
+        ]() raises {
             read output_tokens,
             read output_scales,
             read row_offsets,
@@ -1258,7 +1124,7 @@ struct DistributedEPDispatch:
         @always_inline
         def launch_dispatch[
             index: Int
-        ]() raises unified {
+        ]() raises {
             read output_tokens,
             read row_offsets,
             read expert_ids,
@@ -1350,7 +1216,7 @@ struct DistributedEPDispatchFP8:
         @always_inline
         def launch_dispatch[
             index: Int
-        ]() raises unified {
+        ]() raises {
             read output_tokens,
             read output_scales,
             read row_offsets,
@@ -1461,7 +1327,7 @@ struct DistributedEPCombine:
         @always_inline
         def launch_combine[
             index: Int
-        ]() raises unified {
+        ]() raises {
             read output_tokens,
             read input_tokens,
             read src_info,
@@ -1573,69 +1439,6 @@ struct Struct_ep_combine_async:
         )
 
 
-@compiler.register("ep.combine_async.fused_shared_expert")
-struct Struct_ep_combine_async_fused_shared_expert:
-    @always_inline
-    @staticmethod
-    def execute[
-        combine_dtype: DType,
-        hidden_size: Int,
-        top_k: Int,
-        n_experts: Int,
-        max_token_per_rank: Int,
-        n_gpus_per_node: Int,
-        n_nodes: Int,
-        //,
-        target: StaticString,
-    ](
-        output_tokens: OutputTensor[dtype=combine_dtype, rank=2, ...],
-        atomic_counters: MutableInputTensor[dtype=DType.int32, rank=1, ...],
-        input_tokens: InputTensor[dtype=combine_dtype, rank=2, ...],
-        src_info: InputTensor[dtype=DType.int32, rank=2, ...],
-        send_ptrs: InputTensor[dtype=DType.uint64, rank=1, ...],
-        recv_ptrs: InputTensor[dtype=DType.uint64, rank=1, ...],
-        recv_count_ptrs: InputTensor[dtype=DType.uint64, rank=1, ...],
-        context: DeviceContextPtr,
-    ) raises:
-        """Execute the Expert Parallelism combine kernel. This kernel will
-        also filter out the shared expert's outputs and store them in a separate
-        tensor.
-        """
-
-        var _output_tokens = TileTensor[
-            combine_dtype, RT_LAYOUT_2D, MutAnyOrigin
-        ](
-            ptr=output_tokens._ptr,
-            layout=row_major(
-                (
-                    Idx(Int64(output_tokens.dim_size(0))),
-                    Idx(Int64(output_tokens.dim_size(0))),
-                )
-            ),
-        )
-
-        ep_combine_async_kernel_api[
-            combine_dtype,
-            hidden_size,
-            top_k,
-            n_experts,
-            max_token_per_rank,
-            n_gpus_per_node,
-            n_nodes,
-            target,
-            fused_shared_expert=True,
-        ](
-            atomic_counters.to_tile_tensor[DType.int64](),
-            input_tokens.to_tile_tensor[DType.int64](),
-            src_info.to_tile_tensor[DType.int64](),
-            send_ptrs.to_tile_tensor[DType.int64](),
-            recv_ptrs.to_tile_tensor[DType.int64](),
-            recv_count_ptrs.to_tile_tensor[DType.int64](),
-            context,
-            _output_tokens,
-        )
-
-
 @compiler.register("ep.combine_wait")
 struct Struct_ep_combine_wait:
     @parameter
@@ -1725,6 +1528,7 @@ struct Struct_ep_combine:
         n_nodes: Int,
         fused_shared_expert: Bool,
         lambdas_have_fusion: Bool,
+        skip_a2a: Bool,
         //,
         target: StaticString,
     ](
@@ -1778,6 +1582,7 @@ struct Struct_ep_combine:
                 output_fn
             ) if lambdas_have_fusion else None,
             fused_shared_expert=fused_shared_expert,
+            skip_a2a=skip_a2a,
         ](
             output_tokens.to_tile_tensor[DType.int64](),
             atomic_counters.to_tile_tensor[DType.int64](),
@@ -1787,6 +1592,95 @@ struct Struct_ep_combine:
             recv_ptrs.to_tile_tensor[DType.int64](),
             recv_count_ptrs.to_tile_tensor[DType.int64](),
             context,
+        )
+
+
+@compiler.register("ep.combine.skip_a2a")
+struct Struct_ep_combine_skip_a2a:
+    @always_inline
+    @staticmethod
+    @parameter
+    def execute[
+        combine_dtype: DType,
+        router_weights_dtype: DType,
+        hidden_size: Int,
+        top_k: Int,
+        n_experts: Int,
+        max_token_per_rank: Int,
+        n_gpus_per_node: Int,
+        n_nodes: Int,
+        fused_shared_expert: Bool,
+        lambdas_have_fusion: Bool,
+        skip_a2a: Bool,
+        allreduce_world_size: Int,
+        //,
+        target: StaticString,
+    ](
+        output_tokens: FusedOutputTensor[dtype=combine_dtype, rank=2, ...],
+        atomic_counters: MutableInputTensor[dtype=DType.int32, rank=1, ...],
+        input_tokens: InputTensor[dtype=combine_dtype, rank=2, ...],
+        src_info: InputTensor[dtype=DType.int32, rank=2, ...],
+        send_ptrs: InputTensor[dtype=DType.uint64, rank=1, ...],
+        recv_ptrs: InputTensor[dtype=DType.uint64, rank=1, ...],
+        recv_count_ptrs: InputTensor[dtype=DType.uint64, rank=1, ...],
+        router_weights: InputTensor[dtype=router_weights_dtype, rank=2, ...],
+        topk_ids: InputTensor[dtype=DType.int32, rank=2, ...],
+        context: DeviceContextPtr,
+    ) raises:
+        """Execute the fused Expert Parallelism combine kernel."""
+        var router_weights_tensor = router_weights.to_tile_tensor[DType.int64]()
+        comptime assert router_weights_tensor.flat_rank == 2
+        comptime assert router_weights_tensor.flat_rank >= 2
+
+        @parameter
+        @always_inline
+        @__copy_capture(router_weights_tensor)
+        def router_weights_fn[
+            width: Int
+        ](token_idx: Int, topk_id: Int) -> SIMD[DType.float32, width]:
+            return router_weights_tensor.load[width=width](
+                (Idx(token_idx), Idx(topk_id))
+            ).cast[DType.float32]()
+
+        @parameter
+        @always_inline
+        def output_fn[
+            dtype: DType, width: SIMDSize, *, alignment: Int = 1
+        ](coords: IndexList[2], val: SIMD[dtype, width]):
+            output_tokens._lambda_store[
+                width=width, element_alignment=alignment
+            ](
+                coords,
+                rebind[SIMD[combine_dtype, width]](val),
+            )
+
+        ep_fused_combine_kernel_api[
+            hidden_size,
+            top_k,
+            n_experts,
+            max_token_per_rank,
+            n_gpus_per_node,
+            n_nodes,
+            target,
+            router_weights_wrapper=router_weights_fn,
+            epilogue_fn=Optional[elementwise_epilogue_type](
+                output_fn
+            ) if lambdas_have_fusion else None,
+            fused_shared_expert=fused_shared_expert,
+            skip_a2a=skip_a2a,
+            allreduce_world_size=allreduce_world_size,
+        ](
+            output_tokens.to_tile_tensor[DType.int64](),
+            atomic_counters.to_tile_tensor[DType.int64](),
+            input_tokens.to_tile_tensor[DType.int64](),
+            src_info.to_tile_tensor[DType.int64](),
+            send_ptrs.to_tile_tensor[DType.int64](),
+            recv_ptrs.to_tile_tensor[DType.int64](),
+            recv_count_ptrs.to_tile_tensor[DType.int64](),
+            context,
+            topk_ids._ptr.as_immutable().unsafe_origin_cast[
+                ImmutExternalOrigin
+            ](),
         )
 
 
