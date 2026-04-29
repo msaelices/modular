@@ -23,7 +23,7 @@ from std.math import align_down
 
 @always_inline
 def vectorize[
-    func: def[width: Int](idx: Int) unified -> None,
+    func: def[width: Int](idx: Int) -> None,
     //,
     simd_width: Int,
     /,
@@ -60,7 +60,7 @@ def vectorize[
     def main():
         var p = alloc[Int32](size)
 
-        def closure[width: Int](i: Int) unified {mut}:
+        def closure[width: Int](i: Int) {mut}:
             print("storing", width, "els at pos", i)
             p.store[width=width](i, i)
 
@@ -84,7 +84,7 @@ def vectorize[
     You can also unroll the loop to potentially improve performance at the cost
     of binary size:
 
-    ```
+    ```text
     vectorize[closure, width, unroll_factor=2](size)
     ```
 
@@ -92,7 +92,7 @@ def vectorize[
     fewer arithmetic, comparison, and conditional jump operations. The assembly
     would look like this in pseudocode:
 
-    ```
+    ```text
     closure[4](0)
     closure[4](4)
     # Remainder loop won't unroll unless `size` is passed as a parameter
@@ -128,7 +128,7 @@ def vectorize[
 
 @always_inline
 def vectorize[
-    func: def[width: Int](idx: Int, evl: Int) unified -> None,
+    func: def[width: Int](idx: Int, evl: Int) -> None,
     //,
     simd_width: Int,
     /,
@@ -175,7 +175,7 @@ def vectorize[
     def main():
         var p = alloc[Int32](size)
 
-        def closure[width: Int](i: Int, evl: Int) unified {mut}:
+        def closure[width: Int](i: Int, evl: Int) {mut}:
             print("storing", evl, "of", width, "els at pos", i)
             var val = SIMD[DType.int32, width](i)
 
@@ -211,7 +211,7 @@ def vectorize[
     You can also unroll the main loop to potentially improve performance at the
     cost of binary size:
 
-    ```
+    ```text
     vectorize[simd_width, unroll_factor=2](size, closure)
     ```
 
@@ -219,7 +219,7 @@ def vectorize[
     in fewer arithmetic, comparison, and conditional jump operations. In
     pseudocode:
 
-    ```
+    ```text
     closure[4](0, 4)
     closure[4](4, 4)
     closure[4](8, 2)  # single predicated tail call
@@ -255,7 +255,7 @@ def vectorize[
 
 @always_inline
 def vectorize[
-    func: def[width: Int](idx: Int) unified -> None,
+    func: def[width: Int](idx: Int) -> None,
     //,
     simd_width: Int,
     /,
@@ -294,8 +294,8 @@ def vectorize[
     def main():
         var p = alloc[Int32](size)
 
-        # The closure can capture the `p` pointer with unified {mut}
-        def closure[width: Int](i: Int) unified {mut}:
+        # The closure can capture the `p` pointer with {mut}
+        def closure[width: Int](i: Int) {mut}:
             print("storing", width, "els at pos", i)
             p.store[width=width](i, i)
 
@@ -322,7 +322,7 @@ def vectorize[
     You can also unroll the main loop to potentially improve performance at the
     cost of binary size:
 
-    ```
+    ```text
     vectorize[width, size=size, unroll_factor=2](closure)
     ```
 
@@ -330,7 +330,7 @@ def vectorize[
     fewer arithmetic, comparison, and conditional jump operations. The assembly
     would look like this in pseudocode:
 
-    ```
+    ```text
     closure[4](0)
     closure[4](4)
     closure[2](8)

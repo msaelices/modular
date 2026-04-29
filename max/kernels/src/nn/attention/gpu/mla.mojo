@@ -81,6 +81,7 @@ from layout.layout_tensor import (
 )
 from layout.swizzle import make_swizzle
 from layout.tensor_core import get_fragment_size, get_mma_shape
+from layout.tile_tensor import NullableTileTensor
 from linalg.matmul.gpu._multistage_gemm_gpu import multistage_mma
 from std.memory import stack_allocation
 from nn._ragged_utils import get_batch_from_row_offsets
@@ -106,12 +107,16 @@ from std.utils.static_tuple import StaticTuple
 
 from nn.attention.mha_utils import get_start_and_end_for_partitions
 from nn.softmax import _online_softmax_iter_for_mma_output
-from .amd.mla import Attention, MLAAttentionConfig
+from .amd_structured.mla_decode import Attention
+from .amd_structured.mla_prefill import Attention
 from .nvidia.sm100.mla_prefill import mla_sm100_prefill
 from std.gpu.host.info import B200, _is_sm10x_gpu
 from nn.attention.gpu.nvidia.sm100.mla_decode_dispatch import (
     MLADispatchScalarArgs,
     mla_decode_sm100_dispatch,
+)
+from nn.attention.gpu.nvidia.sm100.mla_decode_sparse_kv_fp8 import (
+    mla_decode_sm100_dispatch_sparse_fp8,
 )
 from .nvidia.sm100.mla_prefill_per_token_scale import (
     mla_sm100_prefill_per_token_scale,
@@ -146,7 +151,7 @@ def flare_mla_decoding[
     ],
     scale: Float32,
     ctx: DeviceContext,
-    scalar_args_buf: TileTensor[
+    scalar_args_buf: NullableTileTensor[
         DType.int64, address_space=AddressSpace.GENERIC, ...
     ],
     q_max_seq_len: OptionalReg[Int] = None,
@@ -256,6 +261,56 @@ def flare_mla_decoding[
 
         var k_operand = KVCacheMHAOperand(k)
 
+        # ----------------------------------------------------------------
+        # Sparse all-FP8 KV routing (Option C):
+        #
+        # When the cache layout is the 576-byte all-FP8 row (nope 512 B FP8
+        # + rope 64 B FP8), route to the dedicated
+        # `mla_decode_sm100_dispatch_sparse_fp8` entry point. This kernel
+        # uses a single 576-byte gather4 TMA and is mutually exclusive with
+        # the BF16-rope sparse kernel (640-byte rows) which continues to
+        # be served by the existing `flare_mla_decoding_dispatch` path.
+        #
+        # The discriminator is `cache_t.kv_params.head_size`: 576 selects
+        # the new all-FP8 kernel; any other value (e.g. 640 for FP8 nope +
+        # BF16 rope) falls through to the legacy dispatch unchanged.
+        # ----------------------------------------------------------------
+        comptime _is_sparse_all_fp8_kv = (
+            sparse
+            and cache_t.dtype == DType.float8_e4m3fn
+            and cache_t.kv_params.head_size == 576
+            and not per_token_scale_rope_aware
+        )
+
+        comptime if _is_sparse_all_fp8_kv:
+            mla_decode_sm100_dispatch_sparse_fp8[
+                config=config,
+                ragged=ragged,
+                decoding_warp_split_k=decoding_warp_split_k,
+            ](
+                output,
+                q,
+                k,
+                mask_functor,
+                valid_length,
+                max_prompt_len,
+                num_keys,
+                scale,
+                ctx,
+                scalar_args_buf,
+                q_scale_ptr,
+                d_indices,
+                indices_stride,
+                topk_lengths,
+                attn_sink_ptr,
+                extra_k=extra_k,
+                extra_d_indices=extra_d_indices,
+                extra_indices_stride=extra_indices_stride,
+                extra_topk_lengths=extra_topk_lengths,
+                extra_scales_ptr=extra_scales_ptr,
+            )
+            return
+
         # For per_token_scale_rope_aware: Q's last dim is 640 (interleaved FP8+BF16)
         # but the logical depth is 576. Override config to use 576.
         comptime if per_token_scale_rope_aware:
@@ -349,7 +404,7 @@ def flare_mla_decoding[
     mask_functor: mask_t,
     scale: Float32,
     ctx: DeviceContext,
-    scalar_args_buf: TileTensor[
+    scalar_args_buf: NullableTileTensor[
         DType.int64, address_space=AddressSpace.GENERIC, ...
     ],
     # if not set, we select num_partitions based on heuristics
@@ -372,8 +427,10 @@ def flare_mla_decoding[
         )
     )
 
-    var valid_length = TileTensor[DType.uint32, _, MutExternalOrigin](
-        None,
+    var valid_length = TileTensor(
+        UnsafePointer[
+            Scalar[DType.uint32], MutExternalOrigin
+        ].unsafe_dangling(),
         row_major(Coord(Idx(0))),
     )
 
@@ -432,7 +489,7 @@ def flare_mla_decoding_dispatch[
     max_cache_valid_length: Int,
     scale: Float32,
     ctx: DeviceContext,
-    scalar_args_buf: TileTensor[
+    scalar_args_buf: NullableTileTensor[
         DType.int64, address_space=AddressSpace.GENERIC, ...
     ],
     kv_input_row_offsets: OptionalReg[
@@ -495,7 +552,7 @@ def flare_mla_decoding_dispatch[
     # TileTensor always has static shapes for the last two dims.
 
     comptime if _is_sm10x_gpu(ctx.default_device_info):
-        if scalar_args_buf.ptr._is_not_null():
+        if scalar_args_buf.ptr:
             # Capturable path: GPU buffer is pre-computed, compute host-side
             # dispatch args from inputs.
             var batch_size: Int
@@ -526,7 +583,7 @@ def flare_mla_decoding_dispatch[
                 scale,
                 valid_length,
                 mask_functor,
-                scalar_args_buf,
+                scalar_args_buf.value(),
                 batch_size,
                 max_prompt_len,
                 max_cache_valid_length,
@@ -842,17 +899,15 @@ def mla_decoding[
             k_group_size=group,
         )
 
-        comptime attention_config = MLAAttentionConfig[True, config]()
-
         var attention = Attention[
             config,
             group,
-            True,
-            False,
+            False,  # sink
+            token_gen=True,
             q_depth=depth,
             output_depth=depth_v,
+            mla_mode=True,
         ](
-            attention_config,
             output_ptr + output_batch_offset,
             q_ptr + q_batch_offset,
             k,
@@ -865,7 +920,7 @@ def mla_decoding[
             num_keys,
             0,
         )
-        attention.mla_decoding(
+        attention.mla_decode(
             exp_sum_batch_ptr,
             qk_max_batch_ptr,
             num_partitions,
@@ -2363,9 +2418,7 @@ def mla_prefill[
             batch_idx,
         )
     elif is_amd_gpu():
-        comptime attention_config = MLAAttentionConfig[False, config]()
-        var attention = Attention[config, 1, False, False, q_depth=q_depth](
-            attention_config,
+        var attention = Attention[config, 1, False, q_depth=q_depth](
             output_ptr + o_batch_offset,
             q_ptr + q_batch_offset,
             k,
@@ -2379,7 +2432,7 @@ def mla_prefill[
             Int(start_pos),
             Int(cache_start_pos),
         )
-        attention.mla_prefill_gfx950(
+        attention.mla_prefill(
             k_rope,
         )
     else:
@@ -3410,7 +3463,7 @@ def _k_cache_to_buffer[
 
     def copy_fn_unified[
         width: Int, rank: Int, alignment: Int = 1
-    ](idx: IndexList[rank]) unified register_passable {}:
+    ](idx: IndexList[rank]) register_passable:
         copy_fn[width, rank, alignment](idx)
 
     _elementwise_impl_gpu[simd_width=target_simd_width](
