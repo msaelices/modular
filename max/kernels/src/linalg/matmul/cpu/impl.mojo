@@ -90,7 +90,7 @@ def elementwise_epilogue_c_tile[
     @always_inline
     def activation_on_col_chunk[
         col_chunk_size: Int
-    ](idx_n: Int) unified {c, offset, tile_len, mut}:
+    ](idx_n: Int) {c, offset, tile_len, mut}:
         var n_coord = idx_n + offset.N
         for idx_m in range(tile_len.M):
             var m_coord = idx_m + offset.M
@@ -113,7 +113,7 @@ def tiled_matmul_run[
     kernel_id: InnerKernelID,
     algorithm: InnerMatmulKernel,
     ElementwiseEpilogueFnType: ImplicitlyCopyable
-    & def(GemmShape, GemmShape) unified -> None,
+    & def(GemmShape, GemmShape) -> None,
 ](
     alg: algorithm,
     c: TileTensor[mut=True, address_space=AddressSpace.GENERIC, ...],
@@ -191,7 +191,7 @@ struct TiledMatmul[
     c_origin: MutOrigin,
     algorithm: InnerMatmulKernel,
     ElementwiseEpilogueFnType: ImplicitlyCopyable
-    & def(GemmShape, GemmShape) unified -> None,
+    & def(GemmShape, GemmShape) -> None,
 ](ImplicitlyCopyable):
     """Tiled matmul implementation integrating packing, inner loop and tile
     partitions.
@@ -440,7 +440,7 @@ def _matmul_cpu_impl[
         var complexity = m * n * k
         var num_tasks = min(
             ceildiv(complexity, get_min_task_size()),
-            num_threads if num_threads > 0 else parallelism_level(),
+            num_threads if num_threads > 0 else parallelism_level(ctx),
         )
 
         comptime use_i8mm = kernel_id == InnerKernelID.I8MM
@@ -711,9 +711,7 @@ def _submatmul_sequential_sync[
 ):
     comptime simd_size = config.simd_size
 
-    def elementwise_closure(
-        offset: GemmShape, shape: GemmShape
-    ) unified {read c}:
+    def elementwise_closure(offset: GemmShape, shape: GemmShape) {read c}:
         comptime if elementwise_lambda_fn:
             comptime func = elementwise_lambda_fn.value()
             elementwise_epilogue_c_tile[

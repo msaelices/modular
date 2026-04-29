@@ -173,7 +173,7 @@ def _memcpy_impl(
         n: The number of bytes to copy.
     """
 
-    def copy[width: Int](offset: Int) unified {read}:
+    def copy[width: Int](offset: Int) {read}:
         dest_data.store(offset, src_data.load[width=width](offset))
 
     comptime if is_gpu():
@@ -325,7 +325,7 @@ def memmove[
 def _memset_impl(
     ptr: UnsafePointer[mut=True, Byte, ...], value: Byte, count: Int
 ):
-    def fill[width: Int](offset: Int) unified {read}:
+    def fill[width: Int](offset: Int) {read}:
         ptr.store(offset, SIMD[DType.uint8, width](value))
 
     comptime simd_width = simd_width_of[Byte]()
@@ -377,7 +377,7 @@ def memset_zero[
     comptime if count > 128:
         return memset_zero(ptr, count)
 
-    def fill[width: Int](offset: Int) unified {read}:
+    def fill[width: Int](offset: Int) {read}:
         ptr.store(offset, SIMD[dtype, width](0))
 
     vectorize[simd_width_of[dtype]()](count, fill)
@@ -617,3 +617,74 @@ def destroy_n[
     else:
         for i in range(count):
             (pointer + i).destroy_pointee()
+
+
+# ===-----------------------------------------------------------------------===#
+# Ownership Ops
+# ===-----------------------------------------------------------------------===#
+
+
+@always_inline("nodebug")
+def forget_deinit[T: AnyType](var value: T):
+    """Takes ownership and skips running `__del__` deinitializers.
+
+    This is a low-level operation, and should not be used unless necessary.
+    Consider if refactoring to avoid needing this function would be more
+    appropriate.
+
+    This operation is not considered unsafe, as Mojo can not guarantee in
+    general that destructors will eventually be run.
+
+    Note: Take care to use `^` to transfer when passing `ImplicitlyCopyable`
+    values to `forget_deinit()`, to avoid forgetting a copy instead of the
+    original value.
+
+    Parameters:
+        T: The type of the value to discard without running a deinitializer.
+
+    Args:
+        value: The value to discard without running a deinitializer.
+
+    Example:
+
+    ```mojo
+    from std.memory import forget_deinit
+
+    @fieldwise_init
+    struct Noisy:
+        def __del__(deinit self):
+            print("@ Noisy.__del__: Noisy is being deleted!")
+
+    def main():
+        var noisy = Noisy()
+
+        # No deletion message is printed
+        forget_deinit(noisy^)
+    ```
+
+    This will skip the destructor for the "root" `value` object and all of
+    it's fields, recursively. Example:
+
+    ```mojo
+    from std.memory import forget_deinit
+
+    @fieldwise_init
+    struct Parent:
+        var child: Child
+
+        def __del__(deinit self):
+            print("@ Parent.__del__")
+
+    @fieldwise_init
+    struct Child(Movable):
+        def __del__(deinit self):
+            print("@ Child.__del__")
+
+    def main():
+        var parent = Parent(Child())
+
+        # Neither Parent.__del__ nor Child.__del__ is called.
+        forget_deinit(parent^)
+    ```
+    """
+    __mlir_op.`lit.ownership.mark_destroyed`(__get_mvalue_as_litref(value))
