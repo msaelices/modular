@@ -17,7 +17,6 @@ from std.sys.intrinsics import _type_is_eq
 from std.utils import IndexList
 from std.math.uutils import umod, ufloordiv
 
-from std.builtin.variadics import _ReduceVariadicAndIdxToVariadic
 from std.sys.intrinsics import _type_is_eq_parse_time
 
 
@@ -44,8 +43,8 @@ trait CoordLike(
     comptime is_value = not Self.is_tuple
     """True if this is a scalar value, False for tuple types."""
 
-    comptime DTYPE = DType.invalid
-    """The data type for runtime values, or invalid for compile-time values."""
+    comptime DTYPE = DType.int
+    """The data type used by scalar-returning coordinate operations."""
 
     # Note that unlike the __len__() from Sized, this is a static method.
     @staticmethod
@@ -57,13 +56,13 @@ trait CoordLike(
         """
         ...
 
-    def value(self) -> Int:
-        """Get the integer value of this coordinate.
+    def value(self) -> Scalar[Self.DTYPE]:
+        """Get the scalar value of this coordinate.
 
         Only valid for value types (not tuples).
 
         Returns:
-            The integer value.
+            The scalar value.
         """
         ...
 
@@ -77,7 +76,7 @@ trait CoordLike(
         """
         ...
 
-    def product(self) -> Int:
+    def product(self) -> Scalar[Self.DTYPE]:
         """Calculate the product of all elements.
 
         Returns:
@@ -85,7 +84,7 @@ trait CoordLike(
         """
         ...
 
-    def sum(self) -> Int:
+    def sum(self) -> Scalar[Self.DTYPE]:
         """Calculate the sum of all elements.
 
         Returns:
@@ -147,7 +146,7 @@ struct ComptimeInt[val: Int](CoordLike, TrivialRegisterPassable):
         t"ComptimeInt[{self.value()}]()".write_to(writer)
 
     @always_inline("nodebug")
-    def product(self) -> Int:
+    def product(self) -> Scalar[Self.DTYPE]:
         """Calculate the product (returns the value for scalar types).
 
         Returns:
@@ -156,7 +155,7 @@ struct ComptimeInt[val: Int](CoordLike, TrivialRegisterPassable):
         return self.value()
 
     @always_inline("nodebug")
-    def sum(self) -> Int:
+    def sum(self) -> Scalar[Self.DTYPE]:
         """Calculate the sum (returns the value for scalar types).
 
         Returns:
@@ -165,13 +164,13 @@ struct ComptimeInt[val: Int](CoordLike, TrivialRegisterPassable):
         return self.value()
 
     @always_inline("nodebug")
-    def value(self) -> Int:
-        """Get the integer value.
+    def value(self) -> Scalar[Self.DTYPE]:
+        """Get the scalar value.
 
         Returns:
             The compile-time integer value.
         """
-        return Self.val
+        return Scalar[Self.DTYPE](Self.val)
 
     @always_inline("nodebug")
     def tuple(var self) -> Coord[*Self.ParamListType]:
@@ -244,7 +243,7 @@ struct RuntimeInt[dtype: DType = DType.int](CoordLike, TrivialRegisterPassable):
         t"RuntimeInt[{self.dtype}]({self.value()})".write_to(writer)
 
     @always_inline("nodebug")
-    def product(self) -> Int:
+    def product(self) -> Scalar[Self.DTYPE]:
         """Calculate the product (returns the value for scalar types).
 
         Returns:
@@ -253,7 +252,7 @@ struct RuntimeInt[dtype: DType = DType.int](CoordLike, TrivialRegisterPassable):
         return self.value()
 
     @always_inline("nodebug")
-    def sum(self) -> Int:
+    def sum(self) -> Scalar[Self.DTYPE]:
         """Calculate the sum (returns the value for scalar types).
 
         Returns:
@@ -262,13 +261,13 @@ struct RuntimeInt[dtype: DType = DType.int](CoordLike, TrivialRegisterPassable):
         return self.value()
 
     @always_inline("nodebug")
-    def value(self) -> Int:
-        """Get the integer value.
+    def value(self) -> Scalar[Self.DTYPE]:
+        """Get the scalar value.
 
         Returns:
-            The runtime integer value as an Int.
+            The runtime integer value.
         """
-        return Int(self._value)
+        return self._value
 
     @always_inline("nodebug")
     def tuple(var self) -> Coord[*Self.ParamListType]:
@@ -377,7 +376,7 @@ struct _All(CoordLike, TrivialRegisterPassable):
     comptime static_value: Int = -2
     """Sentinel value distinguishing `_All` from `RuntimeInt` (-1) and `ComptimeInt` (>=0)."""
 
-    comptime DTYPE = DType.invalid
+    comptime DTYPE = DType.int
 
     comptime is_static_value = True
 
@@ -396,16 +395,16 @@ struct _All(CoordLike, TrivialRegisterPassable):
         writer.write("All")
 
     @always_inline("nodebug")
-    def product(self) -> Int:
-        return 1
+    def product(self) -> Scalar[Self.DTYPE]:
+        return Scalar[Self.DTYPE](1)
 
     @always_inline("nodebug")
-    def sum(self) -> Int:
-        return 0
+    def sum(self) -> Scalar[Self.DTYPE]:
+        return Scalar[Self.DTYPE](0)
 
     @always_inline("nodebug")
-    def value(self) -> Int:
-        return -2
+    def value(self) -> Scalar[Self.DTYPE]:
+        return Scalar[Self.DTYPE](-2)
 
     @always_inline("nodebug")
     def tuple(var self) -> Coord[*Self.ParamListType]:
@@ -421,7 +420,7 @@ struct Coord[*element_types: CoordLike](CoordLike, Sized, Writable):
     """A struct representing tuple-like data with compile-time and runtime elements.
 
     Parameters:
-        element_types: The variadic pack of element types that implement `CoordLike`.
+        element_types: The list of element types that implement `CoordLike`.
     """
 
     comptime ParamListType = Self.element_types
@@ -432,6 +431,10 @@ struct Coord[*element_types: CoordLike](CoordLike, Sized, Writable):
 
     comptime static_value: Int = -1
     """Always -1 for tuple types (value not applicable)."""
+
+    # TODO(GPUA-11): Expand `Coord.DTYPE` so that it can take narrower dtypes.
+    comptime DTYPE = DType.int
+    """The scalar dtype used for tuple-level aggregate operations."""
 
     comptime is_tuple = True
     """True, indicating this is a tuple type."""
@@ -570,35 +573,46 @@ struct Coord[*element_types: CoordLike](CoordLike, Sized, Writable):
         return self._storage[idx]
 
     @always_inline("nodebug")
-    def product(self) -> Int:
+    def product(self) -> Scalar[Self.DTYPE]:
         """Calculate the product of all elements recursively.
 
         Returns:
             The product of all leaf values in the `Coord`.
         """
-        var result = 1
+        var result: Scalar[Self.DTYPE] = 1
 
+        # `Coord` is a heterogeneous tuple: children may have different
+        # `DTYPE`s (e.g. `CompileTimeInt` with `DType.int` alongside a
+        # `RuntimeInt[DType.int32]`). Aggregating into `Self.DTYPE` is
+        # intentional — callers expect a single integer answer at the
+        # tuple's dtype, regardless of per-leaf dtype.
+        # TODO(GPUA-12): Add comptime asserts to make sure that Coord's
+        # product and sum do not overflow.
         comptime for i in range(Self.__len__()):
-            result *= self[i].product()
+            result *= Scalar[Self.DTYPE](self[i].product())
 
         return result
 
     @always_inline("nodebug")
-    def sum(self) -> Int:
+    def sum(self) -> Scalar[Self.DTYPE]:
         """Calculate the sum of all elements recursively.
 
         Returns:
             The sum of all leaf values in the `Coord`.
         """
-        var result = 0
+        var result: Scalar[Self.DTYPE] = 0
 
+        # See `product()`: aggregating heterogeneous child `DTYPE`s into
+        # `Self.DTYPE` is intentional.
+        # TODO(GPUA-12): Add comptime asserts to make sure that Coord's
+        # product and sum do not overflow.
         comptime for i in range(Self.__len__()):
-            result += self[i].sum()
+            result += Scalar[Self.DTYPE](self[i].sum())
 
         return result
 
     @always_inline("nodebug")
-    def value(self) -> Int:
+    def value(self) -> Scalar[Self.DTYPE]:
         """Get the value (not valid for `Coord` tuples).
 
         Returns:
@@ -646,7 +660,7 @@ struct Coord[*element_types: CoordLike](CoordLike, Sized, Writable):
                     i,
                     "] but got tuple",
                 )
-                result += self[i].value() * t_elem.value()
+                result += Int(self[i].value()) * t_elem.value()
         return result
 
     @always_inline("nodebug")
@@ -680,7 +694,7 @@ struct Coord[*element_types: CoordLike](CoordLike, Sized, Writable):
             comptime if T.is_tuple and U.is_tuple:
                 result += Coord(self[i]).inner_product(Coord(other[i]))
             elif T.is_value and U.is_value:
-                result += self[i].value() * other[i].value()
+                result += Int(self[i].value()) * Int(other[i].value())
             else:
                 comptime assert False, String(
                     "Element ",
@@ -722,7 +736,7 @@ struct Coord[*element_types: CoordLike](CoordLike, Sized, Writable):
                 if Coord(self[i]) != Coord(other[i]):
                     return False
             elif T.is_value and U.is_value:
-                if self[i].value() != other[i].value():
+                if Int(self[i].value()) != Int(other[i].value()):
                     return False
             else:
                 comptime assert False, String(
@@ -956,7 +970,16 @@ def _crd2idx_flat[
                 t" out of bounds for static shape [0,"
                 t" {_FlatShapeTypes[i].static_value}) at flat dim {i}"
             )
-        result += Scalar[out_type](crd_t[i].value() * flat_stride[i].value())
+        # Each operand is narrowed to `out_type` *before* the multiply, so the
+        # entire dot-product is computed at `out_type` precision. This is
+        # deliberate: on GPUs with narrow address types (e.g. `uint32`) we
+        # don't want a hidden 64-bit multiply widening every index calculation.
+        # Callers are responsible for choosing an `out_type` wide enough to
+        # hold `max(coord) * max(stride)` summed across dims; the default
+        # `DType.int64` covers essentially all real layouts.
+        result += Scalar[out_type](crd_t[i].value()) * Scalar[out_type](
+            flat_stride[i].value()
+        )
 
     return result
 
@@ -969,6 +992,12 @@ def crd2idx[
     out_type: DType = DType.int64,
 ](crd: Index, shape: Shape, stride: Stride) -> Scalar[out_type]:
     """Calculate the linear index from a coordinate tuple.
+
+    The dot product is computed at `out_type` precision (each `coord * stride`
+    term is evaluated after narrowing both operands to `out_type`). Callers
+    that pick a narrow `out_type` (e.g. `uint32`) are responsible for ensuring
+    every per-dim product and their sum fit in that type. The default
+    `DType.int64` is wide enough for realistic layouts. See `_crd2idx_flat`.
 
     Parameters:
         Index: The coordinate type (must be CoordLike).
@@ -1014,14 +1043,16 @@ def crd2idx[
             var crd_int: Int
 
             comptime if Index.is_tuple:
-                crd_int = 0 if crd_len == 0 else crd.tuple()[0].value()
+                crd_int = 0 if crd_len == 0 else Int(crd.tuple()[0].value())
             else:
-                crd_int = 0 if crd_len == 0 else crd.value()
+                crd_int = 0 if crd_len == 0 else Int(crd.value())
 
             comptime last_elem_idx = shape_len - 1
 
             comptime for i in range(last_elem_idx):
-                var quotient, remainder = divmod(crd_int, shape_t[i].product())
+                var quotient, remainder = divmod(
+                    crd_int, Int(shape_t[i].product())
+                )
                 result += crd2idx[out_type=out_type](
                     Idx(remainder), shape_t[i], stride_t[i]
                 )
@@ -1043,7 +1074,10 @@ def crd2idx[
                     t"crd2idx: static coordinate {Index.static_value} is out of"
                     t" bounds for static shape [0, {Shape.static_value})"
                 )
-            return Scalar[out_type](crd.value() * stride.value())
+            # Narrow-first multiply: see `_crd2idx_flat` for rationale.
+            return Scalar[out_type](crd.value()) * Scalar[out_type](
+                stride.value()
+            )
 
 
 # Implementation based off crd2idx - computes the inverse operation.
@@ -1136,8 +1170,8 @@ def idx2crd[
                     rebind[ResultTypes[i]](ComptimeInt[0]())
                 )
             else:
-                var stride_val = stride_t[i].value()
-                var shape_val = shape_t[i].value()
+                var stride_val = Int(stride_t[i].value())
+                var shape_val = Int(shape_t[i].value())
                 var coord_val = _linear_idx_to_coord(idx, stride_val, shape_val)
 
                 UnsafePointer(to=result[i]).init_pointee_copy(
@@ -1152,7 +1186,7 @@ def idx2crd[
             )
         else:
             var coord_val = _linear_idx_to_coord(
-                idx, stride.value(), shape.value()
+                idx, Int(stride.value()), Int(shape.value())
             )
 
             comptime for i in range(shape_len):
@@ -1225,7 +1259,7 @@ def idx2crd[
             comptime if Shape.ParamListType[i].is_tuple:
                 # Nested shape: recurse into sub-shape/sub-stride.
                 var nested = idx2crd[out_dtype=out_dtype](
-                    idx.value(), shape_t[i], stride_t[i]
+                    Int(idx.value()), shape_t[i], stride_t[i]
                 )
                 UnsafePointer(to=result[i]).init_pointee_copy(
                     rebind[ResultTypes[i]](nested)
@@ -1245,10 +1279,10 @@ def idx2crd[
                 # All static: result is ComptimeInt, already default-initialized.
                 pass
             else:
-                var stride_val = stride_t[i].value()
-                var shape_val = shape_t[i].value()
+                var stride_val = Int(stride_t[i].value())
+                var shape_val = Int(shape_t[i].value())
                 var coord_val = _linear_idx_to_coord(
-                    idx.value(), stride_val, shape_val
+                    Int(idx.value()), stride_val, shape_val
                 )
                 UnsafePointer(to=result[i]).init_pointee_copy(
                     rebind[ResultTypes[i]](
@@ -1269,7 +1303,7 @@ def idx2crd[
             pass
         else:
             var coord_val = _linear_idx_to_coord(
-                idx.value(), stride.value(), shape.value()
+                Int(idx.value()), Int(stride.value()), Int(shape.value())
             )
 
             comptime for i in range(shape_len):
@@ -1293,7 +1327,7 @@ def coord_to_int_tuple[
     - Tuple elements (nested `Coord`) become nested `IntTuple`s
 
     Parameters:
-        element_types: The variadic pack of element types in the `Coord`.
+        element_types: The list of element types in the `Coord`.
 
     Args:
         value: The `Coord` to convert.
@@ -1311,7 +1345,7 @@ def coord_to_int_tuple[
             result.append(coord_to_int_tuple(value[i].tuple()))
         else:
             # Convert value elements to integers
-            result.append(IntTuple(value[i].value()))
+            result.append(IntTuple(Int(value[i].value())))
 
     return result
 
@@ -1323,7 +1357,7 @@ def coord_to_index_list[
     """Convert a flat `Coord` to an `IndexList`.
 
     Parameters:
-        element_types: The variadic pack of element types in the `Coord`.
+        element_types: The list of element types in the `Coord`.
 
     Args:
         value: The `Coord` to convert.
@@ -1334,7 +1368,7 @@ def coord_to_index_list[
     var result = IndexList[value.rank]()
 
     comptime for i in range(type_of(value).__len__()):
-        result[i] = value[i].value()
+        result[i] = Int(value[i].value())
 
     return result
 
@@ -1347,7 +1381,7 @@ def coord_to_int_tuple[*element_types: CoordLike]() -> IntTuple:
     - Tuple elements (nested `Coord`) become nested `IntTuple`s
 
     Parameters:
-        element_types: The variadic pack of element types in the `Coord`.
+        element_types: The list of element types in the `Coord`.
 
     Returns:
         An `IntTuple` with the same structure and values as the input `Coord`.
@@ -1442,25 +1476,17 @@ Returns:
     A Coord full of `size` static elements.
 """
 
-comptime _FlattenReducer[
-    Prev: Variadic.TypesOfTrait[CoordLike],
-    From: Variadic.TypesOfTrait[CoordLike],
-    idx: SIMDSize,
-] = Variadic.concat_types[
-    Prev,
-    TypeList[From]()[idx]
-    ._ParamListType if TypeList[From]()[idx]
-    .is_tuple else TypeList.of[Trait=CoordLike, TypeList[From]()[idx]]()
-    .values,
-]
 
+comptime _FlattenOnceMapper[
+    element_type: CoordLike,
+]: TypeList.of[Trait=CoordLike]()._mlir_type = (
+    element_type._ParamListType if element_type.is_tuple else TypeList.of[
+        Trait=CoordLike, element_type
+    ]().values
+)
 
-comptime _FlattenOnce[*element_types: CoordLike] = TypeList[
-    _ReduceVariadicAndIdxToVariadic[
-        BaseVal=TypeList.of[Trait=CoordLike]().values,
-        ParamListType=element_types.values,
-        Reducer=_FlattenReducer,
-    ]
+comptime _FlattenOnce[*element_types: CoordLike] = TypeList._concat[
+    *element_types.map_to_values[_FlattenOnceMapper]()
 ]()
 """Peels one level of Coord nesting from a variadic type list.
 
@@ -1485,41 +1511,6 @@ Applies `_FlattenOnce` four times via doubling (`_Flatten2` ∘ `_Flatten2`),
 handling up to four levels of Coord nesting.  Once fully flat, additional
 passes are no-ops since all elements are scalars.
 """
-
-comptime _NextOffset[
-    prev_offset: Int,
-    element_type: CoordLike,
-] = prev_offset + (
-    1 if element_type.is_value else _Flattened[*element_type.ParamListType].size
-)
-
-
-comptime _FlattenOffsetReducer[
-    Prev: Variadic.TypesOfTrait[CoordLike],
-    From: Variadic.TypesOfTrait[CoordLike],
-    idx: SIMDSize,
-] = Variadic.concat_types[
-    Prev,
-    TypeList.of[
-        Trait=CoordLike,
-        ComptimeInt[
-            0 if idx
-            == 0 else _NextOffset[
-                TypeList[Prev]()[TypeList[Prev].size - 1].static_value,
-                TypeList[From]()[idx - 1],
-            ]
-        ],
-    ]().values,
-]
-
-
-comptime _FlattenedOffsets[
-    *element_types: CoordLike
-] = _ReduceVariadicAndIdxToVariadic[
-    BaseVal=TypeList.of[Trait=CoordLike]().values,
-    ParamListType=element_types.values,
-    Reducer=_FlattenOffsetReducer,
-]
 
 
 def _get_flattened_helper[
@@ -1546,7 +1537,7 @@ def _get_flattened_helper[
             ](tuple)
     else:
         comptime if flat_idx == current_offset:
-            return tuple[i].value()
+            return Int(tuple[i].value())
         else:
             return _get_flattened_helper[flat_idx, current_offset + 1, i + 1](
                 tuple
@@ -1871,10 +1862,10 @@ struct _RegTuple[*element_types: CoordLike](
     """
 
     comptime _mlir_type = __mlir_type[
-        `!kgen.pack<:`,
+        `!kgen.struct<:`,
         type_of(Self.element_types.values),
         Self.element_types.values,
-        `>`,
+        ` isParamPack>`,
     ]
 
     var _mlir_value: Self._mlir_type
@@ -1945,8 +1936,9 @@ struct _RegTuple[*element_types: CoordLike](
         var storage_kgen_ptr = UnsafePointer(to=self._mlir_value).address
 
         # KGenPointer to the element.
-        var elt_kgen_ptr = __mlir_op.`kgen.pack.gep`[
-            index=idx._int_mlir_index()
+        var elt_kgen_ptr = __mlir_op.`kgen.struct.gep`[
+            index=idx._int_mlir_index(),
+            _type=UnsafePointer[Self.element_types[idx]]._mlir_type,
         ](storage_kgen_ptr)
         return UnsafePointer[_, origin_of(self)](elt_kgen_ptr)[]
 
@@ -2003,10 +1995,8 @@ struct _RegTuple[*element_types: CoordLike](
         self,
         other: _RegTuple[*other_element_types],
         out result: _RegTuple[
-            *TypeList[
-                Variadic.concat_types[
-                    Self.element_types.values, other_element_types.values
-                ],
+            *TypeList._concat[
+                Self.element_types.values, other_element_types.values
             ]()
         ],
     ):
