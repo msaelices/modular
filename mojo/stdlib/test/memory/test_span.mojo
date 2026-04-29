@@ -464,9 +464,7 @@ def test_apply() raises:
 
 
 def test_count_func() raises:
-    def is_2[
-        w: SIMDSize
-    ](v: SIMD[DType.uint8, w]) unified {} -> SIMD[DType.bool, w]:
+    def is_2[w: SIMDSize](v: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
         return v.eq(2)
 
     var data = Span[Byte]([Byte(0), 1, 2, 1, 2, 1, 2])
@@ -554,7 +552,7 @@ def test_binary_search_by_unified() raises:
 
     var seven = 7
 
-    def cmp_7(x: Int) unified {var} -> Int:
+    def cmp_7(x: Int) {var} -> Int:
         return x - seven
 
     var result = span.binary_search_by(cmp_7)
@@ -562,7 +560,7 @@ def test_binary_search_by_unified() raises:
 
     var six = 6
 
-    def cmp_6(x: Int) unified {var six} -> Int:
+    def cmp_6(x: Int) {var six} -> Int:
         return x - six
 
     var result2 = span.binary_search_by(cmp_6)
@@ -570,7 +568,7 @@ def test_binary_search_by_unified() raises:
 
     var one = 1
 
-    def cmp_1(x: Int) unified {var one} -> Int:
+    def cmp_1(x: Int) {var one} -> Int:
         return x - one
 
     var result3 = span.binary_search_by(cmp_1)
@@ -578,7 +576,7 @@ def test_binary_search_by_unified() raises:
 
     var thirteen = 13
 
-    def cmp_13(x: Int) unified {var thirteen} -> Int:
+    def cmp_13(x: Int) {var thirteen} -> Int:
         return x - thirteen
 
     var result4 = span.binary_search_by(cmp_13)
