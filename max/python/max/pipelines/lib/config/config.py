@@ -116,6 +116,7 @@ _AUTO_ENABLE_OVERLAP_SCHEDULER_ARCHITECTURES = (
     "UnifiedEagleLlama3ForCausalLM",
     "UnifiedMTPDeepseekV3ForCausalLM",
     "Eagle3DeepseekV2ForCausalLM",
+    "MiniMaxM2ForCausalLM",
 )
 
 _AUTO_ENABLE_DEVICE_GRAPH_CAPTURE_ARCHITECTURES = (
@@ -129,6 +130,7 @@ _AUTO_ENABLE_DEVICE_GRAPH_CAPTURE_ARCHITECTURES = (
     "UnifiedEagleLlama3ForCausalLM",
     "UnifiedMTPDeepseekV3ForCausalLM",
     "Eagle3DeepseekV2ForCausalLM",
+    "MiniMaxM2ForCausalLM",
 )
 
 
@@ -152,7 +154,7 @@ class PipelineConfig(ConfigFileModel):
     debug_verify_replay: bool = Field(
         default=False,
         description=(
-            "When device_graph_capture is enabled, execute eager launch-trace "
+            "When ``device_graph_capture`` is enabled, execute eager launch-trace "
             "verification before replay. Intended for debugging only."
         ),
     )
@@ -168,8 +170,8 @@ class PipelineConfig(ConfigFileModel):
         default_factory=list,
         description=(
             "Per-component overrides for the ModelManifest, in the format "
-            "'component.field=value'. Applied before resolution. Repeatable. "
-            "Example: 'transformer.quantization_encoding=float4_e2m1fnx2'."
+            "``component.field=value``. Applied before resolution. Repeatable. "
+            "Example: ``transformer.quantization_encoding=float4_e2m1fnx2``."
         ),
     )
     """Per-component model overrides applied before resolution."""
@@ -391,6 +393,13 @@ class PipelineConfig(ConfigFileModel):
             strip_prefix=True,
         )
         if draft_kwargs.get("model_path", "") != "":
+            # Inherit certain fields from the target model if not explicitly
+            # specified for the draft model. This simplifies CLI usage for
+            # speculative decoding (e.g. --draft-trust-remote-code is not
+            # needed if --trust-remote-code is already set).
+            if "main" in self.models:
+                self._apply_draft_model_defaults(draft_kwargs, self.model)
+
             draft_config = MAXModelConfig(**draft_kwargs)
             if kv_cache_kwargs:
                 draft_config.create_kv_cache_config(**kv_cache_kwargs)
@@ -401,6 +410,62 @@ class PipelineConfig(ConfigFileModel):
         # Apply per-component overrides from --model-override flags
         if self.model_override:
             self._apply_model_overrides()
+
+    @staticmethod
+    def _apply_draft_model_defaults(
+        draft_kwargs: dict[str, Any], target_model: MAXModelConfig
+    ) -> None:
+        """Inherit certain fields from the target model for the draft model.
+
+        When running speculative decoding, the draft model typically shares
+        configuration with the target model (same devices, same trust settings,
+        same parallelism). This method copies these fields from the target
+        model config into the draft kwargs if they weren't explicitly specified.
+
+        Fields inherited:
+        - ``trust_remote_code``: If the target model requires custom code,
+          the draft model (from the same model family) likely does too.
+        - ``device_specs``: The draft model runs on the same devices as the
+          target model.
+        - ``data_parallel_degree``: Both models use the same parallelism.
+
+        Note: ``quantization_encoding`` is NOT inherited because draft models
+        (especially EAGLE3) often use bfloat16 regardless of the target model's
+        quantization. The draft model should auto-detect its encoding from its
+        weights.
+
+        Args:
+            draft_kwargs: The draft model kwargs dict (modified in place).
+            target_model: The target model configuration to inherit from.
+        """
+        # Inherit trust_remote_code if not explicitly specified
+        if "trust_remote_code" not in draft_kwargs:
+            if target_model.trust_remote_code:
+                logger.info(
+                    "Inheriting trust_remote_code=True from target model "
+                    "for draft model"
+                )
+                draft_kwargs["trust_remote_code"] = True
+
+        # Inherit device_specs if not explicitly specified
+        if "device_specs" not in draft_kwargs:
+            logger.info(
+                f"Inheriting device_specs={target_model.device_specs} "
+                "from target model for draft model"
+            )
+            draft_kwargs["device_specs"] = target_model.device_specs
+
+        # Inherit data_parallel_degree if not explicitly specified
+        if "data_parallel_degree" not in draft_kwargs:
+            if target_model.data_parallel_degree != 1:
+                logger.info(
+                    f"Inheriting data_parallel_degree="
+                    f"{target_model.data_parallel_degree} from target model "
+                    "for draft model"
+                )
+            draft_kwargs["data_parallel_degree"] = (
+                target_model.data_parallel_degree
+            )
 
     def _apply_model_overrides(self) -> None:
         """Apply --model-override entries to the manifest.
@@ -871,7 +936,7 @@ class PipelineConfig(ConfigFileModel):
             )
             max_batch_size = self.runtime.max_batch_size
             if (
-                not self.runtime.device_graph_capture
+                self.runtime.device_graph_capture is None
                 and arch is not None
                 and arch.name in _AUTO_ENABLE_DEVICE_GRAPH_CAPTURE_ARCHITECTURES
                 and max_batch_size is not None
@@ -883,10 +948,13 @@ class PipelineConfig(ConfigFileModel):
                 self.runtime.device_graph_capture = True
                 logger.info(
                     "Automatically enabling device graph capture for %s with max_batch_size=%d. "
-                    "You can manually disable this by setting --no-device-graph-capture --force.",
+                    "You can manually disable this by setting --no-device-graph-capture.",
                     arch.name,
                     max_batch_size,
                 )
+
+        if self.runtime.device_graph_capture is None:
+            self.runtime.device_graph_capture = False
 
         self._validate_and_resolve_device_graph_capture()
 
@@ -921,10 +989,6 @@ class PipelineConfig(ConfigFileModel):
                     "(Disaggregated Inference). THIS IS EXPERIMENTAL.",
                     self.runtime.pipeline_role,
                 )
-            if self.sampling.enable_structured_output:
-                raise ValueError(
-                    "Structured outputs are not supported with the Overlap scheduler."
-                )
             if self.sampling.enable_variable_logits:
                 raise ValueError(
                     "Variable logits are not supported with the Overlap scheduler. "
@@ -944,8 +1008,7 @@ class PipelineConfig(ConfigFileModel):
 
     def _is_eligible_for_overlap_serve_optimizations(self) -> bool:
         return (
-            not self.sampling.enable_structured_output
-            and not self.sampling.enable_variable_logits
+            not self.sampling.enable_variable_logits
             and not self.lora
             and self.model.device_specs[0].device_type != "cpu"
         )
@@ -1211,17 +1274,10 @@ class PipelineConfig(ConfigFileModel):
 
         target_arch = self._validate_and_resolve_architecture(self.model)
 
-        if (
-            self.draft_model.quantization_encoding is None
-            and self.model.quantization_encoding is not None
-        ):
-            logger.info(
-                f"draft_quantization_encoding not specified, defaulting to"
-                f" target model encoding: {self.model.quantization_encoding}"
-            )
-            self.draft_model.quantization_encoding = (
-                self.model.quantization_encoding
-            )
+        # Note: quantization_encoding is NOT inherited from the target model.
+        # Draft models (especially EAGLE3) typically use bfloat16 regardless
+        # of the target model's quantization. The draft model auto-detects
+        # its encoding from its weights during architecture resolution.
 
         draft_arch = self._validate_and_resolve_architecture(self.draft_model)
 

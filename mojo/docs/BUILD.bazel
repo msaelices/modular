@@ -12,9 +12,18 @@ install_docs(
     target = ":mojodocs",
 )
 
+install_docs(
+    name = "install-changelog",
+    dest_subdir = "mojosite/changelog",
+    tags = ["manual"],
+    target = ":changelog",
+)
+
 genrule(
     name = "mojodocs",
-    srcs = [":mojosite"],
+    srcs = [
+        ":mojosite",
+    ],
     outs = ["mojodocs.tar"],
     cmd = """
   # Unpack inputs for processing
@@ -29,6 +38,7 @@ genrule(
   chmod -R +w mojosite
   $(location :post-process-mojodocs) mojosite
 
+  # TODO: Refactor all this after new site launch
   # Restructure for new site layout:
   #   internal/ content → root (stripping internal/ prefix)
   #   everything else   → docs/
@@ -43,6 +53,8 @@ genrule(
   rm -rf internal_tmp
   mv mojosite/redirects.js mojosite/docs/redirects.js
   rm mojosite/docs/lib.mdx
+  rm -f mojosite/docs/nightly-changelog.md
+  rm -f mojosite/docs/sidebars.js
 
   # Generate final output
   cd mojosite
@@ -50,6 +62,19 @@ genrule(
   """,
     tags = ["manual"],
     tools = [":post-process-mojodocs"],
+)
+
+genrule(
+    name = "changelog",
+    srcs = [":mojodocs"],
+    outs = ["changelog.tar"],
+    cmd = """
+  mkdir -p changelog_tmp
+  tar -xf $(location :mojodocs) -C changelog_tmp
+  cd changelog_tmp/docs/changelog
+  tar -cf ../../../$@ *
+  """,
+    tags = ["manual"],
 )
 
 pkg_tar(

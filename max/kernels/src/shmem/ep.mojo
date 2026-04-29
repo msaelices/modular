@@ -16,8 +16,6 @@
 Helper functions for Expert Parallelism (EP) Communication Kernels.
 """
 
-from std.collections import OptionalReg
-
 from std.gpu.primitives.grid_controls import PDLLevel, pdl_launch_attributes
 from std.gpu.host import FuncAttribute
 from std.gpu.host.info import is_gpu
@@ -57,9 +55,13 @@ def pack_ptrs_array[
     ptrs_layout: TensorLayout,
     //,
     ptr_type: DType,
-    n_gpus_per_node: Int = ptrs_layout.static_shape[0],
+    local_rank_only: Bool = False,
+    n_gpus_per_node: Int = 1 if local_rank_only else ptrs_layout.static_shape[
+        0
+    ],
 ](
     _ptrs: TileTensor[DType.uint64, ptrs_layout, ...],
+    my_rank: Int32,
     out result: InlineArray[
         UnsafePointer[Scalar[ptr_type], MutExternalOrigin], n_gpus_per_node
     ],
@@ -71,9 +73,14 @@ def pack_ptrs_array[
     ](uninitialized=True)
 
     comptime for i in range(n_gpus_per_node):
-        ptr_arr[i] = UnsafePointer[Scalar[ptr_type], MutExternalOrigin](
-            unsafe_from_address=Int(_ptrs[i])
-        )
+        comptime if local_rank_only:
+            ptr_arr[i] = UnsafePointer[Scalar[ptr_type], MutExternalOrigin](
+                unsafe_from_address=Int(_ptrs[my_rank])
+            )
+        else:
+            ptr_arr[i] = UnsafePointer[Scalar[ptr_type], MutExternalOrigin](
+                unsafe_from_address=Int(_ptrs[i])
+            )
 
     return ptr_arr^
 
@@ -212,8 +219,10 @@ def ep_dispatch_async_kernel_api[
         var send_ptr = UnsafePointer[UInt8, MutExternalOrigin](
             unsafe_from_address=Int(send_ptrs[gpu_id])
         )
-        var recv_ptrs_arr = pack_ptrs_array[DType.uint8](recv_ptrs)
-        var recv_count_ptrs_arr = pack_ptrs_array[DType.uint64](recv_count_ptrs)
+        var recv_ptrs_arr = pack_ptrs_array[DType.uint8](recv_ptrs, my_rank)
+        var recv_count_ptrs_arr = pack_ptrs_array[DType.uint64](
+            recv_count_ptrs, my_rank
+        )
         var ep_counters = EPLocalSyncCounters[n_experts](
             UnsafePointer[Int32, MutExternalOrigin](
                 unsafe_from_address=Int(atomic_counters.ptr)
@@ -248,7 +257,6 @@ def ep_dispatch_wait_kernel_api[
     n_gpus_per_node: Int,
     n_nodes: Int,
     target: StaticString,
-    fused_shared_expert: Bool = False,
     input_scales_wrapper: Optional[input_scales_wrapper_type] = None,
 ](
     token_handler: token_fmt_type,
@@ -259,13 +267,6 @@ def ep_dispatch_wait_kernel_api[
     recv_count_ptrs: TileTensor[DType.uint64, ...],
     atomic_counters: TileTensor[DType.int32, ...],
     context: DeviceContextPtr,
-    maybe_fused_shared_expert_input: OptionalReg[
-        TileTensor[
-            DType.bfloat16,
-            type_of(row_major(Idx(Int64(1)), Idx(Int64(1)))),
-            ImmutAnyOrigin,
-        ]
-    ] = None,
 ) raises:
     """Execute the Expert Parallelism dispatch completion kernel.
 
@@ -281,8 +282,6 @@ def ep_dispatch_wait_kernel_api[
         n_gpus_per_node: GPUs per physical node.
         n_nodes: Number of physical nodes.
         target: Target.
-        fused_shared_expert: Whether to pack shared expert inputs with routed
-            experts' inputs.
         input_scales_wrapper: The wrapper for the input scales.
 
     Arguments:
@@ -294,8 +293,6 @@ def ep_dispatch_wait_kernel_api[
         recv_ptrs: Receive buffer pointers for each local GPU.
         recv_count_ptrs: Receive count buffer pointers for each local GPU.
         context: Device context pointer.
-        maybe_fused_shared_expert_input: Optional input tokens for the shared
-            experts.
     """
 
     # Ensure this kernel only runs on GPU targets
@@ -327,7 +324,6 @@ def ep_dispatch_wait_kernel_api[
         n_ranks,
         max_token_per_rank,
         token_fmt_type,
-        fused_shared_expert=fused_shared_expert,
         input_scales_wrapper=input_scales_wrapper,
     ]
 
@@ -372,7 +368,6 @@ def ep_dispatch_wait_kernel_api[
             recv_count_ptr,
             ep_counters,
             my_rank,
-            maybe_fused_shared_expert_input,
             grid_dim=hw_info.sm_count,
             block_dim=hw_info.max_thread_block_size,
             shared_mem_bytes=Int(smem_size),
@@ -399,7 +394,9 @@ def ep_fused_dispatch_kernel_api[
     fused_shared_expert: Bool,
     target: StaticString,
     input_scales_wrapper: Optional[input_scales_wrapper_type] = None,
+    skip_a2a: Bool = False,
     use_shmem: Bool = (n_nodes > 1),
+    allreduce_world_size: Int = 1,
 ](
     token_handler: token_fmt_type,
     row_offsets: TileTensor[DType.uint32, ...],
@@ -432,7 +429,12 @@ def ep_fused_dispatch_kernel_api[
             routed experts' inputs.
         target: Target.
         input_scales_wrapper: The wrapper for the input scales.
+        skip_a2a: Whether to skip the A2A communication. If true, we will only
+            send tokens within the current device.
         use_shmem: Whether to enable SHMEM communication.
+        allreduce_world_size: The world size of the allreduce operation. Only
+            needed for skip_a2a. Used to calculate the workload distribution for
+            the shared expert (if has one).
 
     Arguments:
         token_handler: Token handler. Wrapper for the output token tensor.
@@ -497,7 +499,9 @@ def ep_fused_dispatch_kernel_api[
         token_fmt_type,
         fused_shared_expert=fused_shared_expert,
         input_scales_wrapper=input_scales_wrapper,
+        skip_a2a=skip_a2a,
         use_shmem=use_shmem,
+        allreduce_world_size=allreduce_world_size,
     ]
 
     @always_inline
@@ -545,8 +549,12 @@ def ep_fused_dispatch_kernel_api[
             unsafe_from_address=Int(send_ptrs[gpu_id])
         )
         # Create inline arrays to store all the p2p accessible pointers
-        var recv_ptrs_arr = pack_ptrs_array[DType.uint8](recv_ptrs)
-        var recv_count_ptrs_arr = pack_ptrs_array[DType.uint64](recv_count_ptrs)
+        var recv_ptrs_arr = pack_ptrs_array[
+            DType.uint8, local_rank_only=skip_a2a
+        ](recv_ptrs, my_rank)
+        var recv_count_ptrs_arr = pack_ptrs_array[
+            DType.uint64, local_rank_only=skip_a2a
+        ](recv_count_ptrs, my_rank)
         var ep_counters = EPLocalSyncCounters[n_experts](
             UnsafePointer[Int32, MutExternalOrigin](
                 unsafe_from_address=Int(atomic_counters.ptr)
@@ -588,7 +596,6 @@ def ep_combine_async_kernel_api[
     n_gpus_per_node: Int,
     n_nodes: Int,
     target: StaticString,
-    fused_shared_expert: Bool = False,
     use_shmem: Bool = (n_nodes > 1),
 ](
     atomic_counters: TileTensor[DType.int32, ...],
@@ -598,13 +605,6 @@ def ep_combine_async_kernel_api[
     recv_ptrs: TileTensor[DType.uint64, ...],
     recv_count_ptrs: TileTensor[DType.uint64, ...],
     context: DeviceContextPtr,
-    maybe_fused_shared_expert_output: OptionalReg[
-        TileTensor[
-            combine_dtype,
-            type_of(row_major(Idx(Int64(1)), Idx(Int64(1)))),
-            MutAnyOrigin,
-        ]
-    ] = None,
 ) raises:
     """Execute the Expert Parallelism combine kernel.
 
@@ -624,7 +624,6 @@ def ep_combine_async_kernel_api[
         n_gpus_per_node: GPUs per physical node.
         n_nodes: Number of physical nodes.
         target: Target.
-        fused_shared_expert: Whether to filter out the shared expert's outputs.
         use_shmem: Whether to enable SHMEM communication.
 
     Arguments:
@@ -637,8 +636,6 @@ def ep_combine_async_kernel_api[
         recv_ptrs: Receive buffer pointers for each local GPU.
         recv_count_ptrs: Receive count buffer pointers for each local GPU.
         context: Device context pointer.
-        maybe_fused_shared_expert_output: Optional output tokens for the shared
-            experts.
     """
 
     # Ensure this kernel only runs on GPU targets
@@ -673,7 +670,6 @@ def ep_combine_async_kernel_api[
         combine_msg_size,
         max_token_per_rank,
         n_gpus_per_node,
-        fused_shared_expert=fused_shared_expert,
         use_shmem=use_shmem,
     ]
 
@@ -717,8 +713,10 @@ def ep_combine_async_kernel_api[
             unsafe_from_address=Int(send_ptrs[gpu_id])
         )
         # Create inline arrays to store all the p2p accessible pointers
-        var recv_ptrs_arr = pack_ptrs_array[DType.uint8](recv_ptrs)
-        var recv_count_ptrs_arr = pack_ptrs_array[DType.uint64](recv_count_ptrs)
+        var recv_ptrs_arr = pack_ptrs_array[DType.uint8](recv_ptrs, my_rank)
+        var recv_count_ptrs_arr = pack_ptrs_array[DType.uint64](
+            recv_count_ptrs, my_rank
+        )
         var ep_counters = EPLocalSyncCounters[n_experts](
             UnsafePointer[Int32, MutExternalOrigin](
                 unsafe_from_address=Int(atomic_counters.ptr)
@@ -734,7 +732,6 @@ def ep_combine_async_kernel_api[
             recv_count_ptrs_arr,
             ep_counters,
             my_rank,
-            maybe_fused_shared_expert_output,
             grid_dim=hw_info.sm_count,
             block_dim=hw_info.max_thread_block_size,
         )
@@ -895,7 +892,9 @@ def ep_fused_combine_kernel_api[
     router_weights_wrapper: Optional[router_weights_wrapper_type] = None,
     epilogue_fn: Optional[elementwise_epilogue_type] = None,
     fused_shared_expert: Bool = False,
+    skip_a2a: Bool = False,
     use_shmem: Bool = (n_nodes > 1),
+    allreduce_world_size: Int = 1,
 ](
     output_tokens: TileTensor[combine_dtype, ...],
     atomic_counters: TileTensor[DType.int32, ...],
@@ -905,6 +904,7 @@ def ep_fused_combine_kernel_api[
     recv_ptrs: TileTensor[DType.uint64, ...],
     recv_count_ptrs: TileTensor[DType.uint64, ...],
     context: DeviceContextPtr,
+    topk_ids_p: Optional[UnsafePointer[Int32, ImmutExternalOrigin]] = None,
 ) raises:
     """Execute the fused Expert Parallelism combine kernel.
 
@@ -928,7 +928,12 @@ def ep_fused_combine_kernel_api[
             computing combined output.
         fused_shared_expert: Whether to add shared expert outputs to the
             combined routed expert outputs.
+        skip_a2a: Whether to skip the A2A communication. If true, we will only
+            send tokens within the current device.
         use_shmem: Whether to enable SHMEM communication.
+        allreduce_world_size: The world size of the allreduce operation. Only
+            needed for skip_a2a. Used to calculate the workload distribution for
+            the shared expert (if has one).
 
     Arguments:
         output_tokens: Final output tensor with expert results.
@@ -962,6 +967,13 @@ def ep_fused_combine_kernel_api[
     comptime if n_nodes > 1:
         my_rank = Int32(shmem_my_pe())
 
+    comptime assert not (
+        skip_a2a and use_shmem
+    ), "skip_a2a and use_shmem cannot be True at the same time."
+    comptime if skip_a2a:
+        if not topk_ids_p:
+            raise "topk_ids_p is required when skip_a2a is True."
+
     comptime hw_info = gpu_ctx.default_device_info
     comptime combine_msg_size = hidden_size * size_of[combine_dtype]()
     comptime n_ranks = n_gpus_per_node * n_nodes
@@ -982,7 +994,9 @@ def ep_fused_combine_kernel_api[
         router_weights_wrapper=router_weights_wrapper,
         fused_shared_expert=fused_shared_expert,
         epilogue_fn=epilogue_fn,
+        skip_a2a=skip_a2a,
         use_shmem=use_shmem,
+        allreduce_world_size=allreduce_world_size,
     ]
 
     @always_inline
@@ -1027,8 +1041,12 @@ def ep_fused_combine_kernel_api[
             unsafe_from_address=Int(send_ptrs[gpu_id])
         )
         # Create inline arrays to store all the p2p accessible pointers
-        var recv_ptrs_arr = pack_ptrs_array[DType.uint8](recv_ptrs)
-        var recv_count_ptrs_arr = pack_ptrs_array[DType.uint64](recv_count_ptrs)
+        var recv_ptrs_arr = pack_ptrs_array[
+            DType.uint8, local_rank_only=skip_a2a
+        ](recv_ptrs, my_rank)
+        var recv_count_ptrs_arr = pack_ptrs_array[
+            DType.uint64, local_rank_only=skip_a2a
+        ](recv_count_ptrs, my_rank)
         var ep_counters = EPLocalSyncCounters[n_experts](
             UnsafePointer[Int32, MutExternalOrigin](
                 unsafe_from_address=Int(atomic_counters.ptr)
@@ -1044,6 +1062,7 @@ def ep_fused_combine_kernel_api[
             recv_ptrs_arr,
             recv_count_ptrs_arr,
             ep_counters,
+            topk_ids_p,
             my_rank,
             grid_dim=hw_info.sm_count,
             block_dim=hw_info.max_thread_block_size,
