@@ -54,7 +54,7 @@ from std.gpu.memory import (
     ReduceOp,
     async_copy,
     cp_async_bulk_tensor_global_shared_cta,
-    cp_async_bulk_tensor_reduce,
+    cp_async_bulk_tensor_reduce_global_shared_cta,
     cp_async_bulk_tensor_shared_cluster_global,
     cp_async_bulk_tensor_shared_cluster_global_im2col,
     cp_async_bulk_tensor_shared_cluster_global_im2col_multicast,
@@ -2679,7 +2679,9 @@ struct TMATensorTile[
         comptime assert (
             type_of(src).alignment % 128 == 0
         ), "TMA requires 128B alignment in shared memory"
-        cp_async_bulk_tensor_reduce[reduction_kind=reduction_kind](
+        cp_async_bulk_tensor_reduce_global_shared_cta[
+            reduction_kind=reduction_kind
+        ](
             src.ptr,
             UnsafePointer(to=self.descriptor).bitcast[NoneType](),
             Index(coords[0], coords[1]),
@@ -3761,12 +3763,12 @@ def create_tensor_tile[
                 owning=False,
             ),
             (
-                tensor.layout.shape[0]().value(),
-                tensor.layout.shape[1]().value(),
+                Int(tensor.layout.shape[0]().value()),
+                Int(tensor.layout.shape[1]().value()),
             ),
             (
-                tensor.layout.stride[0]().value(),
-                tensor.layout.stride[1]().value(),
+                Int(tensor.layout.stride[0]().value()),
+                Int(tensor.layout.stride[1]().value()),
             ),
             (__desc_shape[0], __desc_shape[1]),
         )
@@ -3780,14 +3782,14 @@ def create_tensor_tile[
                 owning=False,
             ),
             IndexList[3](
-                tensor.layout.shape[0]().value(),
-                tensor.layout.shape[1]().value(),
-                tensor.layout.shape[2]().value(),
+                Int(tensor.layout.shape[0]().value()),
+                Int(tensor.layout.shape[1]().value()),
+                Int(tensor.layout.shape[2]().value()),
             ),
             IndexList[3](
-                tensor.layout.stride[0]().value(),
-                tensor.layout.stride[1]().value(),
-                tensor.layout.stride[2]().value(),
+                Int(tensor.layout.stride[0]().value()),
+                Int(tensor.layout.stride[1]().value()),
+                Int(tensor.layout.stride[2]().value()),
             ),
             IndexList[3](
                 __desc_shape[0],
@@ -3805,16 +3807,16 @@ def create_tensor_tile[
                 owning=False,
             ),
             IndexList[4](
-                tensor.layout.shape[0]().value(),
-                tensor.layout.shape[1]().value(),
-                tensor.layout.shape[2]().value(),
-                tensor.layout.shape[3]().value(),
+                Int(tensor.layout.shape[0]().value()),
+                Int(tensor.layout.shape[1]().value()),
+                Int(tensor.layout.shape[2]().value()),
+                Int(tensor.layout.shape[3]().value()),
             ),
             IndexList[4](
-                tensor.layout.stride[0]().value(),
-                tensor.layout.stride[1]().value(),
-                tensor.layout.stride[2]().value(),
-                tensor.layout.stride[3]().value(),
+                Int(tensor.layout.stride[0]().value()),
+                Int(tensor.layout.stride[1]().value()),
+                Int(tensor.layout.stride[2]().value()),
+                Int(tensor.layout.stride[3]().value()),
             ),
             IndexList[4](
                 __desc_shape[0],
@@ -3833,18 +3835,18 @@ def create_tensor_tile[
                 owning=False,
             ),
             IndexList[5](
-                tensor.layout.shape[0]().value(),
-                tensor.layout.shape[1]().value(),
-                tensor.layout.shape[2]().value(),
-                tensor.layout.shape[3]().value(),
-                tensor.layout.shape[4]().value(),
+                Int(tensor.layout.shape[0]().value()),
+                Int(tensor.layout.shape[1]().value()),
+                Int(tensor.layout.shape[2]().value()),
+                Int(tensor.layout.shape[3]().value()),
+                Int(tensor.layout.shape[4]().value()),
             ),
             IndexList[5](
-                tensor.layout.stride[0]().value(),
-                tensor.layout.stride[1]().value(),
-                tensor.layout.stride[2]().value(),
-                tensor.layout.stride[3]().value(),
-                tensor.layout.stride[4]().value(),
+                Int(tensor.layout.stride[0]().value()),
+                Int(tensor.layout.stride[1]().value()),
+                Int(tensor.layout.stride[2]().value()),
+                Int(tensor.layout.stride[3]().value()),
+                Int(tensor.layout.stride[4]().value()),
             ),
             IndexList[5](
                 __desc_shape[0],
