@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeVar
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -63,7 +63,6 @@ from max.serve.worker_interface.zmq_queue import (
 )
 from tests.serve.scheduler.common import (
     FakeOverlapPipeline,
-    FakeSpecDecodePipeline,
     FakeTokenGeneratorPipeline,
     PagedKVCacheManager,
     create_kv_cache,
@@ -145,22 +144,39 @@ def create_di_scheduler(
     overlap_decode: bool = False,
     spec_decode_prefill: bool = False,
     num_speculative_tokens: int = 2,
+    prefill_is_mla: bool = False,
+    prefill_tp_per_replica: int = 1,
+    prefill_dp: int | None = None,
+    decode_dp: int | None = None,
 ) -> tuple[DecodeScheduler, PrefillScheduler, str, DIQueues]:
     """Creates a DecodeScheduler and PrefillScheduler pair for testing.
 
     Args:
-        overlap_prefill: When True, the PrefillScheduler uses FakeOverlapPipeline,
-            which mimics the one-batch output lag of OverlapTextGenerationPipeline.
-        overlap_decode: When True, the DecodeScheduler uses FakeOverlapPipeline,
-            which mimics the one-batch output lag of OverlapTextGenerationPipeline.
-        spec_decode_prefill: When True, the PrefillScheduler uses
-            FakeSpecDecodePipeline, which mimics the unified Eagle pipeline
-            (overlap disabled, draft tokens populated on contexts).
+        overlap_prefill: Use FakeOverlapPipeline in overlap mode (one-batch
+            output lag). Combine with spec_decode_prefill for the overlap +
+            spec decode path (num_speculative_tokens=1).
+        overlap_decode: Use FakeOverlapPipeline on decode.
+        spec_decode_prefill: Populate draft tokens during prefill CE.
+            Combined with overlap_prefill=False, opts out of the two-phase
+            path (disable_overlap=True), matching num_speculative_tokens > 1.
         num_speculative_tokens: Number of draft tokens per step when
             spec_decode_prefill is True.
+        prefill_is_mla: When True, the prefill KV cache uses ``is_mla=True``
+            (num_kv_heads=1 replicated across TP) so PrefillScheduler flattens
+            the engine shape from [dp][tp] to [dp*tp][1].
+        prefill_tp_per_replica: Number of simulated TP shards per prefill
+            model replica.
+        prefill_dp: Override ``dp`` for the prefill worker only (defaults to
+            ``dp``). Lets the test set prefill and decode to asymmetric
+            topologies while keeping the same total device count.
+        decode_dp: Override ``dp`` for the decode worker only (defaults to
+            ``dp``).
     """
 
-    def _create_kv_cache() -> PagedKVCacheManager:
+    effective_prefill_dp = prefill_dp if prefill_dp is not None else dp
+    effective_decode_dp = decode_dp if decode_dp is not None else dp
+
+    def _create_prefill_kv_cache() -> PagedKVCacheManager:
         return create_kv_cache(
             num_blocks=num_blocks,
             max_batch_size=max_batch_size,
@@ -168,23 +184,49 @@ def create_di_scheduler(
             page_size=page_size,
             enable_prefix_caching=enable_prefix_caching,
             kv_connector=kv_connector,
-            dp=dp,
+            dp=effective_prefill_dp,
             device=device,
+            is_mla=prefill_is_mla,
+            tp_per_replica=prefill_tp_per_replica,
         )
 
-    # Create a scheduler with a paged manager
-    scheduler_config = TokenGenerationSchedulerConfig(
-        max_batch_size=max_batch_size,
-        max_forward_steps_tg=max_forward_steps_tg,
-        target_tokens_per_batch_ce=target_tokens_per_batch_ce,
-        max_seq_len=max_seq_len,
-        enable_chunked_prefill=enable_chunked_prefill,
-        enable_in_flight_batching=enable_in_flight_batching,
-        data_parallel_degree=dp,
-        num_speculative_tokens=num_speculative_tokens
-        if spec_decode_prefill
-        else 0,
-    )
+    def _create_decode_kv_cache() -> PagedKVCacheManager:
+        return create_kv_cache(
+            num_blocks=num_blocks,
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_len,
+            page_size=page_size,
+            enable_prefix_caching=enable_prefix_caching,
+            kv_connector=kv_connector,
+            dp=effective_decode_dp,
+            device=device,
+            # Decode must use the same KV layout as prefill so bytes_per_page
+            # matches at connect() time. For heterogeneous MLA DI the model
+            # is MLA on both sides; decode's TP=1 naturally so no flatten.
+            is_mla=prefill_is_mla,
+        )
+
+    def _make_scheduler_config(
+        dp_value: int,
+    ) -> TokenGenerationSchedulerConfig:
+        return TokenGenerationSchedulerConfig(
+            max_batch_size=max_batch_size,
+            max_forward_steps_tg=max_forward_steps_tg,
+            target_tokens_per_batch_ce=target_tokens_per_batch_ce,
+            max_seq_len=max_seq_len,
+            enable_chunked_prefill=enable_chunked_prefill,
+            enable_in_flight_batching=enable_in_flight_batching,
+            data_parallel_degree=dp_value,
+            num_speculative_tokens=num_speculative_tokens
+            if spec_decode_prefill
+            else 0,
+        )
+
+    # For heterogeneous-MLA DI (prefill DP=1/TP>1, decode DP=N/TP=1), the
+    # engine auto-detects the shape mismatch via replicate_kv_across_tp on
+    # both sides' metadata at connect() time — no config flag needed.
+    prefill_scheduler_config = _make_scheduler_config(effective_prefill_dp)
+    decode_scheduler_config = _make_scheduler_config(effective_decode_dp)
 
     # Use queue.Queue to simulate the ZMQ queues.
     request_queue: queue.Queue[TextContext] = queue.Queue()
@@ -193,8 +235,8 @@ def create_di_scheduler(
     ] = queue.Queue()
     cancel_queue: queue.Queue[list[RequestID]] = queue.Queue()
 
-    kv_cache_prefill = _create_kv_cache()
-    kv_cache_decode = _create_kv_cache()
+    kv_cache_prefill = _create_prefill_kv_cache()
+    kv_cache_decode = _create_decode_kv_cache()
     server_addr = generate_zmq_ipc_path()
     client_addr = generate_zmq_ipc_path()
     dispatcher_server = BasicDispatcherServer(bind_addr=server_addr)
@@ -212,7 +254,7 @@ def create_di_scheduler(
 
     decode_scheduler = DecodeScheduler(
         pipeline=decode_pipeline,
-        scheduler_config=scheduler_config,
+        scheduler_config=decode_scheduler_config,
         kv_cache=kv_cache_decode,
         request_queue=request_queue,
         response_queue=response_queue,
@@ -221,16 +263,15 @@ def create_di_scheduler(
     )
 
     prefill_pipeline: FakeTokenGeneratorPipeline
-    if spec_decode_prefill:
-        prefill_pipeline = FakeSpecDecodePipeline(
+    if spec_decode_prefill or overlap_prefill:
+        prefill_pipeline = FakeOverlapPipeline(
             kv_cache_prefill,
             max_seq_len=max_seq_len,
             start_token_id=99,
-            num_speculative_tokens=num_speculative_tokens,
-        )
-    elif overlap_prefill:
-        prefill_pipeline = FakeOverlapPipeline(
-            kv_cache_prefill, max_seq_len=max_seq_len, start_token_id=99
+            num_speculative_tokens=(
+                num_speculative_tokens if spec_decode_prefill else 0
+            ),
+            disable_overlap=not overlap_prefill,
         )
     else:
         prefill_pipeline = FakeTokenGeneratorPipeline(
@@ -239,7 +280,7 @@ def create_di_scheduler(
 
     prefill_scheduler = PrefillScheduler(
         pipeline=prefill_pipeline,
-        scheduler_config=scheduler_config,
+        scheduler_config=prefill_scheduler_config,
         kv_cache=kv_cache_prefill,
         dispatcher=dispatcher_server,
     )
@@ -345,6 +386,105 @@ def test_one_req_end_to_end() -> None:
     assert isinstance(rest_of_tokens, TextGenerationOutput)
     assert rest_of_tokens.request_id == req_id
     assert rest_of_tokens.tokens == [42, 43, 44, 45]
+
+
+def test_heterogeneous_mla_prefill_tp2_to_decode_dp2_end_to_end() -> None:
+    """
+    Both engines are constructed with their natural ``[dp][tp]`` layout.
+    At connect(), ``resolve_peer_view`` picks ``flatten_local=True`` on
+    the prefill side so the KVTransferEngine's effective view matches
+    the decode side's DP=2/TP=1 shape. This test drives a full request
+    through the pair and asserts the KV transfer completes and tokens
+    land on the decode side.
+    """
+    decode, prefill, server_addr, q = create_di_scheduler(
+        prefill_is_mla=True,
+        prefill_tp_per_replica=2,
+        prefill_dp=1,
+        decode_dp=2,
+    )
+
+    # Prefill engine keeps its natural DP=1/TP=2 shape and advertises
+    # replicate_kv_across_tp so peers can flatten at connect() time.
+    assert prefill.transfer_engine.dp == 1
+    assert prefill.transfer_engine.tp == 2
+    assert prefill.transfer_engine.replicate_kv_across_tp is True
+    # Decode engine is natural DP=2/TP=1; replicate is coerced off by TP=1.
+    assert decode.transfer_engine.dp == 2
+    assert decode.transfer_engine.tp == 1
+    assert decode.transfer_engine.replicate_kv_across_tp is False
+
+    ctx = create_text_context(
+        target_endpoint=server_addr, prompt_len=100, output_len=5
+    )
+    q.request_queue.put(ctx)
+    req_id = ctx.request_id
+
+    # decode → prefill (exchanges transfer-engine metadata + request).
+    decode.run_iteration()
+    # prefill executes CE, initiates NIXL transfer to decode, and replies.
+    prefill.run_iteration()
+    # decode picks up the transferred KV + the first generated token, then
+    # runs token generation.
+    decode.run_iteration()
+
+    # First response: prefill-generated token.
+    output1 = q.response_queue.get()
+    sch_output1 = output1[req_id]
+    assert not sch_output1.is_done
+    single_token = sch_output1.result
+    assert isinstance(single_token, TextGenerationOutput)
+    assert single_token.tokens == [99]
+
+    # Second response: decode-generated tokens.
+    output2 = q.response_queue.get()
+    sch_output2 = output2[req_id]
+    assert sch_output2.is_done
+    rest_of_tokens = sch_output2.result
+    assert isinstance(rest_of_tokens, TextGenerationOutput)
+    assert rest_of_tokens.tokens == [42, 43, 44, 45]
+
+    # One more prefill iteration drains cleanup_active_transfers — verify the
+    # flattened-engine send transfer was released symmetrically.
+    prefill.run_iteration()
+    assert prefill.active_transfers == {}
+    assert prefill.transfer_engine.inflight_send_transfers == {}
+
+
+def test_heterogeneous_mla_prefill_src_replica_maps_to_first_shard() -> None:
+    """
+    With prefill DP=1/TP=2 (MLA), the PrefillScheduler should translate the
+    model src_replica_idx=0 (only one model replica) to engine replica idx 0
+    (the first of the 2 flattened TP shards). We check this by inspecting
+    the TransferReqData produced by initiating a transfer.
+    """
+    decode, prefill, server_addr, q = create_di_scheduler(
+        prefill_is_mla=True,
+        prefill_tp_per_replica=2,
+        prefill_dp=1,
+        decode_dp=2,
+    )
+
+    ctx = create_text_context(
+        target_endpoint=server_addr, prompt_len=100, output_len=5
+    )
+    q.request_queue.put(ctx)
+
+    # Drive decode → prefill message exchange.
+    decode.run_iteration()
+    prefill.run_iteration()
+
+    # After prefill.run_iteration(), the transfer request is recorded in
+    # active_transfers. Grab it and assert src_replica_idx was translated.
+    assert len(prefill.active_transfers) == 1
+    _context, model_src_replica_idx, transfer_req = next(
+        iter(prefill.active_transfers.values())
+    )
+    # Scheduler-level (model) replica is always 0 for DP=1 prefill.
+    assert model_src_replica_idx == 0
+    # Engine-level src_replica_idx is the RR-selected flattened index.
+    # For the first request (counter=0 → offset 0), it's the first TP shard.
+    assert transfer_req.src_replica_idx == 0
 
 
 def test_di_with_dp2_requests_distributed_to_different_replicas() -> None:
@@ -1428,6 +1568,13 @@ def test_overlap_di_both_sides_minimal_output() -> None:
     assert FUTURE_TOKEN not in all_tokens
 
 
+# Spec decode + disable_overlap=True: covers the PrefillScheduler's
+# synchronous branch. Production Eagle currently always runs with overlap
+# enabled (see the overlap + spec decode section below), so this section
+# tests the scheduler path only and can be removed if the sync path is
+# retired.
+
+
 def test_spec_decode_prefill_sends_token_and_draft_tokens() -> None:
     """When the prefill pipeline uses unified Eagle (spec decode), the
     PrefillResponse must carry both the generated token and draft tokens."""
@@ -1529,8 +1676,9 @@ def test_spec_decode_prefill_does_not_accumulate_pending_first_token() -> None:
     # Prefill executes first batch
     prefill.run_iteration()
 
-    # After processing, _pending_first_token must be empty because spec
-    # decode uses the synchronous path (not two-phase).
+    # Overlap disabled here → synchronous path, never populates
+    # _pending_first_token. Overlap + spec decode is covered separately
+    # in test_overlap_spec_decode_prefill_uses_two_phase_path.
     assert len(prefill._pending_first_token) == 0
 
     # Both requests should have initiated transfers
@@ -1589,10 +1737,271 @@ def test_load_prefill_scheduler_rejects_standalone_spec_decode() -> None:
 
 
 def test_load_prefill_scheduler_accepts_eagle_spec_decode() -> None:
-    """load_prefill_scheduler must not reject eagle speculative decoding."""
-    spec = SpeculativeConfig(speculative_method="eagle")
-    # The validation in load_prefill_scheduler only checks spec_config
-    # methods; verify those pass without raising.
-    assert spec.is_eagle()
-    assert not spec.is_standalone()
-    assert not spec.is_mtp()
+    """load_prefill_scheduler returns a PrefillScheduler for eagle spec decode.
+
+    PrefillScheduler is patched so the test stays a unit — it would otherwise
+    need a full KV cache, transfer engine, and NIXL agent.
+    """
+    pipeline = MagicMock()
+    pipeline.kv_manager = MagicMock()
+    config = MagicMock()
+    config.speculative = SpeculativeConfig(speculative_method="eagle")
+    sentinel = MagicMock(name="PrefillScheduler")
+
+    with (
+        patch(
+            "max.serve.scheduler.prefill_scheduler.PrefillScheduler",
+            return_value=sentinel,
+        ) as prefill_scheduler_cls,
+        patch("max.serve.scheduler.prefill_scheduler.PrefillDispatcherServer"),
+        patch(
+            "max.serve.scheduler.prefill_scheduler."
+            "TokenGenerationSchedulerConfig.from_pipeline_config",
+        ) as from_pipeline_config,
+    ):
+        result = load_prefill_scheduler(pipeline, config, MagicMock())
+
+    assert result is sentinel
+    prefill_scheduler_cls.assert_called_once()
+    from_pipeline_config.assert_called_once_with(config)
+
+
+def test_load_prefill_scheduler_accepts_mtp_spec_decode() -> None:
+    """load_prefill_scheduler accepts mtp spec decode just like eagle."""
+    pipeline = MagicMock()
+    pipeline.kv_manager = MagicMock()
+    config = MagicMock()
+    config.speculative = SpeculativeConfig(speculative_method="mtp")
+
+    with (
+        patch("max.serve.scheduler.prefill_scheduler.PrefillScheduler"),
+        patch("max.serve.scheduler.prefill_scheduler.PrefillDispatcherServer"),
+        patch(
+            "max.serve.scheduler.prefill_scheduler."
+            "TokenGenerationSchedulerConfig.from_pipeline_config",
+        ),
+    ):
+        load_prefill_scheduler(pipeline, config, MagicMock())
+
+
+# Overlap + speculative decoding on the prefill side: CE deferral and
+# draft-token publication must coexist (num_speculative_tokens=1 path).
+
+
+def test_overlap_spec_decode_prefill_uses_two_phase_path() -> None:
+    """With overlap enabled, spec decode requests flow through the two-phase
+    path (deferred CE → flush), not the synchronous shortcut."""
+    decode, prefill, server_addr, q = create_di_scheduler(
+        spec_decode_prefill=True,
+        overlap_prefill=True,
+    )
+    assert isinstance(prefill.pipeline, FakeOverlapPipeline)
+    assert not prefill.pipeline._disable_overlap
+
+    ctx = create_text_context(
+        target_endpoint=server_addr, prompt_len=100, output_len=5
+    )
+    q.request_queue.put(ctx)
+
+    # Iter 1: CE deferred; _pending_first_token tracks the request.
+    decode.run_iteration()
+    prefill.run_iteration()
+
+    assert len(prefill._pending_first_token) == 1
+    assert ctx.request_id in prefill._pending_first_token
+    assert prefill.pipeline.has_pending_outputs()
+
+
+def test_overlap_spec_decode_prefill_response_carries_draft_tokens() -> None:
+    """After the two-phase flush, the PrefillResponse carries both the real
+    generated token and the populated draft tokens."""
+    num_spec_tokens = 1
+    decode, prefill, server_addr, q = create_di_scheduler(
+        spec_decode_prefill=True,
+        overlap_prefill=True,
+        num_speculative_tokens=num_spec_tokens,
+    )
+    assert isinstance(prefill.pipeline, FakeOverlapPipeline)
+    ctx = create_text_context(
+        target_endpoint=server_addr, prompt_len=100, output_len=5
+    )
+    q.request_queue.put(ctx)
+
+    # Iter 1: defer. Iter 2: flush + send PrefillResponse.
+    decode.run_iteration()
+    prefill.run_iteration()
+    assert prefill.pipeline.has_pending_outputs()
+    prefill.run_iteration()
+    assert not prefill.pipeline.has_pending_outputs()
+
+    metadata = decode.dispatcher.recv_reply_nowait()
+    assert isinstance(metadata, KVTransferEngineMetadata)
+    response = decode.dispatcher.recv_reply_nowait()
+    assert isinstance(response, PrefillResponse)
+    assert response.id == ctx.request_id
+    assert response.generated_token_id != FUTURE_TOKEN
+    assert response.draft_tokens is not None
+    assert len(response.draft_tokens) == num_spec_tokens
+
+
+def test_overlap_spec_decode_end_to_end() -> None:
+    """Full DI lifecycle with overlap + spec decode on the prefill side."""
+    decode, prefill, server_addr, q = create_di_scheduler(
+        spec_decode_prefill=True,
+        overlap_prefill=True,
+        num_speculative_tokens=1,
+    )
+    ctx = create_text_context(
+        target_endpoint=server_addr, prompt_len=100, output_len=5
+    )
+    req_id = ctx.request_id
+    q.request_queue.put(ctx)
+
+    decode.run_iteration()
+    prefill.run_iteration()  # defer
+    prefill.run_iteration()  # flush
+    decode.run_iteration()
+
+    output1 = q.response_queue.get()
+    sch1 = output1[req_id]
+    assert not sch1.is_done
+    tok1 = sch1.result
+    assert isinstance(tok1, TextGenerationOutput)
+    assert tok1.tokens == [99]
+
+    output2 = q.response_queue.get()
+    sch2 = output2[req_id]
+    assert sch2.is_done
+    tok2 = sch2.result
+    assert isinstance(tok2, TextGenerationOutput)
+    assert tok2.tokens == [42, 43, 44, 45]
+
+
+def test_overlap_spec_decode_cancel_between_defer_and_resolve() -> None:
+    """Cancelling an overlap + spec-decode request between CE deferral and
+    flush emits no PrefillResponse and does not crash."""
+    decode, prefill, server_addr, q = create_di_scheduler(
+        spec_decode_prefill=True,
+        overlap_prefill=True,
+        num_speculative_tokens=1,
+    )
+    assert isinstance(prefill.pipeline, FakeOverlapPipeline)
+    ctx = create_text_context(
+        target_endpoint=server_addr, prompt_len=100, output_len=5
+    )
+    q.request_queue.put(ctx)
+
+    decode.run_iteration()
+    prefill.run_iteration()
+    assert prefill.pipeline.has_pending_outputs()
+
+    # Cancel while request sits in _pending_first_token.
+    prefill.handle_cancel_request(CancelRequest(id=ctx.request_id))
+
+    prefill.run_iteration()
+    assert not prefill.pipeline.has_pending_outputs()
+
+    while True:
+        try:
+            msg = decode.dispatcher.recv_reply_nowait()
+            assert not isinstance(msg, PrefillResponse), (
+                "Cancelled overlap+spec-decode request must not produce a "
+                "PrefillResponse"
+            )
+        except queue.Empty:
+            break
+
+
+# ---------------------------------------------------------------------------
+# Stall watchdog tests
+# ---------------------------------------------------------------------------
+
+
+def test_stall_watchdog_fires_when_prefill_stalled() -> None:
+    """When requests are stuck in prefill longer than the timeout,
+    run_iteration raises SystemExit(1) to enable a pod restart."""
+    decode, _, server_addr, q = create_di_scheduler()
+    ctx = create_text_context(target_endpoint=server_addr, prompt_len=100)
+    q.request_queue.put(ctx)
+
+    # Move request into prefill_reqs without running prefill (simulates NIXL stall).
+    decode.reserve_memory_and_send_to_prefill()
+    assert len(decode.prefill_reqs) == 1
+
+    # Backdate last activity to simulate a long stall.
+    decode._last_batch_activity = time.monotonic() - 9999
+    decode.scheduler_config.decode_stall_timeout_s = 1.0
+
+    with pytest.raises(SystemExit) as exc_info:
+        decode.run_iteration()
+    assert exc_info.value.code == 1
+
+
+def test_stall_watchdog_no_fire_within_timeout() -> None:
+    """Watchdog does not fire when the stall duration is below the threshold."""
+    decode, _, server_addr, q = create_di_scheduler()
+    ctx = create_text_context(target_endpoint=server_addr, prompt_len=100)
+    q.request_queue.put(ctx)
+
+    decode.reserve_memory_and_send_to_prefill()
+    assert len(decode.prefill_reqs) == 1
+
+    # Last activity was just now.
+    decode._last_batch_activity = time.monotonic()
+    decode.scheduler_config.decode_stall_timeout_s = 9999.0
+
+    result = decode.run_iteration()
+
+    assert result == SchedulerProgress.NO_PROGRESS
+
+
+def test_stall_watchdog_resets_on_batch_activity() -> None:
+    """_last_batch_activity is updated whenever a non-empty batch is produced."""
+    decode, prefill, server_addr, q = create_di_scheduler()
+    ctx = create_text_context(
+        target_endpoint=server_addr, prompt_len=100, output_len=5
+    )
+    q.request_queue.put(ctx)
+
+    decode.run_iteration()  # sends to prefill
+    prefill.run_iteration()  # executes prefill, sends PrefillResponse
+
+    t_before = time.monotonic()
+    decode.run_iteration()  # receives response, produces decode batch
+
+    assert decode._last_batch_activity >= t_before
+
+
+def test_stall_watchdog_clock_resets_while_idle() -> None:
+    """Clock resets when the queue is empty, so idle warmup time before the
+    first request does not count toward the stall threshold.
+
+    Without this reset, initializing `_last_batch_activity` at scheduler
+    startup causes the watchdog to fire immediately on the first request if
+    startup takes longer than the timeout (e.g. dataset loading before
+    benchmark start)."""
+    decode, _, server_addr, q = create_di_scheduler()
+
+    # Simulate a stale clock from a long idle period (e.g. pre-benchmark warmup).
+    decode._last_batch_activity = time.monotonic() - 9999
+    decode.scheduler_config.decode_stall_timeout_s = 60.0
+
+    # With no pending requests, run_iteration resets the clock.
+    decode.run_iteration()
+
+    # Now submit the first request — stall duration is measured from the reset,
+    # not from scheduler init, so the watchdog must not fire.
+    ctx = create_text_context(target_endpoint=server_addr, prompt_len=100)
+    q.request_queue.put(ctx)
+    decode.reserve_memory_and_send_to_prefill()
+    assert len(decode.prefill_reqs) == 1
+
+    result = decode.run_iteration()
+
+    assert result == SchedulerProgress.NO_PROGRESS
+
+
+def test_stall_watchdog_default_is_disabled() -> None:
+    """The stall timeout defaults to None (disabled) when the env var is unset."""
+    decode, _, _, _ = create_di_scheduler()
+    assert decode.scheduler_config.decode_stall_timeout_s is None
