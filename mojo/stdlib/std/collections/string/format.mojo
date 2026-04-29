@@ -71,7 +71,6 @@ methods.
 
 
 from std.builtin.globals import global_constant
-from std.builtin.variadics import Variadic
 from std.collections.string.string_slice import _memchr, get_static_string
 from std.compile import get_type_name
 from std.memory import Span
@@ -167,6 +166,7 @@ def _comptime_list_to_span[
 ]() -> Span[T, StaticConstantOrigin]:
     """Convert a comptime list to a runtime span of static constant origin."""
 
+    @parameter
     def list_to_array[list: List[T]]() -> InlineArray[T, len(list)]:
         var array = InlineArray[T, len(list)](uninitialized=True)
 
@@ -638,7 +638,7 @@ struct _FormatCurlyEntry[origin: ImmutOrigin](ImplicitlyCopyable):
         comptime s_value = UInt8(ord("s"))
         # alias a_value = UInt8(ord("a")) # TODO
 
-        def _format(idx: Int) unified {read self, read args, mut writer}:
+        def _format(idx: Int) {read self, read args, mut writer}:
             comptime for i in range(Ts.size):
                 if i == idx:
                     var flag = self.conversion_flag
