@@ -484,6 +484,61 @@ def test_flush_prefix_cache_other_errors_raise() -> None:
             flush_prefix_cache("modular", "localhost", 8000, dry_run=False)
 
 
+def test_flush_prefix_cache_proxy_wrapped_404_logs_warning_not_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Mammoth proxy wraps engine 404s in 502; treat unanimous 404 children as skip."""
+    from max.benchmark.benchmark_serving import flush_prefix_cache
+
+    proxy_body = {
+        "status": "error",
+        "results": [
+            {
+                "endpoint": "http://10.42.138.154:8000",
+                "name": "engine-0",
+                "statusCode": 404,
+                "success": False,
+                "error": '{"detail":"Not Found"}',
+            }
+        ],
+        "error": "failed to reset prefix cache for one or more endpoints",
+    }
+    mock_response = MagicMock()
+    mock_response.status_code = 502
+    mock_response.content = b"{...}"
+    mock_response.json.return_value = proxy_body
+    mock_response.text = str(proxy_body)
+
+    with patch("requests.post", return_value=mock_response):
+        flush_prefix_cache("vllm-chat", "localhost", 8000, dry_run=False)
+
+    assert any(
+        "skipping cache flush" in record.message for record in caplog.records
+    ), f"Expected warning in logs, got: {[r.message for r in caplog.records]}"
+
+
+def test_flush_prefix_cache_proxy_wrapped_mixed_statuses_raises() -> None:
+    """Proxy 502 with mixed children (not all 404) should still raise."""
+    from max.benchmark.benchmark_serving import flush_prefix_cache
+
+    proxy_body = {
+        "status": "error",
+        "results": [
+            {"statusCode": 404, "success": False},
+            {"statusCode": 500, "success": False},
+        ],
+    }
+    mock_response = MagicMock()
+    mock_response.status_code = 502
+    mock_response.content = b"{...}"
+    mock_response.json.return_value = proxy_body
+    mock_response.text = str(proxy_body)
+
+    with patch("requests.post", return_value=mock_response):
+        with pytest.raises(RuntimeError, match="Failed to flush prefix cache"):
+            flush_prefix_cache("vllm-chat", "localhost", 8000, dry_run=False)
+
+
 # ===========================================================================
 # result_filename plumbing tests
 # ===========================================================================
@@ -602,6 +657,7 @@ def test_save_result_json_writes_valid_json(
     mock_metrics.completed = 5
 
     save_result_json(
+        config.result_filename,
         config,
         {"duration": 1.0, "completed": 5, "failures": 0},
         mock_metrics,
@@ -874,12 +930,12 @@ def test_upload_path_writes_one_json_per_concurrency(
         ),
     ]
 
-    # Capture result_filename at call time — config is mutated between calls, so
-    # call_args_list would only reflect the final state without this side_effect.
     saved_filenames: list[str] = []
 
-    def capture_save(config: object, *args: object, **kwargs: object) -> None:
-        saved_filenames.append(getattr(config, "result_filename", "") or "")
+    def capture_save(
+        result_filename: str | None, *args: object, **kwargs: object
+    ) -> None:
+        saved_filenames.append(result_filename or "")
 
     mocker.patch(
         "max.benchmark.sweep_benchmark_serving.benchmark_serving_main",
@@ -927,3 +983,194 @@ def test_upload_path_writes_one_json_per_concurrency(
             f"Expected results-{expected_mc}-median.json in filename, "
             f"got {filename!r}"
         )
+
+
+def test_upload_writes_correct_data_to_correct_files(
+    tmp_path: Path,
+    workload_config: Path,
+    mocker: pytest_mock.MockerFixture,
+) -> None:
+    """Each concurrency level's JSON file must contain that level's results.
+
+    Regression test: a config-mutation bug caused the generator to resume
+    with a stale result_filename on the second iteration, writing mc2 data
+    into mc1's file and burying mc1's data in a .orig backup.
+
+    The fake generator here mimics the real generator's behavior: it reads
+    config.result_filename lazily on each resume.  If run_sweep mutates
+    config between yields (the bug), the second resume picks up the first
+    iteration's stale path and the file-content assertions fail.
+    """
+    from collections.abc import Iterator
+
+    from max.benchmark.benchmark_serving import (
+        BenchmarkRunResult,
+        save_result_json,
+    )
+    from max.benchmark.benchmark_shared.config import ServingBenchmarkConfig
+
+    mock_metrics = MagicMock()
+    mock_metrics.completed = 5
+
+    MC1_SENTINEL = "mc1_data"
+    MC2_SENTINEL = "mc2_data"
+
+    def fake_benchmark_serving_main(
+        config: ServingBenchmarkConfig,
+    ) -> Iterator[BenchmarkRunResult]:
+        assert config.model is not None
+        for mc, sentinel in [(1, MC1_SENTINEL), (2, MC2_SENTINEL)]:
+            result_dict = {
+                "duration": float(mc),
+                "completed": 5,
+                "failures": 0,
+                "test_sentinel": sentinel,
+            }
+            save_result_json(
+                config.result_filename,
+                config,
+                result_dict,
+                mock_metrics,
+                benchmark_task="text-generation",
+                model_id=config.model,
+                tokenizer_id=config.model,
+                request_rate=float(mc),
+            )
+            yield BenchmarkRunResult(
+                max_concurrency=mc,
+                request_rate=float(mc),
+                num_prompts=10,
+                metrics=mock_metrics,
+                result_dict=result_dict,
+            )
+
+    mocker.patch(
+        "max.benchmark.sweep_benchmark_serving.benchmark_serving_main",
+        side_effect=fake_benchmark_serving_main,
+    )
+    mocker.patch(
+        "max.benchmark.sweep_benchmark_serving._build_sweep_result",
+    )
+    mock_writer_cls = mocker.patch(
+        "max.benchmark.sweep_benchmark_serving.LLMBenchmarkResultWriter"
+    )
+    mock_ctx = MagicMock()
+    mock_ctx.__enter__ = MagicMock(return_value=mock_ctx)
+    mock_ctx.__exit__ = MagicMock(return_value=False)
+    mock_writer_cls.return_value = mock_ctx
+
+    sweep_benchmark_serving.main(
+        [
+            "--model",
+            "myorg/mymodel",
+            "--workload-config",
+            str(workload_config),
+            "--max-concurrency",
+            "1,2",
+            "--num-prompts",
+            "10",
+            "--upload-results",
+            "--backend",
+            "modular",
+            "--log-dir",
+            str(tmp_path),
+        ],
+        uploader=MagicMock(),
+    )
+
+    mc1_file = tmp_path / "results-1-median.json"
+    mc2_file = tmp_path / "results-2-median.json"
+
+    assert mc1_file.exists(), "results-1-median.json was not written"
+    assert mc2_file.exists(), "results-2-median.json was not written"
+    assert not (tmp_path / "results-1-median.json.orig").exists(), (
+        "results-1-median.json.orig found — the generator wrote stale data "
+        "into mc1's file, meaning config.result_filename was mutated between iterations"
+    )
+
+    mc1_data = json.loads(mc1_file.read_text())
+    mc2_data = json.loads(mc2_file.read_text())
+    assert mc1_data.get("test_sentinel") == MC1_SENTINEL, (
+        f"results-1-median.json contains mc2 data (sentinel={mc1_data.get('test_sentinel')!r})"
+    )
+    assert mc2_data.get("test_sentinel") == MC2_SENTINEL, (
+        f"results-2-median.json contains wrong data (sentinel={mc2_data.get('test_sentinel')!r})"
+    )
+
+
+def test_upload_path_single_run_no_max_concurrency(
+    tmp_path: Path,
+    workload_config: Path,
+    mocker: pytest_mock.MockerFixture,
+) -> None:
+    """run_sweep must call save_result_json for a non-sweep (single-run) upload.
+
+    When upload_results=True and max_concurrency is not set, run_sweep must
+    still write a JSON — the result_dict/metrics guard must not silently skip
+    the upload for single-run jobs migrated from the old out-of-process path.
+    """
+    from max.benchmark.benchmark_serving import BenchmarkRunResult
+
+    mock_metrics = MagicMock()
+    mock_metrics.completed = 5
+
+    fake_results = [
+        BenchmarkRunResult(
+            max_concurrency=None,
+            request_rate=float("inf"),
+            num_prompts=10,
+            metrics=mock_metrics,
+            result_dict={"duration": 1.0},
+        )
+    ]
+
+    saved_filenames: list[str] = []
+
+    def capture_save(
+        result_filename: str | None, *args: object, **kwargs: object
+    ) -> None:
+        saved_filenames.append(result_filename or "")
+
+    mocker.patch(
+        "max.benchmark.sweep_benchmark_serving.benchmark_serving_main",
+        return_value=fake_results,
+    )
+    mocker.patch(
+        "max.benchmark.sweep_benchmark_serving.save_result_json",
+        side_effect=capture_save,
+    )
+    mocker.patch(
+        "max.benchmark.sweep_benchmark_serving._build_sweep_result",
+        return_value=MagicMock(),
+    )
+    mock_writer_cls = mocker.patch(
+        "max.benchmark.sweep_benchmark_serving.LLMBenchmarkResultWriter"
+    )
+    mock_ctx = MagicMock()
+    mock_ctx.__enter__ = MagicMock(return_value=mock_ctx)
+    mock_ctx.__exit__ = MagicMock(return_value=False)
+    mock_writer_cls.return_value = mock_ctx
+
+    sweep_benchmark_serving.main(
+        [
+            "--model",
+            "myorg/mymodel",
+            "--workload-config",
+            str(workload_config),
+            "--num-prompts",
+            "10",
+            "--upload-results",
+            "--log-dir",
+            str(tmp_path),
+        ],
+        uploader=MagicMock(),
+    )
+
+    assert len(saved_filenames) == 1, (
+        f"Expected save_result_json called once for single-run upload, "
+        f"got {len(saved_filenames)}."
+    )
+    assert "results-None-median.json" in saved_filenames[0], (
+        f"Expected results-None-median.json in filename, "
+        f"got {saved_filenames[0]!r}."
+    )

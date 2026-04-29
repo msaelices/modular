@@ -111,6 +111,7 @@ class UnifiedMTPDeepseekV3(Module):
                 else None
             ),
             num_draft_steps=self.num_draft_steps,
+            use_stochastic=True,
         )
         self.target = DeepseekV3(config)
         self.merger = RaggedTokenMerger(config.devices[0])
@@ -130,6 +131,11 @@ class UnifiedMTPDeepseekV3(Module):
         data_parallel_splits: TensorValue,
         batch_context_lengths: list[TensorValue],
         seed: TensorValue,
+        temperature: TensorValue,
+        top_k: TensorValue,
+        max_k: TensorValue,
+        top_p: TensorValue,
+        min_top_p: TensorValue,
         ep_inputs: list[Value[Any]] | None = None,
         draft_kv_collections: list[PagedCacheValues] | None = None,
     ) -> tuple[TensorValue, ...]:
@@ -143,22 +149,39 @@ class UnifiedMTPDeepseekV3(Module):
             host_input_row_offsets, draft_tokens
         )
 
+        # Broadcast merged_offsets once (uint32, small) and reuse the
+        # per-device list for target + draft step 0 + the accept-position
+        # gather. Hoisting this eliminates the broadcast that target and
+        # each draft step would otherwise run independently.
+        merged_offsets_per_dev = ops.distributed_broadcast(
+            merged_offsets, signal_buffers
+        )
         target_outputs = self.target(
             merged_tokens,
             signal_buffers,
             kv_collections,
             return_n_logits,
-            merged_offsets,
+            merged_offsets_per_dev,
             host_merged_offsets,
             data_parallel_splits,
             batch_context_lengths,
             ep_inputs,
         )
+        devices = self.config.devices
+        n_devs = len(devices)
+
         logits = target_outputs[1]
-        hidden_states = target_outputs[3]
+        hidden_states = list(target_outputs[3 : 3 + n_devs])
 
         num_accepted_draft_tokens, recovered, bonus = self.acceptance_sampler(
-            draft_tokens, logits, seed=seed
+            draft_tokens,
+            logits,
+            seed=seed,
+            temperature=temperature,
+            top_k=top_k,
+            max_k=max_k,
+            top_p=top_p,
+            min_top_p=min_top_p,
         )
 
         target_tokens = ops.concat([recovered, bonus], axis=1)
@@ -181,6 +204,8 @@ class UnifiedMTPDeepseekV3(Module):
         )
 
         assert draft_kv_collections is not None
+        # Step 0 always uses ALL hidden states (for per-batch-element gather
+        # at accepted positions) + VARIABLE logits (for draft argmax).
         self.draft.return_hidden_states = ReturnHiddenStates.ALL
         self.draft.return_logits = ReturnLogits.VARIABLE
         draft_outputs = self.draft(
@@ -189,17 +214,23 @@ class UnifiedMTPDeepseekV3(Module):
             signal_buffers,  # reuse target signal buffers for draft
             draft_kv_collections,
             return_n_logits,
-            merged_offsets,
+            merged_offsets_per_dev,
             host_merged_offsets,
             data_parallel_splits,
             batch_context_lengths,
             ep_inputs,  # reuse target ep inputs for draft
         )
-        self.draft.return_hidden_states = ReturnHiddenStates.LAST
+        # Steps 1..K use LAST_PER_DEVICE. The underlying LAST path's
+        # internal allgather acts as a collective fence between successive
+        # draft invocations — without it, the draft's EP/MoE dispatch
+        # leaves pending async work that surfaces `mgp.sync` on the 2nd
+        # decoder call during CUDA graph capture. LAST_PER_DEVICE returns
+        # the post-allgather per-device tensors directly.
+        self.draft.return_hidden_states = ReturnHiddenStates.LAST_PER_DEVICE
         self.draft.return_logits = ReturnLogits.LAST_TOKEN
 
         draft_variable_logits = draft_outputs[1]
-        all_hs = draft_outputs[3]
+        all_hs = list(draft_outputs[3 : 3 + n_devs])
 
         draft_logits_3d = _reshape_target_logits(draft_variable_logits)
         draft_argmax = ops.squeeze(
@@ -222,7 +253,36 @@ class UnifiedMTPDeepseekV3(Module):
             - num_draft_sentinel_gpu.broadcast_to(["batch_size"])
             + num_accepted_draft_tokens
         )
-        draft_hs = ops.gather(all_hs, last_accepted_idx, axis=0)
+        # Per-device gather at accepted positions. Broadcast indices once,
+        # then either slice by DP splits (DP mode, each device holds its
+        # local batch shard) or gather directly (TP mode, each device
+        # holds a full replica).
+        last_accepted_idx_i64 = last_accepted_idx.cast(DType.int64)
+        last_accepted_idx_per_dev = ops.distributed_broadcast(
+            last_accepted_idx_i64, signal_buffers
+        )
+
+        draft_hs: list[TensorValue] = []
+        if self.config.data_parallel_degree > 1:
+            for i in range(n_devs):
+                start = data_parallel_splits[i]
+                end = data_parallel_splits[i + 1]
+                global_idx_dev_i = ops.slice_tensor(
+                    last_accepted_idx_per_dev[i],
+                    [(slice(start, end), f"mtp_batch_split_{i}")],
+                )
+                local_seq_offset_i = merged_offsets_per_dev[i][start].cast(
+                    DType.int64
+                )
+                local_idx_dev_i = global_idx_dev_i - local_seq_offset_i
+                draft_hs.append(ops.gather(all_hs[i], local_idx_dev_i, axis=0))
+        else:
+            # TP / single-device: each all_hs[i] is a full replica, index
+            # directly with the global accepted-idx on each device.
+            for i in range(n_devs):
+                draft_hs.append(
+                    ops.gather(all_hs[i], last_accepted_idx_per_dev[i], axis=0)
+                )
 
         input_lengths = ops.rebind(
             (input_row_offsets[1:] - input_row_offsets[:-1]).cast(DType.int64),
@@ -250,6 +310,9 @@ class UnifiedMTPDeepseekV3(Module):
             out_dim="input_row_offsets_len",
             device=device0,
             dtype=DType.uint32,
+        )
+        decode_offsets_per_dev = ops.distributed_broadcast(
+            decode_offsets, signal_buffers
         )
         host_decode_offsets = ops.range(
             start=0,
@@ -282,7 +345,15 @@ class UnifiedMTPDeepseekV3(Module):
         all_draft_tokens = [next_draft_tokens]
 
         for step in range(1, self.num_draft_steps):
-            draft_hs = draft_hs.rebind(["batch_size", hidden_dim])
+            # Per-device shapes differ across DP replicas; use per-device
+            # dim names. The draft internally rebinds to
+            # `{split_prefix}_seq_len_device_{i}` once inside __call__.
+            draft_hs = [
+                draft_hs[i].rebind(
+                    [f"mtp_step{step}_batch_dev_{i}", hidden_dim]
+                )
+                for i in range(n_devs)
+            ]
 
             step_kv: list[PagedCacheValues] = [
                 replace(kv, cache_lengths=cl)
@@ -297,7 +368,7 @@ class UnifiedMTPDeepseekV3(Module):
                 signal_buffers,
                 step_kv,
                 draft_return_n_logits,
-                decode_offsets,
+                decode_offsets_per_dev,
                 host_decode_offsets,
                 data_parallel_splits,
                 batch_context_lengths,
@@ -306,7 +377,28 @@ class UnifiedMTPDeepseekV3(Module):
             )
 
             logits = step_outputs[0]
-            draft_hs = step_outputs[1]
+            draft_hs_full = list(step_outputs[1 : 1 + n_devs])
+            next_step = step + 1
+            if self.config.data_parallel_degree > 1:
+                draft_hs = [
+                    ops.slice_tensor(
+                        draft_hs_full[i],
+                        [
+                            (
+                                slice(
+                                    data_parallel_splits[i],
+                                    data_parallel_splits[i + 1],
+                                ),
+                                f"mtp_step{next_step}_batch_dev_{i}",
+                            ),
+                        ],
+                    )
+                    for i in range(n_devs)
+                ]
+            else:
+                # TP / single-device: each device already holds a full
+                # replica, no per-device slicing needed.
+                draft_hs = list(draft_hs_full)
 
             next_draft_tokens = ops.argmax(logits, axis=-1).reshape([-1])
             all_draft_tokens.append(
@@ -334,10 +426,11 @@ class UnifiedMTPDeepseekV3(Module):
     ) -> tuple[TensorType | BufferType, ...]:
         """Input types for the with-MTP graph.
 
-        Order: tokens, device_offsets, host_offsets, draft_tokens,
-               return_n_logits, data_parallel_splits, signal_buffers,
-               target_kv_cache, draft_kv_blocks_per_device,
-               batch_context_lengths, ep_inputs, seed.
+        Order: tokens, device_offsets, host_offsets, return_n_logits,
+               data_parallel_splits, signal_buffers, target_kv_cache,
+               batch_context_lengths, ep_inputs, draft_tokens,
+               draft_kv_blocks_per_device, seed, temperature, top_k,
+               max_k, top_p, min_top_p.
         """
         devices = self.config.devices
         device_ref = devices[0]
@@ -399,5 +492,28 @@ class UnifiedMTPDeepseekV3(Module):
                 all_input_types.append(sym.kv_blocks)
 
         all_input_types.append(ops.random.SeedType)
+
+        temperature_type = TensorType(
+            DType.float32, shape=["batch_size"], device=device_ref
+        )
+        top_k_type = TensorType(
+            DType.int64, shape=["batch_size"], device=device_ref
+        )
+        max_k_type = TensorType(DType.int64, shape=[], device=DeviceRef.CPU())
+        top_p_type = TensorType(
+            DType.float32, shape=["batch_size"], device=device_ref
+        )
+        min_top_p_type = TensorType(
+            DType.float32, shape=[], device=DeviceRef.CPU()
+        )
+        all_input_types.extend(
+            [
+                temperature_type,
+                top_k_type,
+                max_k_type,
+                top_p_type,
+                min_top_p_type,
+            ]
+        )
 
         return tuple(all_input_types)
