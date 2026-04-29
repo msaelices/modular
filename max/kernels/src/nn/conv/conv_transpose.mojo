@@ -485,7 +485,7 @@ struct ConvTransposedPacked[
             ), "Don't support grouped transposed conv for now."
 
         # Number of partitions in n, ho_wo, c, f dimensions.
-        var num_threads = parallelism_level()
+        var num_threads = parallelism_level(ctx)
         var num_partitions = get_num_partitions[
             micro_kernel_height, micro_kernel_f_size
         ](num_threads, conv_shape)
@@ -546,7 +546,7 @@ struct ConvTransposedPacked[
         for _ in range(num_rows):
 
             @always_inline
-            def zero[width: Int](offset: Int) unified {output_ptr, mut}:
+            def zero[width: Int](offset: Int) {output_ptr, mut}:
                 output_ptr.store(offset, SIMD[Self.output_type, width](0))
 
             vectorize[simd_size](self.partition.f_size, zero)
@@ -1433,7 +1433,7 @@ def conv_transposed_cpu[
             packed_filter_shape = IndexList[packed_filter_rank]()
 
             comptime for i in range(packed_filter_rank):
-                packed_filter_shape[i] = filter.layout.shape[i]().value()
+                packed_filter_shape[i] = Int(filter.layout.shape[i]().value())
 
         var packed_filter = TileTensor(
             packed_filter_ptr,
@@ -1467,7 +1467,7 @@ def conv_transposed_cpu[
             comptime input_rank = input.rank
 
             @always_inline
-            def body[width: Int](idx: Int) unified {coords, output, mut}:
+            def body[width: Int](idx: Int) {coords, output, mut}:
                 # Coordinates of the current index.
                 var curr_coords = rebind[IndexList[input_rank]](coords)
                 curr_coords[input_rank - 1] += idx

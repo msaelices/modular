@@ -11,6 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+from std.logger import Logger
 from std.math import fma
 from std.ffi import external_call, c_size_t
 from std.sys import size_of, align_of
@@ -43,10 +44,11 @@ from tensor.managed_tensor_slice import DynamicTensor, get_kernel_simd_width
 
 from std.utils import Index, IndexList, StaticTuple
 
-from .buffer_plan import BufferPlanState
+from .buffer_plan import BufferPlanState, BufferPlanStats
 
 comptime MutByteBuffer = DynamicTensor[DType.int8, 1]
 comptime ImmutByteBuffer = DynamicTensor[DType.int8, 1]
+comptime logger = Logger()
 
 # ===-----------------------------------------------------------------------===#
 # Helper Structures
@@ -426,6 +428,36 @@ def mgp_buffer_slice(
     return MutByteBuffer(buffer.unsafe_ptr() + offset, Index(size))
 
 
+@register_internal("mgp.buffer.bulk_slice")
+@no_inline
+def mgp_buffer_bulk_slice[
+    N: Int,
+    //,
+](
+    base: MutByteBuffer,
+    offsets: InlineArray[Int, N],
+    sizes: InlineArray[Int, N],
+) -> InlineArray[MutByteBuffer, N]:
+    """Bulk slice: produce N non-overlapping sub-buffers from a pool buffer.
+
+    Parameters:
+        N: Number of slices.
+
+    Args:
+        base: The pool buffer.
+        offsets: Byte offset of each slice within the pool.
+        sizes: Byte size of each slice.
+
+    Returns:
+        An InlineArray of N MutByteBuffer views into the pool.
+    """
+    var result = InlineArray[MutByteBuffer, N](uninitialized=True)
+
+    for i in range(N):
+        result[i] = mgp_buffer_slice(base, offsets[i], sizes[i])
+    return result
+
+
 @register_internal("mgp.buffer.plan")
 @no_inline
 def mgp_buffer_plan[
@@ -472,6 +504,7 @@ def mgp_buffer_plan[
         - offsets: Offsets for each allocation (static_sizes first, then runtime_sizes).
     """
 
+    @parameter
     def compute_static_allocations(
         out result: BufferPlanState[
             alignments,
@@ -486,11 +519,16 @@ def mgp_buffer_plan[
     # If all sizes are static, then we can avoid materializing the allocator
     # state.
     comptime if num_runtime_sizes == 0:
+        comptime stats = state.stats()
+        logger.debug(stats)
+
         comptime results = state.take_results()
         return results
     else:
         var runtime_state = materialize[state]()
         runtime_state.allocate_greedy[start=num_static_sizes](runtime_sizes)
+
+        logger.debug(runtime_state.stats())
         return runtime_state^.take_results()
 
 
@@ -1009,7 +1047,7 @@ def mogg_async_pack_borrow[
 ](
     borrower: AnyAsyncValueRefPtr,
     buffer: DynamicTensor[dtype, buffer_rank],
-    mem: TensorBufferRefPtr,
+    mem: Optional[TensorBufferRefPtr],
 ):
     """
     Borrows an async value. This differs from `mogg.async.pack` which assigns a
@@ -1040,7 +1078,7 @@ def mogg_async_pack_borrow[
 ](
     borrower: AnyAsyncValueRefPtr,
     buffer: TensorBufferRefPtr,
-    mem: TensorBufferRefPtr,
+    mem: Optional[TensorBufferRefPtr],
 ):
     """
     Borrows an async value. This differs from `mogg.async.pack` which assigns a
@@ -1222,7 +1260,8 @@ def mgp_buffer_get_cached(
     )
 
     var buffer = MutByteBuffer(
-        unsafe_cast[Type=Int8](buffer_data), Index(buffer_size)
+        buffer_data.unsafe_value().bitcast[Int8](),
+        Index(buffer_size),
     )
     var res = Tuple[MutByteBuffer, TensorBufferRefPtr](buffer, buffer_ref)
 

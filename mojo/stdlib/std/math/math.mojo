@@ -43,6 +43,8 @@ from std.memory import Span
 from std.utils.numerics import FPUtils, isnan, nan
 from std.utils.static_tuple import StaticTuple
 
+from std._plugin import CurrentPlugin
+
 from .constants import log2e
 from .polynomial import polynomial_evaluate
 
@@ -203,15 +205,11 @@ def sqrt(x: Int) -> Int:
 
 @always_inline
 def _sqrt_nvvm(x: SIMD, out res: type_of(x)):
-    comptime assert x.dtype in (
-        DType.float32,
-        DType.float64,
-    ), "must be f32 or f64 type"
-    comptime instruction = "llvm.nvvm.sqrt.approx.ftz.f" if x.dtype == DType.float32 else "llvm.nvvm.sqrt.approx.d"
+    comptime assert x.dtype == DType.float32, "must be DType.float32"
     res = {}
 
     comptime for i in range(x.size):
-        res[i] = _llvm_unary_fn[instruction](x[i])
+        res[i] = _llvm_unary_fn["llvm.nvvm.sqrt.approx.ftz.f"](x[i])
 
 
 @always_inline
@@ -245,6 +243,9 @@ def sqrt[
     elif is_nvidia_gpu():
         comptime if dtype in (DType.float16, DType.bfloat16):
             return _sqrt_nvvm(x.cast[DType.float32]()).cast[dtype]()
+        comptime assert (
+            dtype != DType.float64
+        ), "DType.float64 is not supported for approx sqrt on NVIDIA GPU"
         return _sqrt_nvvm(x)
     elif is_apple_gpu():
         return _llvm_unary_fn["llvm.air.sqrt"](x)
@@ -617,6 +618,9 @@ def exp[
     """
 
     comptime neg_ln2 = -0.69314718055966295651160180568695068359375
+
+    comptime if CurrentPlugin.exp_fn:
+        return comptime (CurrentPlugin.exp_fn.value())(x)
 
     comptime if is_gpu():
         comptime if dtype in (DType.float16, DType.float32):
@@ -1209,11 +1213,11 @@ def isclose[
     For floating-point dtypes, the following criteria apply:
 
     - Symmetric (Python `math.isclose` style), when `symmetrical` is true:
-        ```
+        ```text
         |a - b| ≤ max(atol, rtol * max(|a|, |b|))
         ```
     - Asymmetric (NumPy style), when `symmetrical` is false:
-        ```
+        ```text
         |a - b| ≤ atol + rtol * |b|
         ```
 
@@ -1317,7 +1321,7 @@ def iota[
     """
 
     @always_inline
-    def fill[width: Int](i: Int) unified {var offset, var buff}:
+    def fill[width: Int](i: Int) {var offset, var buff}:
         buff.store(i, iota[dtype, width](Scalar[dtype](offset + i)))
 
     vectorize[simd_width_of[dtype]()](len, fill)
@@ -1756,7 +1760,7 @@ def cos[
     else:
         comptime assert (
             not is_nvidia_gpu() or dtype != DType.float64
-        ), "DType.float64 is not supported on NVIDIA GPU"
+        ), "DType.float64 is not supported for cos on NVIDIA GPU"
         return _llvm_unary_fn["llvm.cos"](x)
 
 
@@ -1799,7 +1803,7 @@ def sin[
     else:
         comptime assert (
             not is_nvidia_gpu() or dtype != DType.float64
-        ), "DType.float64 is not supported on NVIDIA GPU"
+        ), "DType.float64 is not supported for sin on NVIDIA GPU"
         return _llvm_unary_fn["llvm.sin"](x)
 
 

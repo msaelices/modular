@@ -211,7 +211,7 @@ def _softmax_2_pass_step2[
     @always_inline
     def _step_2[
         simd_width: Int
-    ](idx: Int) unified {running_max, running_sum, input, output, mut}:
+    ](idx: Int) {running_max, running_sum, input, output, mut}:
         var running_max_simd = SIMD[dtype, simd_width](running_max)
         var running_sum_simd = SIMD[dtype, simd_width](running_sum)
         var input_val = input.load_linear[width=simd_width, alignment=1](
@@ -312,7 +312,7 @@ def _softmax_3_pass_step_2[
     var accum_simd: SIMD[dtype, outer_simd_width] = 0
 
     @always_inline
-    def step_2[simd_width: Int](idx: Int) unified {max_val, output, mut}:
+    def step_2[simd_width: Int](idx: Int) {max_val, output, mut}:
         var vin = input_fn_1d[simd_width](idx)
         var elem = vin - SIMD[dtype, simd_width](max_val)
 
@@ -352,7 +352,7 @@ def _softmax_3_pass_step_3[
     var accum_proc = accum_proc_func[dtype, 1](accum)
 
     @always_inline
-    def step_3[simd_width: Int](idx: Int) unified {var accum_proc, output}:
+    def step_3[simd_width: Int](idx: Int) {var accum_proc, output}:
         var accum_simd = SIMD[dtype, simd_width](accum_proc)
         var elem = output.load_linear[width=simd_width, alignment=1](
             IndexList[1](idx)
@@ -618,7 +618,7 @@ def _softmax_cpu[
 
     var inner_dim = Int(output.dim[rank - 1]())
     var outer_dim = product[rank](shape, rank - 1)
-    var num_workers = min(parallelism_level(), outer_dim)
+    var num_workers = min(parallelism_level(ctx), outer_dim)
     var chunk_size = ceildiv(outer_dim, num_workers)
 
     @__copy_capture(chunk_size, inner_dim, outer_dim)
@@ -1004,7 +1004,7 @@ def _softmax_temperature_kernel[
                         @always_inline
                         def online_max_sum[
                             width: Int
-                        ](offset: Int) unified {input, row_idx, mut}:
+                        ](offset: Int) {input, row_idx, mut}:
                             var v = input.load_linear[width=width](
                                 IndexList[2](row_idx, Int(lane_base) + offset)
                             ).cast[accum_type]()
@@ -1048,7 +1048,7 @@ def _softmax_temperature_kernel[
                         @always_inline
                         def normalize[
                             width: Int
-                        ](offset: Int) unified {input, row_idx, output, mut}:
+                        ](offset: Int) {input, row_idx, output, mut}:
                             var logit = input.load_linear[width=width](
                                 IndexList[2](row_idx, Int(lane_base) + offset)
                             ).cast[accum_type]()
