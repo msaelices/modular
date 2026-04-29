@@ -45,11 +45,12 @@ from pathlib import Path
 from pprint import pformat
 from subprocess import DEVNULL, check_call, check_output
 from tempfile import TemporaryDirectory
-from typing import Any, TypedDict
+from typing import Any
 
 import click
 import requests
 from inference_server_harness import start_server
+from requests.structures import CaseInsensitiveDict
 
 DUMMY_2X2_IMAGE = (
     "data:image/png;base64,"
@@ -74,104 +75,70 @@ logger = logging.getLogger(__name__)
 EvalResults = dict[str, Any]
 EvalSamples = list[dict[str, Any]]
 
-
-class ModelAlias(TypedDict):
-    hf_model_path: str
-    max_serve_args: str
-
-
 # Maps alias model names to their real HuggingFace model path and extra
 # MAX serve args. Aliases let the same weights be tested under different
 # configurations while keeping results separate in dashboards.
 # max_serve_args are only applied to MAX frameworks, not vllm/sglang.
-MODEL_ALIASES: dict[str, ModelAlias] = {
+# fmt: off
+MODEL_ALIASES = CaseInsensitiveDict({
     "google/gemma-4-26B-A4B-it__no_dgc": {
-        "hf_model_path": "google/gemma-4-26B-A4B-it",
-        "max_serve_args": "--max-num-steps 1 --no-device-graph-capture --force",
+        "max_serve_args": "--max-num-steps 1 --no-device-graph-capture",
     },
     "meta-llama/Llama-3.1-8B-Instruct__modulev3": {
-        "hf_model_path": "meta-llama/Llama-3.1-8B-Instruct",
         "max_serve_args": "--prefer-module-v3",
     },
     "meta-llama/Llama-3.2-1B-Instruct__modulev3": {
-        "hf_model_path": "meta-llama/Llama-3.2-1B-Instruct",
         "max_serve_args": "--prefer-module-v3",
     },
     "unsloth/gpt-oss-20b-BF16__modulev3": {
-        "hf_model_path": "unsloth/gpt-oss-20b-BF16",
         "max_serve_args": "--prefer-module-v3",
     },
     "microsoft/Phi-3.5-mini-instruct__modulev3": {
-        "hf_model_path": "microsoft/Phi-3.5-mini-instruct",
         "max_serve_args": "--prefer-module-v3",
     },
     "microsoft/phi-4__modulev3": {
-        "hf_model_path": "microsoft/phi-4",
         "max_serve_args": "--prefer-module-v3",
     },
     "google/gemma-3-4b-it__modulev3": {
-        "hf_model_path": "google/gemma-3-4b-it",
         "max_serve_args": "--prefer-module-v3",
     },
     "nvidia/DeepSeek-V3.1-NVFP4__fp8kv": {
-        "hf_model_path": "nvidia/DeepSeek-V3.1-NVFP4",
         "max_serve_args": "--kv-cache-format float8_e4m3fn",
     },
     "nvidia/DeepSeek-V3.1-NVFP4__tpep": {
-        "hf_model_path": "nvidia/DeepSeek-V3.1-NVFP4",
         "max_serve_args": "--data-parallel-degree 1",
     },
-    "nvidia/Kimi-K2.5-NVFP4__with_vision": {  # MODELS-1066
-        "hf_model_path": "nvidia/Kimi-K2.5-NVFP4",
-        "max_serve_args": "--ep-size 8 --data-parallel-degree 8 --max-batch-input-tokens 4096 --max-num-steps 1 --max-length 262144 --trust-remote-code --no-enable-in-flight-batching --device-memory-utilization 0.80 --enable-chunked-prefill --enable-prefix-caching",
+    "nvidia/DeepSeek-V3.1-NVFP4__tpep_ar": {
+        "max_serve_args": "--data-parallel-degree 1 --ep-use-allreduce",
     },
-    "nvidia/Kimi-K2.5-NVFP4__no_vision": {
-        "hf_model_path": "nvidia/Kimi-K2.5-NVFP4",
-        "max_serve_args": "--enable-prefix-caching --enable-chunked-prefill --max-num-steps 1 --trust-remote-code",
+    "nvidia/DeepSeek-V3.1-NVFP4__tptp": {
+        "max_serve_args": "--ep-size 1 --data-parallel-degree 1",
     },
     "meta-llama/Llama-3.1-8B-Instruct__eagle": {
-        "hf_model_path": "meta-llama/Llama-3.1-8B-Instruct",
         "max_serve_args": (
             "--draft-model-path atomicapple0/EAGLE-LLaMA3.1-Instruct-8B "
+            "--devices gpu:0 "
             "--speculative-method eagle"
         ),
     },
-    # Llama Eagle + CUDA Graph only works when num_speculative_tokens == 1
-    # TODO: Remove this config once we support CUDA Graph for >1 draft tokens
-    "meta-llama/Llama-3.1-8B-Instruct__eagle_1_draft_token": {
-        "hf_model_path": "meta-llama/Llama-3.1-8B-Instruct",
-        "max_serve_args": (
-            "--draft-model-path atomicapple0/EAGLE-LLaMA3.1-Instruct-8B "
-            "--speculative-method eagle "
-            "--num-speculative-tokens 1"
-        ),
-    },
     "nvidia/DeepSeek-V3.1-NVFP4__mtp": {
-        "hf_model_path": "nvidia/DeepSeek-V3.1-NVFP4",
         "max_serve_args": (
             "--speculative-method eagle "
             "--kv-cache-format float8_e4m3fn "
             "--num-speculative-tokens 3"
         ),
     },
-    # Deepseek MTP + CUDA Graph only works when num_speculative_tokens == 1
-    # TODO: Remove this config once we support CUDA Graph for >1 draft tokens
-    "nvidia/DeepSeek-V3.1-NVFP4__mtp_1_draft_token": {
-        "hf_model_path": "nvidia/DeepSeek-V3.1-NVFP4",
+    "nvidia/DeepSeek-V3.1-NVFP4__mtp_tpep": {
         "max_serve_args": (
+            "--data-parallel-degree 1 "
             "--speculative-method eagle "
             "--kv-cache-format float8_e4m3fn "
-            "--num-speculative-tokens 1"
+            "--num-speculative-tokens 3"
         ),
     },
     "nvidia/Kimi-K2.5-NVFP4__eagle": {
-        "hf_model_path": "nvidia/Kimi-K2.5-NVFP4",
         "max_serve_args": (
             "--draft-model-path nvidia/Kimi-K2.5-Thinking-Eagle3 "
-            "--draft-trust-remote-code "
-            "--draft-devices gpu:0,1,2,3,4,5,6,7 "
-            "--draft-data-parallel-degree 8 "
-            "--draft-quantization-encoding bfloat16 "
             "--speculative-method eagle "
             "--num-speculative-tokens 3 "
             "--kv-cache-format float8_e4m3fn "
@@ -181,44 +148,8 @@ MODEL_ALIASES: dict[str, ModelAlias] = {
             "--max-num-steps 1"
         ),
     },
-    # Kimi Eagle + CUDA Graph only works when num_speculative_tokens == 1
-    # TODO: Remove this config once we support CUDA Graph for >1 draft tokens
-    "nvidia/Kimi-K2.5-NVFP4__eagle_1_draft_token": {
-        "hf_model_path": "nvidia/Kimi-K2.5-NVFP4",
-        "max_serve_args": (
-            "--draft-model-path nvidia/Kimi-K2.5-Thinking-Eagle3 "
-            "--draft-trust-remote-code "
-            "--draft-devices gpu:0,1,2,3,4,5,6,7 "
-            "--draft-data-parallel-degree 8 "
-            "--draft-quantization-encoding bfloat16 "
-            "--speculative-method eagle "
-            "--num-speculative-tokens 1 "
-            "--kv-cache-format float8_e4m3fn "
-            "--device-memory-utilization 0.75 "
-            "--max-batch-input-tokens 4096 "
-            "--max-length 163840 "
-            "--max-num-steps 1"
-        ),
-    },
-    "nvidia/Kimi-K2.5-NVFP4__eagle_tp": {
-        "hf_model_path": "nvidia/Kimi-K2.5-NVFP4",
-        "max_serve_args": (
-            "--draft-model-path nvidia/Kimi-K2.5-Thinking-Eagle3 "
-            "--draft-trust-remote-code "
-            "--draft-devices gpu:0,1,2,3,4,5,6,7 "
-            "--data-parallel-degree 1 "
-            "--draft-data-parallel-degree 1 "
-            "--draft-quantization-encoding bfloat16 "
-            "--speculative-method eagle "
-            "--num-speculative-tokens 3 "
-            "--kv-cache-format float8_e4m3fn "
-            "--device-memory-utilization 0.75 "
-            "--max-batch-input-tokens 4096 "
-            "--max-length 163840 "
-            "--max-num-steps 1"
-        ),
-    },
-}
+})
+# fmt: on
 
 
 # TODO Refactor this to a model list/matrix specifying type of model
@@ -325,6 +256,23 @@ def get_gpu_name_and_count() -> tuple[str, int]:
             return "N/A", 0
 
 
+def resolve_canonical_repo_id(repo_id: str) -> str:
+    """HF disk cache is case-sensitive, so do what we can to avoid issues"""
+    if os.environ.get("HF_HUB_OFFLINE") == "1":
+        return repo_id
+    try:
+        r = requests.get(
+            f"https://huggingface.co/api/models/{repo_id}",
+            headers={"Authorization": f"Bearer {os.environ['HF_TOKEN']}"},
+            timeout=(5, 10),
+        )
+        r.raise_for_status()
+        return r.json()["id"]
+    except Exception as e:
+        logger.warning("Failed repo id lookup for %s: %s", repo_id, e)
+        return repo_id
+
+
 def get_server_cmd(
     framework: str,
     model: str,
@@ -352,7 +300,7 @@ def get_server_cmd(
             VLLM += f" --tensor-parallel-size={gpu_count}"
 
         # Remove once vLLM >= 0.17 (which includes vllm-project/vllm#34673).
-        if "minimax-m2" in model:
+        if "minimax-m2" in model.casefold():
             os.environ["VLLM_USE_FLASHINFER_MOE_FP8"] = "0"
             VLLM += " --attention-backend FLASH_ATTN"
         # Have not been successful in getting SGLang to work with R1 yet
@@ -378,7 +326,7 @@ def get_server_cmd(
 
     # GPT-OSS uses repetition_penalty in lm_eval to prevent reasoning loops,
     # so we need to enable penalties on the server
-    if "gpt-oss" in model and framework in ["max-ci", "max"]:
+    if "gpt-oss" in model.casefold() and framework in ["max-ci", "max"]:
         cmd += ["--enable-penalties"]
 
     revision = _load_hf_repo_lock().get(model.casefold())
@@ -420,7 +368,7 @@ def call_eval(
 ) -> tuple[EvalResults, EvalSamples]:
     extra_gen_kwargs = ""
     is_reasoning_model = any(
-        kw in model
+        kw in model.casefold()
         for kw in (
             "academic-ds",
             "deepseek-r1",
@@ -430,6 +378,8 @@ def call_eval(
             "internvl3_5",
             "qwen3",
             "kimi-k2.5",
+            "minimax-m2",
+            "step-3.5",
         )
     )
     # Reasoning models needs extra tokens for .. reasoning
@@ -438,7 +388,7 @@ def call_eval(
 
     # GPT-OSS sometimes gets stuck in a reasoning loop. To ensure consistency
     # in CI, we add a repetition penalty which helps prevent the loop
-    if "gpt-oss" in model:
+    if "gpt-oss" in model.casefold():
         extra_gen_kwargs = extra_gen_kwargs + ",repetition_penalty=1.1"
 
     interpreter = sys.executable if _inside_bazel() else ".venv-eval/bin/python"
@@ -682,12 +632,10 @@ def smoke_test(
     if output_path and build_workspace and not output_path.is_absolute():
         output_path = Path(build_workspace) / output_path
 
-    model = hf_model_path.strip().casefold()
-    model_aliases_lowercase = {
-        k.casefold(): v for k, v in MODEL_ALIASES.items()
-    }
-    alias = model_aliases_lowercase.get(model)
-    hf_model_path = (alias["hf_model_path"] if alias else model).casefold()
+    model = hf_model_path.strip()
+    alias = MODEL_ALIASES.get(model)
+    hf_model_path = model.rsplit("__", 1)[0] if alias else model
+    hf_model_path = resolve_canonical_repo_id(hf_model_path)
     if alias and framework in ["max-ci", "max"]:
         serve_extra_args = (
             f"{serve_extra_args} {alias['max_serve_args']}".strip()

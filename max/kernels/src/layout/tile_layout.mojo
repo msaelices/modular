@@ -42,11 +42,6 @@ from layout.tile_layout import Layout, TensorLayout, row_major, col_major
 
 from std.math.uutils import udivmod_unchecked
 
-from std.builtin.variadics import (
-    Variadic,
-    _ReduceVariadicAndIdxToVariadic,
-)
-
 from .coord import (
     ComptimeInt,
     Idx,
@@ -430,9 +425,9 @@ struct Layout[
 
             comptime flat_len = type_of(flat_idx).__len__()
             comptime for i in range(flat_len):
-                result += Scalar[linear_idx_type](
-                    flat_idx[i].value() * flat_stride[i].value()
-                )
+                result += Scalar[linear_idx_type](flat_idx[i].value()) * Scalar[
+                    linear_idx_type
+                ](flat_stride[i].value())
 
             return result
         else:
@@ -491,10 +486,10 @@ struct Layout[
                 comptime for j in range(sub_rank):
                     var divided = _divide_by_stride[
                         Self.stride_types[i].ParamListType[j]
-                    ](idx, sub_stride[j].value())
+                    ](idx, Int(sub_stride[j].value()))
                     var coord_val = _mod_by_shape[
                         Self.shape_types[i].ParamListType[j]
-                    ](divided, sub_shape[j].value())
+                    ](divided, Int(sub_shape[j].value()))
                     UnsafePointer(to=sub_result[j]).init_pointee_copy(
                         rebind[SubResultType.element_types[j]](
                             RuntimeInt[out_dtype](Scalar[out_dtype](coord_val))
@@ -505,10 +500,10 @@ struct Layout[
                 )
             else:
                 var divided = _divide_by_stride[Self.stride_types[i]](
-                    idx, stride_t[i].value()
+                    idx, Int(stride_t[i].value())
                 )
                 var coord_val = _mod_by_shape[Self.shape_types[i]](
-                    divided, shape_t[i].value()
+                    divided, Int(shape_t[i].value())
                 )
                 UnsafePointer(to=result[i]).init_pointee_copy(
                     rebind[ResultType.element_types[i]](
@@ -527,7 +522,7 @@ struct Layout[
         Returns:
             The total number of elements in the layout.
         """
-        return self._shape.product()
+        return Int(self._shape.product())
 
     @always_inline("nodebug")
     def size(self) -> Int:
@@ -767,51 +762,52 @@ comptime _StaticCosize[
 """The compile-time size of the memory region spanned by the layout."""
 
 
-comptime _RowMajor[*element_types: CoordLike] = TypeList[
-    _ReduceVariadicAndIdxToVariadic[
-        BaseVal=TypeList.of[Trait=CoordLike]().values,
-        ParamListType=_UnwrapSingleTuple[*element_types].reverse().values,
-        Reducer=_RowMajorMapper,
-    ]
-]()
-
-
 comptime _UnwrapSingleTuple[*element_types: CoordLike] = TypeList[
     element_types[0]._ParamListType if element_types.size == 1
     and element_types[0].is_tuple else element_types.values
 ]()
 
+comptime _RowMajor[*element_types: CoordLike] = TypeList[
+    _UnwrapSingleTuple[*element_types]
+    .reverse()
+    .reduce_idx[
+        TypeList.of[Trait=CoordLike]().values,
+        _RowMajorMapperIdx[_UnwrapSingleTuple[*element_types].reverse(), ...],
+    ]
+]()
 
-comptime _RowMajorMapper[
-    Prev: Variadic.TypesOfTrait[CoordLike],
-    From: Variadic.TypesOfTrait[CoordLike],
-    idx: SIMDSize,
-] = Variadic.concat_types[
-    TypeList.of[Trait=CoordLike, ComptimeInt[1]]().values if idx
+
+comptime _RowMajorMapperIdx[
+    ShapeList: TypeList[Trait=CoordLike, ...],
+    Prev: TypeList.of[Trait=CoordLike]._mlir_type,
+    element: CoordLike,
+    list_idx: Int,
+] = TypeList._concat[
+    TypeList.of[Trait=CoordLike, ComptimeInt[1]]().values if list_idx
     == 0 else (
         TypeList.of[
             Trait=CoordLike,
             RuntimeInt[
-                TypeList[From]()[idx - 1]
-                .DTYPE if not TypeList[From]()[idx - 1]
+                ShapeList[list_idx - 1]
+                .DTYPE if not ShapeList[list_idx - 1]
                 .is_static_value else TypeList[Prev]()[0]
                 .DTYPE
             ],
         ]()
-        .values if not TypeList[From]()[idx - 1]
+        .values if not ShapeList[list_idx - 1]
         .is_static_value
         or not TypeList[Prev]()[0]
         .is_static_value else TypeList.of[
             Trait=CoordLike,
             ComptimeInt[
-                TypeList[From]()[idx - 1].static_value
+                ShapeList[list_idx - 1].static_value
                 * TypeList[Prev]()[0].static_value
             ],
         ]()
         .values
     ),
     Prev,
-]
+]().values
 
 
 @always_inline
@@ -854,8 +850,8 @@ def row_major(var shape: Coord) -> RowMajorLayout[*shape.element_types]:
                     rebind[StrideType](Idx[stride_val]())
                 )
             else:
-                var stride_val = (
-                    shape[idx + 1].value() * strides[idx + 1].value()
+                var stride_val = Int(shape[idx + 1].value()) * Int(
+                    strides[idx + 1].value()
                 )
                 stride_ptr.init_pointee_copy(
                     rebind[StrideType](
@@ -915,8 +911,8 @@ def row_major[
                 )
             else:
                 # At least one is runtime, compute at runtime
-                var stride_val = (
-                    elements[idx + 1].value() * strides[idx + 1].value()
+                var stride_val = Int(elements[idx + 1].value()) * Int(
+                    strides[idx + 1].value()
                 )
                 stride_ptr.init_pointee_copy(
                     rebind[StrideType](
@@ -959,48 +955,45 @@ Parameters:
     shape_types: The types for the shape dimensions.
 """
 
-
 comptime _ColMajor[*element_types: CoordLike] = TypeList[
-    _ReduceVariadicAndIdxToVariadic[
-        BaseVal=TypeList.of[Trait=CoordLike]().values,
-        ParamListType=_UnwrapSingleTuple[
-            *element_types
-        ].values,  # Process in forward order
-        Reducer=_ColMajorMapper,
+    _UnwrapSingleTuple[*element_types].reduce_idx[
+        TypeList.of[Trait=CoordLike]().values,
+        _ColMajorMapperIdx[_UnwrapSingleTuple[*element_types], ...],
     ]
 ]()
 
 
-comptime _ColMajorMapper[
-    Prev: Variadic.TypesOfTrait[CoordLike],
-    From: Variadic.TypesOfTrait[CoordLike],
-    idx: SIMDSize,
-] = Variadic.concat_types[
+comptime _ColMajorMapperIdx[
+    ShapeList: TypeList[Trait=CoordLike, ...],
+    Prev: TypeList.of[Trait=CoordLike]._mlir_type,
+    element: CoordLike,
+    list_idx: Int,
+] = TypeList._concat[
     Prev,
-    TypeList.of[Trait=CoordLike, ComptimeInt[1]]().values if idx
+    TypeList.of[Trait=CoordLike, ComptimeInt[1]]().values if list_idx
     == 0 else (
         TypeList.of[
             Trait=CoordLike,
             RuntimeInt[
-                TypeList[From]()[idx - 1]
-                .DTYPE if not TypeList[From]()[idx - 1]
-                .is_static_value else TypeList[Prev]()[idx - 1]
+                ShapeList[list_idx - 1]
+                .DTYPE if not ShapeList[list_idx - 1]
+                .is_static_value else TypeList[Prev]()[list_idx - 1]
                 .DTYPE
             ],
         ]()
-        .values if not TypeList[From]()[idx - 1]
+        .values if not ShapeList[list_idx - 1]
         .is_static_value
-        or not TypeList[Prev]()[idx - 1]
+        or not TypeList[Prev]()[list_idx - 1]
         .is_static_value else TypeList.of[
             Trait=CoordLike,
             ComptimeInt[
-                TypeList[From]()[idx - 1].static_value
-                * TypeList[Prev]()[idx - 1].static_value
+                ShapeList[list_idx - 1].static_value
+                * TypeList[Prev]()[list_idx - 1].static_value
             ],
         ]()
         .values
     ),
-]
+]().values
 
 
 @always_inline
@@ -1068,7 +1061,9 @@ def col_major(var shape: Coord) -> ColMajorLayout[shape.element_types]:
                 )
             else:
                 # At least one is runtime, compute at runtime
-                var stride_val = shape[i - 1].value() * strides[i - 1].value()
+                var stride_val = Int(shape[i - 1].value()) * Int(
+                    strides[i - 1].value()
+                )
                 stride_ptr.init_pointee_copy(
                     rebind[StrideType](
                         RuntimeInt[StrideType.DTYPE](
@@ -1175,7 +1170,7 @@ def zipped_divide[
         ):
             outer_shape[i] = rebind[outer_shape.element_types[i]](
                 Scalar[outer_shape.element_types[i].DTYPE](
-                    shape[i].value() // tile[i].value()
+                    Int(shape[i].value()) // Int(tile[i].value())
                 )
             )
 
@@ -1185,7 +1180,7 @@ def zipped_divide[
         ):
             outer_stride[i] = rebind[outer_stride.element_types[i]](
                 Scalar[outer_stride.element_types[i].DTYPE](
-                    inner_stride[i].value() * tile[i].value()
+                    Int(inner_stride[i].value()) * Int(tile[i].value())
                 )
             )
     var out_layout = Layout(
@@ -1479,12 +1474,12 @@ def blocked_product[
                 )
             )
         else:
-            var block_cosize = block.shape_coord().product()
+            var block_cosize = Int(block.shape_coord().product())
             UnsafePointer(to=outer_stride[i]).init_pointee_copy(
                 rebind[OuterStrideTypes[i]](
                     RuntimeInt[OuterStrideTypes[i].DTYPE](
                         Scalar[OuterStrideTypes[i].DTYPE](
-                            tiler.stride_coord()[i].value() * block_cosize
+                            Int(tiler.stride_coord()[i].value()) * block_cosize
                         )
                     )
                 )
@@ -1744,7 +1739,7 @@ def upcast[
                     RuntimeInt(
                         Scalar[ResultStrideTypes[i].DTYPE](
                             _runtime_shape_div(
-                                layout.stride_coord()[i].value(), factor
+                                Int(layout.stride_coord()[i].value()), factor
                             )
                         )
                     )
@@ -1762,10 +1757,10 @@ def upcast[
                     RuntimeInt(
                         Scalar[ResultShapeTypes[i].DTYPE](
                             _runtime_shape_div(
-                                layout.shape_coord()[i].value(),
+                                Int(layout.shape_coord()[i].value()),
                                 _runtime_shape_div(
                                     factor,
-                                    layout.stride_coord()[i].value(),
+                                    Int(layout.stride_coord()[i].value()),
                                 ),
                             )
                         )
@@ -1782,53 +1777,56 @@ def upcast[
 
 
 comptime _DropLast2[
-    types: Variadic.TypesOfTrait[CoordLike],
+    types: TypeList.of[Trait=CoordLike]._mlir_type,
 ] = TypeList[
     types
 ]().slice[0, TypeList[types].size - 2]()
 """Remove the last two elements from a variadic."""
 
 
-comptime _CoalesceReducer[
-    flat_shape_types: TypeList[Trait=CoordLike, ...],
+comptime _CoalesceReducerIdx[
     flat_stride_types: TypeList[Trait=CoordLike, ...],
-    Prev: Variadic.TypesOfTrait[CoordLike],
-    From: Variadic.TypesOfTrait[CoordLike],
-    idx: SIMDSize,
-] = Prev if flat_shape_types[idx].static_value == 1 else (
+    Prev: TypeList.of[Trait=CoordLike]._mlir_type,
+    element: CoordLike,
+    list_idx: Int,
+] = Prev if element.static_value == 1 else (
     # prev_shape == 1: replace last pair with current (shape, stride)
-    Variadic.concat_types[
+    TypeList._concat[
         _DropLast2[Prev].values,
         TypeList.of[
             Trait=CoordLike,
-            ComptimeInt[flat_shape_types[idx].static_value],
-            ComptimeInt[flat_stride_types[idx].static_value],
+            ComptimeInt[element.static_value],
+            ComptimeInt[flat_stride_types[list_idx].static_value],
         ]().values,
-    ] if TypeList[Prev]()[TypeList[Prev].size - 2].static_value
+    ]()
+    .values if TypeList[Prev]()[TypeList[Prev].size - 2]
+    .static_value
     == 1 else (
         # Contiguous: merge into previous (prev_shape * cur_shape, prev_stride)
-        Variadic.concat_types[
+        TypeList._concat[
             _DropLast2[Prev].values,
             TypeList.of[
                 Trait=CoordLike,
                 ComptimeInt[
                     TypeList[Prev]()[TypeList[Prev].size - 2].static_value
-                    * flat_shape_types[idx].static_value
+                    * element.static_value
                 ],
                 TypeList[Prev]()[TypeList[Prev].size - 1],
             ]().values,
-        ] if TypeList[Prev]()[TypeList[Prev].size - 2].static_value
+        ]()
+        .values if TypeList[Prev]()[TypeList[Prev].size - 2]
+        .static_value
         * TypeList[Prev]()[TypeList[Prev].size - 1].static_value
-        == flat_stride_types[idx].static_value else
+        == flat_stride_types[list_idx].static_value else
         # Non-contiguous: append new (shape, stride) pair
-        Variadic.concat_types[
+        TypeList._concat[
             Prev,
             TypeList.of[
                 Trait=CoordLike,
-                ComptimeInt[flat_shape_types[idx].static_value],
-                ComptimeInt[flat_stride_types[idx].static_value],
+                ComptimeInt[element.static_value],
+                ComptimeInt[flat_stride_types[list_idx].static_value],
             ]().values,
-        ]
+        ]().values
     )
 )
 """Reducer for coalescing a flattened layout.
@@ -1838,11 +1836,10 @@ the current dimension is either skipped (shape == 1), merged into the
 previous pair (contiguous strides), or appended as a new pair.
 
 Parameters:
-    flat_shape_types: Flattened shape types of the input layout.
     flat_stride_types: Flattened stride types of the input layout.
     Prev: Accumulated interleaved (shape, stride) pairs so far.
-    From: The variadic being iterated (same as ``flat_shape_types``).
-    idx: Current dimension index.
+    element: The flattened shape type at ``list_idx``.
+    list_idx: Current dimension index.
 """
 
 
@@ -1850,13 +1847,9 @@ comptime _CoalescedInterleaved[
     shape_types: TypeList[Trait=CoordLike, ...],
     stride_types: TypeList[Trait=CoordLike, ...],
 ] = TypeList[
-    _ReduceVariadicAndIdxToVariadic[
-        BaseVal=TypeList.of[
-            Trait=CoordLike, ComptimeInt[1], ComptimeInt[0]
-        ]().values,
-        ParamListType=_Flattened[*shape_types].values,
-        Reducer=_CoalesceReducer[
-            _Flattened[*shape_types],
+    _Flattened[*shape_types].reduce_idx[
+        TypeList.of[Trait=CoordLike, ComptimeInt[1], ComptimeInt[0]]().values,
+        _CoalesceReducerIdx[
             _Flattened[*stride_types],
             ...,
         ],
