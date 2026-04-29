@@ -15,6 +15,13 @@ This version is still a work in progress.
   enabling significant speedups for image-to-image generation by skipping
   redundant transformer passes during the denoising loop.
 - Added the Mamba state space model architecture.
+- Fixed Wan 2.1 / 2.2 video diffusion pipelines silently running without
+  classifier-free guidance. The tokenizer gated negative-prompt tokenization
+  on `true_cfg_scale > 1.0` (default `1.0`), so negative tokens were never
+  produced and the executor fell back to unguided generation even when
+  `guidance_scale > 1.0` and a negative prompt were supplied. Wan now enables
+  classical CFG whenever `guidance_scale > 1.0` and defaults an absent
+  negative prompt to the empty string, matching the diffusers baseline.
 
 ## MAX framework {#26-3-max}
 
@@ -31,6 +38,9 @@ This version is still a work in progress.
 - Added `--model-override` CLI flag for per-component `ModelManifest` overrides
   (e.g. `--model-override transformer.quantization_encoding=float4_e2m1fnx2`),
   enabling mixed quantization in diffusion pipelines.
+- Removed jump forward decoding (`compute_ff_tokens`) from structured output.
+  The bitmask constraint alone ensures valid structured output, matching the
+  approach used by vLLM and SGLang.
 
 ### `max` CLI {#26-3-max-cli}
 
@@ -54,11 +64,13 @@ This version is still a work in progress.
   eager-mode execution of group normalization without graph compilation.
 - Fixed tensor slicing with negative integer indices (e.g. `hidden[:, -1]`)
   which previously raised a `RuntimeError` at compile time.
-- Setting `MODULAR_MAX_UNINITIALIZED_READ_CHECK=true` enables detection of
-  uninitialized memory reads in Mojo kernels. `InferenceSession` automatically
-  enables the debug allocator poison and compiles kernels with load-time
-  poison checks for all float types. When a load matches a poison pattern,
-  the process aborts with a descriptive message.
+- Setting `MODULAR_MAX_DEBUG_UNINITIALIZED_READ_CHECK=true` (or the
+  `max-debug.uninitialized-read-check` config key, or
+  `InferenceSession.debug.uninitialized_read_check = True`) enables detection
+  of uninitialized memory reads in Mojo kernels. `InferenceSession`
+  automatically enables the debug allocator poison and compiles kernels with
+  load-time poison checks for all float types. When a load matches a poison
+  pattern, the process aborts with a descriptive message.
 - Added support for the `bfloat16` data type on ARM CPU devices in MAX graphs.
   Previously, `session.load()` raised a `ValueError` when a graph contained
   bf16 tensors targeting an ARM CPU.
@@ -81,10 +93,35 @@ This version is still a work in progress.
   configured.
 - Introduced `CPUMetrics` alongside the existing GPU diagnostics and open source
   it under from `max.diagnostics`.
-- Added experimental `max.experimental.distributed` module with `DTensor`,
-  `DeviceMesh`, and placement types (`Replicated`, `Sharded`, `Partial`) for
-  expressing how tensors are distributed across multiple devices. Op dispatch
-  is not yet supported.
+- `max.experimental.Tensor` is now distribution-aware: it carries a
+  tuple of per-shard storages, `driver.Buffer`s (realized) or graph
+  values (`TensorValue` / `BufferValue`, unrealized), paired with a
+  `DeviceMapping` that maps those local shards onto the
+  `DeviceMesh`.
+- Reworked `max.experimental.functional` from a single `functional.py`
+  into a `functional/` package, a new distribution-and mesh-aware
+  dispatch layer on top of the graph-compiler Python API, split cleanly
+  into three op categories: `creation_ops` (tensor factories), `spmd_ops`
+  (rule-based per-op SPMD dispatch), and `collective_ops`
+  (`allreduce_sum`, `allgather`, `reduce_scatter` etc., now applied per
+  device-group along a chosen mesh axis so they dispatch correctly on
+  multi-dimensional meshes, plus a `transfer_to` convenience op
+  between `DeviceMapping`s).
+- Added `max.experimental.sharding` with the core types for distributed
+  tensors (`DeviceMesh`; `DeviceMapping` with `PlacementMapping` and
+  `NamedMapping`; placement primitives `Replicated` / `Sharded` /
+  `Partial`; `DistributedTensorType` / `DistributedBufferType`;
+  `TensorLayout`), plus a `sharding.rules` submodule of pure
+  mapping-propagation rules (elementwise, matmul, reduction, shape,
+  conv, pooling) that, for each op, either error out or reshard inputs
+  to the proposed `DeviceMapping`s and derive the resulting output
+  `DeviceMapping`.
+- `max.experimental.nn.Module.compile()` now accepts
+  `DistributedTensorType` symbolic inputs (not just `TensorType`), so
+  distributed models can be built via the graph-compilation path in
+  addition to running eagerly; `gemma3_modulev3` is the first multi-GPU
+  model wired up. DTensor support in MAX is still ongoing work and
+  these APIs may evolve.
 - Improved experimental eager interpreter performance by enabling multi-threaded
   CPU execution and removing unnecessary GPU device synchronization after each
   op dispatch.
@@ -180,6 +217,11 @@ This version is still a work in progress.
   experimental eager interpreter. These complement the existing
   `mo.mutable.load` handler and enable eager execution of in-place buffer
   writes (full-tensor stores and slice-indexed stores).
+- Rewrote the eager-interpreter `mo.mutable.store.slice` handler to write
+  slices via a device-side Mojo kernel instead of a host numpy round-trip.
+  GPU buffers no longer full-buffer D→H→D on every call, and `bfloat16`
+  and `float8_*` dtypes are now supported. `float4_e2m1fn` remains
+  unsupported.
 - Added defensive `mo.gather_sum` handler to the experimental eager
   interpreter. This fused composite op (gather axis 0 + sum axis 1) is
   used by DLRM-style multi-hot embeddings; the handler prevents crashes
@@ -192,13 +234,9 @@ This version is still a work in progress.
 - Added `distributed.scatter` op handler to the experimental eager
   interpreter, enabling multi-GPU eager execution of scatter collectives
   without falling back to compilation.
-- Added `distributed_scatter` collective to `distributed_functional` for
-  hardware-accelerated root-to-device tensor distribution.
 - Added `distributed.broadcast` op handler to the eager interpreter,
   enabling multi-GPU eager execution of broadcast collectives
   without falling back to compilation.
-- Added `distributed_broadcast` collective to `distributed_functional` for
-  hardware-accelerated root-to-all tensor replication.
 - Added `non_maximum_suppression` op handler to the experimental eager
   interpreter (CPU), enabling NMS to run through the interpreter without
   falling back to compilation.
@@ -208,8 +246,6 @@ This version is still a work in progress.
 - Added `distributed.reducescatter.sum` op handler to the eager interpreter,
   enabling multi-GPU eager execution of reduce-scatter collectives without
   falling back to compilation.
-- Added `distributed_reducescatter_sum` collective to `distributed_functional`
-  for hardware-accelerated reduce-and-scatter tensor distribution.
 - Added `max.nn.StackedLinear` for QKV-style stacked projections, with a
   fused (`stacked=True`) and an unfused (`stacked=False`) layout. Unfused
   mode opts into a new `Module._omit_module_attr_name` flag, which drops
@@ -286,6 +322,14 @@ This version is still a work in progress.
   AMD GPUs when the high and low 32-bit halves of the fill value differ (e.g.,
   `2.0`), reducing the call count to O(log N).
   ([Issue #6417](https://github.com/modular/modular/issues/6417))
+
+- Fixed integer indexing into a graph tensor (e.g. `x[0]` on a `(2, 3)`
+  tensor) failing graph compilation with
+  `'mo.static.reshape' op input and output elements do not match`. A
+  reshape-through-slice optimization pattern was incorrectly rewriting
+  the slice + squeeze pattern produced by integer indexing, generating a
+  reshape whose element count did not match the input.
+  ([Issue #6440](https://github.com/modular/modular/issues/6440))
 
 ## Mojo language {#26-3-mojo}
 
