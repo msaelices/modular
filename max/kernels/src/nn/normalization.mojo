@@ -723,7 +723,7 @@ def layer_norm_cpu[
         )  # use biased estimator
         var norm_factor = rsqrt(var_val + epsilon)
 
-        def _normalize[simd_width: Int](col: Int) unified {beta, mut}:
+        def _normalize[simd_width: Int](col: Int) {beta, mut}:
             var out_val = input_fn[simd_width](row, col)
             var gamma_val = gamma_fn[simd_width, 1](Index(col))
             var beta_col = beta.layout(Idx(col))
@@ -767,7 +767,7 @@ def layer_norm_cpu[
     comptime for i in range(rank - 1):
         prod_all_but_last_dim *= shape[i]
 
-    var num_workers = min(parallelism_level(), prod_all_but_last_dim)
+    var num_workers = min(parallelism_level(ctx), prod_all_but_last_dim)
     var chunk_size = ceildiv(prod_all_but_last_dim, num_workers)
 
     @__copy_capture(chunk_size, prod_all_but_last_dim, last_dim, epsilon)
@@ -836,7 +836,7 @@ def layer_norm[
     if gamma_shape[0] != shape[rank - 1]:
         raise Error("Gamma size does not match dimension of reduction.")
 
-    if beta.layout.shape[0]().value() != shape[rank - 1]:
+    if Int(beta.layout.shape[0]().value()) != shape[rank - 1]:
         raise Error("Beta size does not match dimension of reduction.")
 
     @always_inline
@@ -1390,9 +1390,7 @@ def rms_norm_cpu[
         var mean_val = _sum_to_mean(sum_val, num_cols)
         var norm_factor = rsqrt(mean_val + epsilon.cast[intermediate_type]())
 
-        def _normalize[
-            simd_width: Int
-        ](col: Int) unified {gamma, weight_offset, mut}:
+        def _normalize[simd_width: Int](col: Int) {gamma, weight_offset, mut}:
             var input_val = input_fn[simd_width](row, col).cast[
                 intermediate_type
             ]()
@@ -1439,7 +1437,7 @@ def rms_norm_cpu[
     var last_dim = shape[rank - 1]
     var prod_all_but_last_dim = shape.flattened_length() // last_dim
 
-    var num_workers = min(parallelism_level(), prod_all_but_last_dim)
+    var num_workers = min(parallelism_level(ctx), prod_all_but_last_dim)
     var chunk_size = ceildiv(prod_all_but_last_dim, num_workers)
 
     @__copy_capture(
@@ -1515,7 +1513,7 @@ def _rms_norm_impl[
     comptime assert gamma.flat_rank == 1, "gamma must have rank 1"
 
     # Note: we only support reduction along the last dimension
-    if gamma.layout.shape[0]().value() != shape[rank - 1]:
+    if Int(gamma.layout.shape[0]().value()) != shape[rank - 1]:
         raise Error(
             "Gamma size "
             + String(gamma.layout.shape[0]().value())
@@ -2360,15 +2358,15 @@ def _rms_norm_rope_gpu_warp_tiling[
     //,
     simd_width: Int,
     max_warps_per_block: Int,
-    input_fn: def[width: Int](row: Int, col: Int) capturing -> SIMD[
-        input_dtype, width
-    ],
-    cos_fn: def[width: Int](row: Int, col: Int) capturing -> SIMD[
-        cos_sin_dtype, width
-    ],
-    sin_fn: def[width: Int](row: Int, col: Int) capturing -> SIMD[
-        cos_sin_dtype, width
-    ],
+    input_fn: def[width: Int, alignment: Int](
+        row: Int, col: Int
+    ) capturing -> SIMD[input_dtype, width],
+    cos_fn: def[width: Int, alignment: Int](
+        row: Int, col: Int
+    ) capturing -> SIMD[cos_sin_dtype, width],
+    sin_fn: def[width: Int, alignment: Int](
+        row: Int, col: Int
+    ) capturing -> SIMD[cos_sin_dtype, width],
     output_fn: def[width: Int, alignment: Int](
         row: Int, col: Int, val: SIMD[input_dtype, width]
     ) capturing -> None,
@@ -2406,7 +2404,9 @@ def _rms_norm_rope_gpu_warp_tiling[
     with PDL():
         var gamma_val = SIMD[input_dtype, simd_width](0)
         if idx < num_cols:
-            vec_data = input_fn[simd_width](row, idx).cast[accum_type]()
+            vec_data = input_fn[simd_width, alignment=align](row, idx).cast[
+                accum_type
+            ]()
             gamma_val = gamma.load[width=simd_width, alignment=align](
                 Coord(Idx(idx))
             )
@@ -2446,8 +2446,12 @@ def _rms_norm_rope_gpu_warp_tiling[
         # The paired normed value is recomputed from the raw input in shared memory.
         if idx < num_cols:
             var half_cols = num_cols // 2
-            var cos_val = cos_fn[simd_width](row, idx).cast[accum_type]()
-            var sin_val = sin_fn[simd_width](row, idx).cast[accum_type]()
+            var cos_val = cos_fn[simd_width, alignment=align](row, idx).cast[
+                accum_type
+            ]()
+            var sin_val = sin_fn[simd_width, alignment=align](row, idx).cast[
+                accum_type
+            ]()
             var normed_col = norm_val.cast[accum_type]()
 
             # Since half_cols % simd_width == 0 (guaranteed by dispatch), all
@@ -2501,15 +2505,15 @@ def _rms_norm_rope_gpu_warp_tiling_128[
     //,
     simd_width: Int,
     warps_per_block: Int,
-    input_fn: def[width: Int](row: Int, col: Int) capturing -> SIMD[
-        input_dtype, width
-    ],
-    cos_fn: def[width: Int](row: Int, col: Int) capturing -> SIMD[
-        cos_sin_dtype, width
-    ],
-    sin_fn: def[width: Int](row: Int, col: Int) capturing -> SIMD[
-        cos_sin_dtype, width
-    ],
+    input_fn: def[width: Int, alignment: Int](
+        row: Int, col: Int
+    ) capturing -> SIMD[input_dtype, width],
+    cos_fn: def[width: Int, alignment: Int](
+        row: Int, col: Int
+    ) capturing -> SIMD[cos_sin_dtype, width],
+    sin_fn: def[width: Int, alignment: Int](
+        row: Int, col: Int
+    ) capturing -> SIMD[cos_sin_dtype, width],
     output_fn: def[width: Int, alignment: Int](
         row: Int, col: Int, val: SIMD[input_dtype, width]
     ) capturing -> None,
@@ -2588,7 +2592,9 @@ def _rms_norm_rope_gpu_warp_tiling_128[
         var gamma_val = SIMD[input_dtype, simd_width](0)
 
         if row < num_rows and idx < num_cols:
-            vec_data = input_fn[simd_width](row, idx).cast[accum_type]()
+            vec_data = input_fn[simd_width, alignment=align](row, idx).cast[
+                accum_type
+            ]()
             gamma_val = gamma.load[width=simd_width, alignment=align](
                 Coord(Idx(idx))
             )
@@ -2628,8 +2634,12 @@ def _rms_norm_rope_gpu_warp_tiling_128[
         # Apply RoPE using the paired element re-normalized from shared memory.
         if row < num_rows and idx < num_cols:
             var half_cols = num_cols // 2
-            var cos_val = cos_fn[simd_width](row, idx).cast[accum_type]()
-            var sin_val = sin_fn[simd_width](row, idx).cast[accum_type]()
+            var cos_val = cos_fn[simd_width, alignment=align](row, idx).cast[
+                accum_type
+            ]()
+            var sin_val = sin_fn[simd_width, alignment=align](row, idx).cast[
+                accum_type
+            ]()
             var normed_col = norm_val.cast[accum_type]()
 
             # paired_idx is in the same row's shmem slot (within [0, num_cols)).
@@ -2679,15 +2689,15 @@ def _rms_norm_rope_gpu_block[
     //,
     simd_width: Int,
     max_warps_per_block: Int,
-    input_fn: def[width: Int](row: Int, col: Int) capturing -> SIMD[
-        input_dtype, width
-    ],
-    cos_fn: def[width: Int](row: Int, col: Int) capturing -> SIMD[
-        cos_sin_dtype, width
-    ],
-    sin_fn: def[width: Int](row: Int, col: Int) capturing -> SIMD[
-        cos_sin_dtype, width
-    ],
+    input_fn: def[width: Int, alignment: Int](
+        row: Int, col: Int
+    ) capturing -> SIMD[input_dtype, width],
+    cos_fn: def[width: Int, alignment: Int](
+        row: Int, col: Int
+    ) capturing -> SIMD[cos_sin_dtype, width],
+    sin_fn: def[width: Int, alignment: Int](
+        row: Int, col: Int
+    ) capturing -> SIMD[cos_sin_dtype, width],
     output_fn: def[width: Int, alignment: Int](
         row: Int, col: Int, val: SIMD[input_dtype, width]
     ) capturing -> None,
@@ -2713,7 +2723,9 @@ def _rms_norm_rope_gpu_block[
         for x in range(ceildiv(num_cols // simd_width, block_dim.x)):
             var offset = x * block_dim.x * simd_width + tid * simd_width
             if offset < num_cols:
-                var v = input_fn[simd_width](row, offset).cast[accum_type]()
+                var v = input_fn[simd_width, alignment=align](row, offset).cast[
+                    accum_type
+                ]()
                 thread_m2 += (v**2).reduce_add()
 
         var row_m2 = block_reduce[max_warps_per_block=max_warps_per_block](
@@ -2731,7 +2743,9 @@ def _rms_norm_rope_gpu_block[
         for x in range(ceildiv(num_cols // simd_width, block_dim.x)):
             var offset = x * block_dim.x * simd_width + tid * simd_width
             if offset < num_cols:
-                var v = input_fn[simd_width](row, offset).cast[accum_type]()
+                var v = input_fn[simd_width, alignment=align](row, offset).cast[
+                    accum_type
+                ]()
                 var gamma_val = gamma.load[width=simd_width, alignment=align](
                     Coord(Idx(offset))
                 )
@@ -2758,9 +2772,9 @@ def _rms_norm_rope_gpu_block[
                     offset + half_cols if offset
                     < half_cols else offset - half_cols
                 )
-                var paired_v = input_fn[simd_width](row, paired_offset).cast[
-                    accum_type
-                ]()
+                var paired_v = input_fn[simd_width, alignment=align](
+                    row, paired_offset
+                ).cast[accum_type]()
                 var paired_gamma_val = gamma.load[
                     width=simd_width, alignment=align
                 ](Coord(Idx(paired_offset)))
@@ -2787,8 +2801,12 @@ def _rms_norm_rope_gpu_block[
                 else:
                     rotated = paired_norm_val
 
-                var cos_val = cos_fn[simd_width](row, offset).cast[accum_type]()
-                var sin_val = sin_fn[simd_width](row, offset).cast[accum_type]()
+                var cos_val = cos_fn[simd_width, alignment=align](
+                    row, offset
+                ).cast[accum_type]()
+                var sin_val = sin_fn[simd_width, alignment=align](
+                    row, offset
+                ).cast[accum_type]()
                 var result = (norm_val * cos_val + rotated * sin_val).cast[
                     input_dtype
                 ]()
@@ -2800,15 +2818,15 @@ def rms_norm_rope_gpu[
     cos_sin_dtype: DType,
     rank: Int,
     //,
-    input_fn: def[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
-        input_dtype, width
-    ],
-    cos_fn: def[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
-        cos_sin_dtype, width
-    ],
-    sin_fn: def[width: Int, rank: Int](IndexList[rank]) capturing -> SIMD[
-        cos_sin_dtype, width
-    ],
+    input_fn: def[width: Int, rank: Int, alignment: Int](
+        IndexList[rank]
+    ) capturing -> SIMD[input_dtype, width],
+    cos_fn: def[width: Int, rank: Int, alignment: Int](
+        IndexList[rank]
+    ) capturing -> SIMD[cos_sin_dtype, width],
+    sin_fn: def[width: Int, rank: Int, alignment: Int](
+        IndexList[rank]
+    ) capturing -> SIMD[cos_sin_dtype, width],
     output_fn: def[width: Int, alignment: Int](
         IndexList[rank], SIMD[input_dtype, width]
     ) capturing -> None,
@@ -2855,29 +2873,29 @@ def rms_norm_rope_gpu[
     @parameter
     @always_inline
     def input_fn_2d[
-        simd_width: Int
+        simd_width: Int, alignment: Int
     ](row: Int, col: Int) -> SIMD[input_dtype, simd_width]:
         var indices = _get_start_indices_of_nth_subvolume(row, shape)
         indices[rank - 1] = col
-        return input_fn[simd_width](indices.canonicalize())
+        return input_fn[simd_width, rank, alignment](indices.canonicalize())
 
     @parameter
     @always_inline
     def cos_fn_2d[
-        simd_width: Int
+        simd_width: Int, alignment: Int
     ](row: Int, col: Int) -> SIMD[cos_sin_dtype, simd_width]:
         var indices = _get_start_indices_of_nth_subvolume(row, shape)
         indices[rank - 1] = col
-        return cos_fn[simd_width](indices.canonicalize())
+        return cos_fn[simd_width, rank, alignment](indices.canonicalize())
 
     @parameter
     @always_inline
     def sin_fn_2d[
-        simd_width: Int
+        simd_width: Int, alignment: Int
     ](row: Int, col: Int) -> SIMD[cos_sin_dtype, simd_width]:
         var indices = _get_start_indices_of_nth_subvolume(row, shape)
         indices[rank - 1] = col
-        return sin_fn[simd_width](indices.canonicalize())
+        return sin_fn[simd_width, rank, alignment](indices.canonicalize())
 
     comptime simd_width = simd_width_of[input_dtype, target=get_gpu_target()]()
     comptime max_warps_per_block = ctx.default_device_info.max_thread_block_size // WARP_SIZE
@@ -3094,7 +3112,7 @@ def _rms_norm_fused_residual_add_impl[
     comptime assert gamma2.rank == 1, "gamma2 must have rank 1"
 
     # Note: we only support reduction along the last dimension
-    if gamma1.layout.shape[0]().value() != shape[rank - 1]:
+    if Int(gamma1.layout.shape[0]().value()) != shape[rank - 1]:
         raise Error(
             "Gamma1 size "
             + String(gamma1.layout.shape[0]().value())
@@ -3103,7 +3121,7 @@ def _rms_norm_fused_residual_add_impl[
             + "."
         )
 
-    if gamma2.layout.shape[0]().value() != shape[rank - 1]:
+    if Int(gamma2.layout.shape[0]().value()) != shape[rank - 1]:
         raise Error(
             "Gamma2 size "
             + String(gamma2.layout.shape[0]().value())
@@ -3672,11 +3690,44 @@ def group_norm_gpu[
             var h, w = divmod(hw, shape[3])
             indices = IndexList[rank](n, c, h, w)
 
+            # Guard against c_offset boundary straddling.  A view-fused
+            # NHWC→NCHW transpose generates a strided_load(stride=C) for
+            # the W-dimension.  That load is correct within a single c_offset
+            # region (consecutive-w with stride C maps to adjacent NHWC
+            # addresses), but it reads wrong elements when the simd_width
+            # window crosses a c_offset boundary at a multiple of
+            # inner_volume=H*W.  This happens when H*W % simd_width != 0 and
+            # the thread's starting column lands near a boundary.  Fall back
+            # to element-wise scalar loads in that case so each element's
+            # full (n, c, h, w) index is recomputed independently.
+            if (col + simd_width - 1) // inner_volume != c_offset:
+                var result = SIMD[dtype, simd_width]()
+                for i in range(simd_width):
+                    var cur_col = col + i
+                    var c_off, hw_i = divmod(cur_col, inner_volume)
+                    var h_i, w_i = divmod(hw_i, shape[3])
+                    result[i] = input_fn[1, rank](
+                        IndexList[rank](
+                            n, g * channels_per_group + c_off, h_i, w_i
+                        )
+                    )[0]
+                return result
+
         elif rank == 3:
             var inner_volume = shape[2]
             var c_offset, l = divmod(col, inner_volume)
             c += c_offset
             indices = IndexList[rank](n, c, l)
+
+            if (col + simd_width - 1) // inner_volume != c_offset:
+                var result = SIMD[dtype, simd_width]()
+                for i in range(simd_width):
+                    var cur_col = col + i
+                    var c_off, l_i = divmod(cur_col, inner_volume)
+                    result[i] = input_fn[1, rank](
+                        IndexList[rank](n, g * channels_per_group + c_off, l_i)
+                    )[0]
+                return result
 
         return input_fn[simd_width, rank](indices)
 

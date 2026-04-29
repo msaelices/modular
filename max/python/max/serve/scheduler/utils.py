@@ -16,8 +16,9 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from max.driver import Buffer
 from max.interfaces import (
     BatchType,
     MAXPullQueue,
@@ -88,6 +89,22 @@ class BatchMetrics:
     nixl_read_gib_per_s: float = 0.0
     nixl_write_gib_per_s: float = 0.0
 
+    # When True, ``batch_execution_time_s`` is the execution time of the
+    # previous batch (i.e. the overlap scheduler is active).
+    batch_execution_time_is_previous: bool = False
+
+    # Per-request KV cache hit rates for requests admitted in this batch
+    # (cached_prefix_length / prompt_length). Empty for non-CE batches and
+    # for CE batches that admit no new requests (e.g. follow-up prefill
+    # chunks of an already-admitted long prefill).
+    per_request_hit_rates: list[float] = field(default_factory=list)
+
+    # Number of requests newly admitted in this batch. Zero for TG batches
+    # and for CE batches that contain only chunked-prefill continuations of
+    # already-admitted requests. The cache-hit log clause and cumulative
+    # hit/miss counters are gated on this being non-zero.
+    num_new_admissions: int = 0
+
     @classmethod
     def create(
         cls,
@@ -100,6 +117,7 @@ class BatchMetrics:
         num_terminated_reqs: int,
         total_preemption_count: int,
         speculative_decoding_metrics: SpeculativeDecodingMetrics | None = None,
+        batch_execution_time_is_previous: bool = False,
     ) -> BatchMetrics:
         num_input_tokens = inputs.input_tokens
         batch_size = len(inputs.flat_batch)
@@ -110,9 +128,6 @@ class BatchMetrics:
 
         total_kv_blocks = 0
         used_kv_pct = 0.0
-        cache_hit_rate = 0.0
-        cache_hit_tokens = 0
-        cache_miss_tokens = num_input_tokens
         used_host_kv_pct = 0.0
         total_host_kv_blocks = 0
         h2d_blocks_copied = 0
@@ -138,16 +153,6 @@ class BatchMetrics:
             )
             assert total_kv_blocks > 0
             used_kv_pct = used_kv_blocks / total_kv_blocks
-            cache_hit_tokens = sum(
-                kv_cache.get_metrics(replica_idx).cache_tokens
-                for replica_idx in range(num_replicas)
-            )
-            all_tokens = cache_hit_tokens + cache_miss_tokens
-            # We have to handle case where denominator is 0 (empty batch)
-            if all_tokens > 0:
-                # This may differ from cache_metrics.cache_hit_rate due as this
-                # calculation takes chunked prefill into account.
-                cache_hit_rate = cache_hit_tokens / all_tokens
 
             total_host_kv_blocks = sum(
                 kv_cache.get_num_host_pages(replica_idx)
@@ -192,6 +197,37 @@ class BatchMetrics:
             nixl_write_gib_per_s = agg.nixl_write_gib_per_s
 
             kv_cache.reset_metrics()
+
+        # Capture per-request KV cache hit rates for newly admitted requests.
+        # The block manager set ``cached_prefix_length`` on each context's
+        # first admission; consume it here so chunked-prefill follow-ups do
+        # not re-emit observations for the same request. Admission only
+        # happens on CE batches, so skip the scan on TG entirely.
+        # The same admission data feeds the batch-level cache hit/miss
+        # numbers, so a continuation-only CE batch contributes nothing to
+        # them and the log line drops the cache-hit clause entirely.
+        per_request_hit_rates: list[float] = []
+        admission_hit_tokens = 0
+        admission_prompt_tokens = 0
+        if inputs.batch_type == BatchType.CE:
+            for ctx in inputs.flat_batch:
+                cached = ctx.cached_prefix_length
+                if cached is None:
+                    continue
+                ctx.cached_prefix_length = None
+                prompt_length = ctx.tokens.prompt_length
+                if prompt_length > 0:
+                    per_request_hit_rates.append(cached / prompt_length)
+                    admission_hit_tokens += cached
+                    admission_prompt_tokens += prompt_length
+
+        cache_hit_tokens = admission_hit_tokens
+        cache_miss_tokens = admission_prompt_tokens - admission_hit_tokens
+        cache_hit_rate = (
+            cache_hit_tokens / admission_prompt_tokens
+            if admission_prompt_tokens > 0
+            else 0.0
+        )
 
         draft_tokens_generated = 0
         draft_tokens_accepted = 0
@@ -253,6 +289,9 @@ class BatchMetrics:
             rpc_read_latency_avg_ms=rpc_read_latency_avg_ms,
             nixl_read_gib_per_s=nixl_read_gib_per_s,
             nixl_write_gib_per_s=nixl_write_gib_per_s,
+            batch_execution_time_is_previous=batch_execution_time_is_previous,
+            per_request_hit_rates=per_request_hit_rates,
+            num_new_admissions=len(per_request_hit_rates),
         )
 
     def pretty_format(self) -> str:
@@ -262,10 +301,19 @@ class BatchMetrics:
 
         kv_str = ""
         if self.total_kv_blocks != 0:
-            kv_str = (
-                f"KVCache usage: {self.used_kv_pct:.1%} of {self.total_kv_blocks} blocks, "
-                f"Cache hit rate: {self.cache_hit_rate:.1%} | "
-            )
+            usage_str = f"KVCache usage: {self.used_kv_pct:.1%} of {self.total_kv_blocks} blocks"
+            # Only show the cache-hit clause when this batch newly admitted
+            # at least one request. CE batches that are pure chunked-prefill
+            # continuations report 0 admissions and would otherwise display
+            # a misleading 0.0% hit rate over their continuation tokens.
+            if self.num_new_admissions > 0:
+                kv_str = (
+                    f"{usage_str}, "
+                    f"Cache hit rate: {self.cache_hit_rate:.1%} "
+                    f"({self.cache_hit_tokens} hit, {self.cache_miss_tokens} miss) | "
+                )
+            else:
+                kv_str = f"{usage_str} | "
 
         host_kv_str = ""
         if self.total_host_kv_blocks != 0:
@@ -314,6 +362,12 @@ class BatchMetrics:
                 f"pin {self.rpc_read_latency_avg_ms:.1f}ms | "
             )
 
+        exec_label = (
+            "Previous Execution"
+            if self.batch_execution_time_is_previous
+            else "Execution"
+        )
+
         return (
             f"Executed {self.batch_type.value} batch with {self.batch_size} reqs | "
             f"Terminated: {self.terminated_reqs} reqs, "
@@ -323,7 +377,7 @@ class BatchMetrics:
             f"Prompt Tput: {_to_human_readable_throughput(self.prompt_throughput)}, "
             f"Generation Tput: {_to_human_readable_throughput(self.generation_throughput)} | "
             f"Batch creation: {to_human_readable_latency(self.batch_creation_time_s)}, "
-            f"Execution: {to_human_readable_latency(self.batch_execution_time_s)} | "
+            f"{exec_label}: {to_human_readable_latency(self.batch_execution_time_s)} | "
             f"{kv_str}"
             f"{host_kv_str}"
             f"{dkv_str}"
@@ -342,9 +396,11 @@ class BatchMetrics:
             int(self.total_kv_blocks * self.used_kv_pct)
         )
         METRICS.cache_num_total_blocks(self.total_kv_blocks)
-        METRICS.cache_hit_rate(self.cache_hit_rate)
-        METRICS.cache_hits(self.cache_hit_tokens)
-        METRICS.cache_misses(self.cache_miss_tokens)
+        if self.batch_type == BatchType.CE and self.num_new_admissions > 0:
+            METRICS.cache_hits(self.cache_hit_tokens)
+            METRICS.cache_misses(self.cache_miss_tokens)
+            for hit_rate in self.per_request_hit_rates:
+                METRICS.cache_hit_rate(hit_rate)
 
         if self.nixl_read_latency_avg_ms > 0:
             METRICS.dkv_nixl_read_latency(self.nixl_read_latency_avg_ms)
@@ -399,6 +455,7 @@ class SchedulerLogger:
         num_terminated_reqs: int,
         total_preemption_count: int,
         speculative_decoding_metrics: SpeculativeDecodingMetrics | None = None,
+        batch_execution_time_is_previous: bool = False,
     ) -> None:
         """Periodically logs batch-level metrics to console.
 
@@ -411,6 +468,10 @@ class SchedulerLogger:
             num_pending_reqs: The number of pending requests.
             total_preemption_count: The total number of preemptions.
             speculative_decoding_metrics: The speculative decoding metrics, if any.
+            batch_execution_time_is_previous: When True, ``batch_execution_time_s``
+                is the execution time of the previous batch (the overlap
+                scheduler is active); the log line will read
+                ``Previous Execution:`` instead of ``Execution:``.
 
         Returns:
             None
@@ -426,6 +487,7 @@ class SchedulerLogger:
             num_terminated_reqs=num_terminated_reqs,
             total_preemption_count=total_preemption_count,
             speculative_decoding_metrics=speculative_decoding_metrics,
+            batch_execution_time_is_previous=batch_execution_time_is_previous,
         )
 
         # Always publish metrics.
@@ -456,3 +518,22 @@ def get_cancelled_reqs(
         for req_id in req_ids:
             cancelled_reqs.append(req_id)
     return cancelled_reqs
+
+
+def reshape_flat_kv_blocks_to_grid(
+    flat_blocks: list[Buffer], dp: int, group_name: str
+) -> list[list[Buffer]]:
+    """Reshape a flat per-device buffer list into ``[dp][tp]`` row-major.
+
+    Matches the primary tensor grid that ``KVTransferEngine`` expects
+    when registering an extra tensor group. ``flat_blocks`` is
+    ``[r0t0, r0t1, ..., r0t(tp-1), r1t0, ...]`` as produced by
+    ``PagedKVCacheManager.runtime_inputs``.
+    """
+    tp = len(flat_blocks) // dp
+    if dp * tp != len(flat_blocks):
+        raise ValueError(
+            f"{group_name} KV tensor group has {len(flat_blocks)} "
+            f"buffers, not divisible by DP={dp}."
+        )
+    return [list(flat_blocks[r * tp : (r + 1) * tp]) for r in range(dp)]
