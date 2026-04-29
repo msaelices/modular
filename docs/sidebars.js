@@ -74,22 +74,12 @@ const maxSidebars = {
           label: 'Overview',
         },
         {
-          label: "Fundamentals",
-          type: "category",
-          collapsed: true,
-          items: [
-            "max/develop/tensors",
-            "max/develop/dtypes",
-            "max/develop/basic-ops",
-          ],
-        },
-        {
           label: "Graphs",
           type: "category",
           collapsed: true,
           items: [
+            "max/develop/graph",
             "max/develop/modules",
-            "max/develop/eager-execution",
           ],
         },
         {
@@ -135,6 +125,20 @@ const maxSidebars = {
             },
           ],
         },
+        {
+          label: "Eager fundamentals",
+          type: "category",
+          collapsed: true,
+          items: [
+            "max/develop/eager-execution",
+            "max/develop/tensors",
+            "max/develop/dtypes",
+            "max/develop/basic-ops",
+            "max/develop/broadcasting",
+            "max/develop/indexing",
+          ],
+        },
+        "max/develop/debugging",
         "max/gpu-system-profiling",
       ],
     },
@@ -447,6 +451,7 @@ const maxSidebars = {
             "max/api/python/pipelines.architectures.qwen3vl_moe",
             "max/api/python/pipelines.architectures.qwen_image",
             "max/api/python/pipelines.architectures.qwen_image_edit",
+            "max/api/python/pipelines.architectures.step3p5",
             "max/api/python/pipelines.architectures.unified_eagle_llama3",
             "max/api/python/pipelines.architectures.unified_mtp_deepseekV3",
             "max/api/python/pipelines.architectures.wan",
