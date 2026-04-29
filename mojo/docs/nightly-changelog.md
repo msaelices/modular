@@ -1,4 +1,6 @@
-# Nightly: v0.26.3
+---
+title: Mojo nightly
+---
 
 This version is still a work in progress.
 
@@ -6,7 +8,39 @@ This version is still a work in progress.
 
 ## Documentation
 
+- Compilation targets docs instructs how to inspect your current platform,
+  select a target configuration, and generate code for that target. Use it to
+  build for your own system or target other CPUs, operating systems, and
+  accelerators.
+
+- Mojo language reference covers lexical elements, expressions, statements,
+  numeric types, struct declarations, trait declarations.
+
+- Functions reference page improves discoverability of new function features.
+
+- Split operators manual into separate pages; refreshed coverage and added
+  tutorial, operator tests, and new reference page.
+
+- Negative examples and errors added to reference pages highlight sharp
+  edges of the language.
+
+- MLIR reference page introduces inline MLIR to developers in Mojo code.
+
+- Adds docs for non-nullable pointers and provides sample code showing
+  how to use `Optional` with `UnsafePointer`.
+
 ## Language enhancements
+
+- Improved diagnostics for onboarding-priority parser errors in Mojo
+  for clarity and UX.
+
+- Migrated monorepo from `fn` to using `def` for function declaration.
+  Warned on use of `fn` and will deprecate `fn` in the next release.
+
+- Updated signature error diagnostics and added related tests.
+
+- Mojo now uses `NoneType` instead of an empty tuple to mark constructor
+  using literals.
 
 - The ternary `if/else` expression now coerces each element to its contextual
   type when it is obvious. For example, this works instead of producing an
@@ -76,6 +110,13 @@ This version is still a work in progress.
   def foo(*args: *SomeTypeList[Copyable]) -> Int: ...
   ```
 
+- T-strings can now be used in `comptime assert` messages:
+
+  ```mojo
+    def foo[i: Int]():
+        comptime assert i > 5, t"expected i > 5, got {i}"
+  ```
+
 ## Language changes
 
 - Variadic parameters lists are now passed instead of `ParameterList` and
@@ -113,6 +154,10 @@ This version is still a work in progress.
 
 ## Library changes
 
+- The `Variadic` suite of low-level operation has been refactored and migrated
+  to being members of the `TypeList` and `ParameterList` types, making them more
+  ergonomic to work with and more accessible.
+
 - `Set.difference_update()` now uses `discard()` instead of a try/except
   `remove()` pattern, avoiding exception overhead for missing elements.
 
@@ -135,6 +180,35 @@ This version is still a work in progress.
   ```
 
 - `assert_raises` now catches custom `Writable` error types, not just `Error`.
+
+- Added UAX #29 grapheme cluster segmentation to `String` and `StringSlice`.
+  New APIs: `graphemes()` returns a `GraphemeSliceIter` that yields each
+  user-perceived "character" as a `StringSlice`, and `count_graphemes()` returns
+  the grapheme cluster count. This correctly handles combining marks, emoji ZWJ
+  sequences, flag emoji, Hangul syllables, and other multi-codepoint clusters.
+
+- `StringSlice` now supports slicing by grapheme cluster via the `grapheme=`
+  keyword argument, mirroring the existing `byte=` indexer. For example,
+  `s[grapheme=0:3]` returns a `StringSlice` covering the first three grapheme
+  clusters, and `s[grapheme=i:i+1]` extracts the *i*-th grapheme. Out-of-range
+  ends are clamped to the end of the string; negative indices are not supported.
+  Because grapheme boundaries are discovered by a forward scan, this operation
+  is O(n) in the byte length — prefer `byte=` slicing when you already have
+  byte offsets.
+
+- `GraphemeSliceIter` now supports reverse iteration. `next_back()` and
+  `peek_back()` return the last grapheme cluster in the remaining range, and
+  `StringSlice.graphemes_reversed()` / `String.graphemes_reversed()` return a
+  `GraphemeSliceIter` whose `for`-loop iteration walks clusters from end to
+  start. `next()` and `next_back()` can be interleaved on the same iterator.
+  Reverse iteration costs more per cluster than forward iteration because the
+  UAX #29 state machine is inherently forward-scanning: `next_back()` backs
+  up to a guaranteed grapheme boundary (the start of the string or a
+  Control/CR/LF codepoint) and rescans forward. The safe boundary is cached
+  across reverse calls — a forward `next()` invalidates it — so per-call cost
+  is dominated by forward-scan length: small in text containing line breaks
+  or whitespace, growing with the distance back to such a codepoint in long
+  runs without them.
 
 - Variadics of types have been moved to the `TypeList` struct.
   One can write operations such as:
@@ -170,8 +244,10 @@ This version is still a work in progress.
   against the debug allocator's poison patterns (0xFF host fill and canonical
   qNaN device fill). A match triggers `abort()` with a descriptive message.
   When disabled (the default), zero runtime overhead. For MAX pipelines, set
-  `MODULAR_MAX_UNINITIALIZED_READ_CHECK=true` to enable both the debug
-  allocator and the load-time checks automatically.
+  `MODULAR_MAX_DEBUG_UNINITIALIZED_READ_CHECK=true` (or the
+  `max-debug.uninitialized-read-check` config key, or
+  `InferenceSession.debug.uninitialized_read_check = True`) to enable both the
+  debug allocator and the load-time checks automatically.
 
 - Added `CompilationTarget.is_apple_m5()` to `std.sys` for detecting Apple M5
   targets at compile time. `is_apple_silicon()` now includes M5 in its check.
@@ -193,6 +269,41 @@ This version is still a work in progress.
 - `OwnedDLHandle.get_symbol()` now returns `Optional[UnsafePointer[...]]`
   instead of aborting when a symbol is not found. This allows callers to handle
   missing symbols gracefully.
+
+- `UnsafePointer` is now non-null by design. See the
+  [non-null pointer proposal](https://github.com/modular/modular/blob/main/mojo/proposals/non-null-pointer.md)
+  for the full design and migration timeline.
+
+  The default null constructor `__init__(out self)` and `__bool__(self)` method
+  are now deprecated, and `UnsafePointer` no longer conforms to `Defaultable` or
+  `Boolable`.
+
+  To migrate, express nullability explicitly with
+  `Optional[UnsafePointer[...]]`, which has the same layout as `UnsafePointer`
+  (the null address is the `None` niche) so nullable pointers remain
+  zero-overhead and can be used across C-FFIs.
+
+  ```mojo
+  # Before: null default construction
+  var ptr = UnsafePointer[Int, origin]()
+
+  # After: express absence with Optional
+  var ptr: Optional[UnsafePointer[Int, origin]] = None
+
+  # Before: Bool-based null check
+  if ptr:
+      use(ptr[])
+
+  # After: check the Optional, then unwrap
+  if ptr:
+      use(ptr.value()[])
+  ```
+
+  If you specifically need a non-null placeholder for a field that will be
+  populated later (for example, a buffer that is allocated on demand) use
+  `UnsafePointer.unsafe_dangling()`, which returns a well-aligned but dangling
+  pointer. Note that `unsafe_dangling()` is not a null sentinel: types that
+  lazily allocate must track initialization separately.
 
 - GPU primitive id accessors (e.g. `thread_idx`) have migrated from `UInt` to
   `Int`.
@@ -371,6 +482,10 @@ This version is still a work in progress.
   print(mapped) # Optional("43")
   ```
 
+- Added `std.memory.forget_deinit()` to enable low-level code to skip the usual
+  requirement to run a destructor for a value. This function should be used
+  rarely, when building low-level abstractions.
+
 - `parallelize`, `parallelize_over_rows` (in
   `std.algorithm.backend.cpu.parallelize`) and the `elementwise` overloads in
   `std.algorithm.functional` now accept an optional trailing
@@ -424,6 +539,15 @@ This version is still a work in progress.
 
 ## 🛠️ Fixed
 
+- Fixed `math.sqrt` on `Float64` on NVIDIA GPU producing a cryptic
+  `could not find LLVM intrinsic: "llvm.nvvm.sqrt.approx.d"` failure at LLVM
+  IR translation time. `math.sqrt` now rejects `Float64` on NVIDIA GPU at
+  compile time with the message `DType.float64 isn't supported for approx
+  sqrt on NVIDIA GPU`. The existing `math.sin` and `math.cos` constraint
+  messages were also sharpened to name the op (`DType.float64 isn't supported
+  for sin/cos on NVIDIA GPU`).
+  ([Issue #6434](https://github.com/modular/modular/issues/6434))
+
 - Fixed pack inference failing with `could not infer type of parameter pack ...
   given value with unresolved type` when passing list, dict, set, or slice
   literals to a `*Ts`-bound variadic pack parameter (e.g.
@@ -438,6 +562,17 @@ This version is still a work in progress.
   config search now treats permission errors as "not found" and falls through
   to the next candidate.
   ([Issue #6412](https://github.com/modular/modular/issues/6412))
+
+- `mojo run` and `mojo debug` now honor `-Xlinker` flags by loading the
+  referenced shared libraries into the in-process JIT. Previously the flags
+  were dropped (with a `-Xlinker argument unused` warning), leaving programs
+  that called into external shared libraries via `external_call` unable to
+  resolve those symbols at runtime (so `mojo build` worked but `mojo run` did
+  not). The supported forms mirror what the system linker accepts: `-Xlinker
+  -L<dir>`, `-Xlinker -l<name>`, `-Xlinker -rpath <dir>`, and `-Xlinker
+  <absolute-path-to-shared-library>`. Flags that have no meaning under JIT
+  are reported as a warning and ignored.
+  ([Issue #6155](https://github.com/modular/modular/issues/6155))
 
 - Fixed `libpython` auto-discovery failing for Python 3.14 free-threaded builds.
   The discovery script constructed the library filename without the ABI flags
@@ -473,3 +608,16 @@ This version is still a work in progress.
 - Fixed `Process.run()` not inheriting the parent's environment variables.
   Child processes spawned via `Process.run()` now correctly receive the
   parent's environment.
+
+- Fixed `\xhh` and `\ooo` escape sequences in string literals being
+  interpreted as raw bytes instead of Unicode code points, which produced
+  malformed UTF-8 for values `>= 0x80`. The escapes now match Python `str`
+  semantics (and the existing `\u`/`\U` handling): `"\x85"` encodes U+0085
+  (NEL) as two UTF-8 bytes and `ord("\x85")` returns `133` instead of `5`.
+  Code that relied on `\xhh` to emit a single raw byte for non-ASCII values
+  must construct the bytes explicitly (for example via a `List[Byte]`
+  literal).
+  ([Issue #2842](https://github.com/modular/modular/issues/2842))
+
+- Fixed incorrect data layout for `MI250X` AMDGPU architectures.
+  ([Issue #6451](https://github.com/modular/modular/issues/6451)
