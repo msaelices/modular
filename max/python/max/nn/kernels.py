@@ -5233,6 +5233,83 @@ def mxfp4_dequant(
     return result
 
 
+def nvfp4_dequant(
+    packed_weights: TensorValue,
+    scales: TensorValue,
+    out_type: DType = DType.bfloat16,
+) -> TensorValue:
+    """Dequantizes NVFP4 packed weights to BF16 or FP8 on GPU.
+
+    Software-LUT kernel that runs on any GPU — the fallback path on
+    architectures without native FP4 matmul support (pre-Blackwell NVIDIA).
+    The modelopt per-tensor ``weight_scale_2`` must be pre-multiplied into
+    ``scales`` by the caller (yielding float32 scales); raw float8_e4m3fn
+    block scales are also accepted when no per-tensor scale exists.
+
+    Supports rank 2 ``[N, K//2]`` and rank 3 ``[E, N, K//2]`` inputs.
+    For rank 3, leading dims are flattened to 2D, dequantized, and reshaped back.
+
+    Args:
+        packed_weights: Packed weights in uint8 (2 FP4 values per byte).
+            Shape ``[N, K//2]`` or ``[E, N, K//2]``.
+        scales: Block scales in float32 (pre-multiplied) or float8_e4m3fn.
+            Shape ``[N, K//16]`` or ``[E, N, K//16]`` (non-interleaved).
+        out_type: Output dtype (bfloat16 or float8_e4m3fn).
+
+    Returns:
+        Dequantized tensor ``[N, K]`` or ``[E, N, K]`` in out_type.
+    """
+    if packed_weights.rank not in (2, 3):
+        raise ValueError(
+            f"packed_weights must be rank 2 or 3, got {packed_weights.rank}"
+        )
+    if scales.rank != packed_weights.rank:
+        raise ValueError(
+            f"scales rank ({scales.rank}) must match packed_weights rank"
+            f" ({packed_weights.rank})"
+        )
+    if packed_weights.dtype != DType.uint8:
+        raise ValueError(
+            f"packed_weights must be uint8, got {packed_weights.dtype}"
+        )
+    if scales.dtype not in (DType.float32, DType.float8_e4m3fn):
+        raise ValueError(
+            "scales must be float32 (pre-multiplied) or float8_e4m3fn, got"
+            f" {scales.dtype}"
+        )
+
+    # Flatten leading dims if rank 3
+    is_batched_weights = packed_weights.rank == 3
+    if is_batched_weights:
+        e = packed_weights.shape[0]
+        n = packed_weights.shape[1]
+        k_packed = packed_weights.shape[2]
+        packed_weights = ops.reshape(packed_weights, [e * n, k_packed])
+        scales = ops.reshape(scales, [e * n, scales.shape[2]])
+
+    rows = packed_weights.shape[0]
+    k = packed_weights.shape[1] * 2  # Unpacked column count
+
+    result = ops.custom(
+        "mo.dequant.nvfp4",
+        device=packed_weights.device,
+        values=[packed_weights, scales],
+        out_types=[
+            TensorType(
+                dtype=out_type,
+                shape=[rows, k],
+                device=packed_weights.device,
+            )
+        ],
+    )[0].tensor
+
+    # Reshape back if originally rank 3
+    if is_batched_weights:
+        result = ops.reshape(result, [e, n, k])
+
+    return result
+
+
 def _is_sm10x_gpu() -> bool:
     """Checks if the current accelerator is NVIDIA SM100+ (Blackwell)."""
     try:
