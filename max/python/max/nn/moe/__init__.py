@@ -22,6 +22,7 @@ from .moe_fp8 import MoEQuantized
 from .quant_strategy import (
     Fp8Strategy,
     Mxfp4Strategy,
+    Nvfp4DequantStrategy,
     Nvfp4Scales,
     Nvfp4Strategy,
     QuantStrategy,
@@ -38,6 +39,7 @@ __all__ = [
     "MoE",
     "MoEGate",
     "MoEQuantized",
+    "Nvfp4DequantStrategy",
     "Nvfp4Scales",
     "Nvfp4Strategy",
     "QuantStrategy",
