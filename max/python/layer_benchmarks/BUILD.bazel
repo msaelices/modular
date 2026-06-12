@@ -59,6 +59,19 @@ modular_py_library(
 )
 
 modular_py_binary(
+    name = "bench_fp4_linear_chain",
+    srcs = ["bench_fp4_linear_chain.py"],
+    main = "bench_fp4_linear_chain.py",
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        "//max/python/max/nn",
+        requirement("numpy"),
+    ],
+)
+
+modular_py_binary(
     name = "dump_ir",
     srcs = ["testbed/dump_ir_cli.py"],
     imports = ["."],

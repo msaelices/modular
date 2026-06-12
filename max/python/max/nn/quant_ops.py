@@ -29,6 +29,9 @@ from .kernels import (
     matmul_static_scaled_float8,
     mxfp4_dequant,
     nvfp4_dequant,
+    nvfp4_gemv,
+    store_k_cache_ragged,
+    store_v_cache_ragged,
     quantize_dynamic_block_scaled,
     quantize_dynamic_block_scaled_mxfp4,
     quantize_dynamic_scaled_float8,
@@ -75,6 +78,7 @@ def _dequant_weight_nvfp4(
     weight_scale: TensorValue,
     weight_scale_2: TensorValue,
     scales_pre_interleaved: bool,
+    anti_hoist_dep: TensorValue | None = None,
 ) -> TensorValue:
     """Dequantizes an NVFP4 weight to BF16 (pre-Blackwell fallback).
 
@@ -92,6 +96,21 @@ def _dequant_weight_nvfp4(
     scales_f32 = weight_scale.to(weight.device).cast(
         DType.float32
     ) * weight_scale_2.to(weight.device)
+    if anti_hoist_dep is not None:
+        # LOCAL EXPERIMENT: make the scales depend (numerically +0.0) on a
+        # runtime tensor so the compiler cannot hoist the dequantized BF16
+        # weight into a persistent constant; the dequant then runs per
+        # forward with a transient buffer (fits 12B on 24 GB).
+        # Structural (not algebraic) dependency: append a junk runtime row
+        # to the scales and statically slice it back off. Fast-math can fold
+        # `x * 0.0`, but concat+slice cancellation is not a folding pattern,
+        # so the dequant keeps a runtime input either way.
+        dep = ops.sum(anti_hoist_dep.cast(DType.float32).reshape((1, -1)))
+        n = scales_f32.shape[0]
+        pad_row = ops.broadcast_to(
+            dep.reshape((1, 1)), (1, scales_f32.shape[1])
+        )
+        scales_f32 = ops.concat([scales_f32, pad_row], axis=0)[:n, :]
     return nvfp4_dequant(weight, scales_f32, out_type=DType.bfloat16)
 
 
@@ -124,10 +143,18 @@ def _matmul_float4(
         The output tensor in bf16.
     """
     if not _is_sm10x_gpu():
-        dequanted = _dequant_weight_nvfp4(
-            weight, weight_scale, weight_scale_2, scales_pre_interleaved
-        )
-        return x @ dequanted.T
+        # Fused dequant-GEMV: FP4 decoded in registers, no BF16 weight is
+        # ever materialized (no anti-hoist dependency needed — the op
+        # consumes x, so it can never be constant-folded).
+        if scales_pre_interleaved:
+            raise ValueError(
+                "NVFP4 checkpoints with pre-interleaved (TCGEN 5D) scales"
+                " are not supported on pre-Blackwell GPUs"
+            )
+        scales_f32 = weight_scale.to(weight.device).cast(
+            DType.float32
+        ) * weight_scale_2.to(weight.device)
+        return nvfp4_gemv(x.cast(DType.bfloat16), weight, scales_f32)
 
     x, x_scales = quantize_dynamic_block_scaled(
         x,
@@ -513,26 +540,52 @@ def quantized_fused_qkv_matmul(
             assert weight_scale_2 is not None
 
             if not _is_sm10x_gpu():
-                # Pre-Blackwell fallback: no FP4 tensor cores, so dequantize
-                # the (constant) QKV weight to bf16 and use the unquantized
-                # fused QKV ragged matmul.
-                wqkv_bf16 = _dequant_weight_nvfp4(
-                    wqkv,
-                    weight_scale,
-                    weight_scale_2,
-                    quant_config.scales_pre_interleaved,
+                # Pre-Blackwell fallback: fused dequant-GEMV for the QKV
+                # projection (FP4 decoded in registers, no BF16 weight is
+                # materialized), then split and store K/V into the paged
+                # cache explicitly — fused_qkv_ragged_matmul owns that write
+                # on the unquantized path.
+                if quant_config.scales_pre_interleaved:
+                    raise ValueError(
+                        "NVFP4 checkpoints with pre-interleaved (TCGEN 5D)"
+                        " scales are not supported on pre-Blackwell GPUs"
+                    )
+                scales_f32 = weight_scale.to(wqkv.device).cast(
+                    DType.float32
+                ) * weight_scale_2.to(wqkv.device)
+                qkv = nvfp4_gemv(x.cast(DType.bfloat16), wqkv, scales_f32)
+                if bias is not None:
+                    qkv = qkv + bias.cast(qkv.dtype)
+
+                head_dim = kv_params.head_dim
+                kv_dim = kv_params.n_kv_heads_per_device * head_dim
+                total_dim = int(wqkv.shape[0])
+                q_dim = (
+                    _output_dim
+                    if _output_dim is not None
+                    else n_heads * head_dim
                 )
-                return fused_qkv_ragged_matmul(
-                    kv_params,
-                    input=x,
-                    input_row_offsets=input_row_offsets,
-                    wqkv=wqkv_bf16,
-                    kv_collection=kv_collection,
-                    layer_idx=layer_idx,
-                    n_heads=n_heads,
-                    bias=bias,
-                    _output_dim=_output_dim,
+                q_out = qkv[:, :q_dim]
+                k_out = ops.reshape(
+                    qkv[:, q_dim : q_dim + kv_dim],
+                    [-1, kv_params.n_kv_heads_per_device, head_dim],
                 )
+                if total_dim - q_dim - kv_dim >= kv_dim:
+                    v_out = ops.reshape(
+                        qkv[:, q_dim + kv_dim : q_dim + 2 * kv_dim],
+                        [-1, kv_params.n_kv_heads_per_device, head_dim],
+                    )
+                else:
+                    # K-equals-V layers (e.g. Gemma 4 full-attention) pack
+                    # only Q and K rows in wqkv.
+                    v_out = k_out
+                store_k_cache_ragged(
+                    kv_collection, k_out, input_row_offsets, layer_idx
+                )
+                store_v_cache_ragged(
+                    kv_collection, v_out, input_row_offsets, layer_idx
+                )
+                return q_out
 
             x, x_scales = quantize_dynamic_block_scaled(
                 x,
