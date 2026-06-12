@@ -55,7 +55,9 @@ class Gemma4MemoryPlanner(PagedMemoryPlanner):
         # based on available blocks, so it targets larger concurrent batches
         # whose activation tensors need proportionally more headroom.
         # TODO(MODELS-1544): investigate high activation memory estimates
-        base = 3 * 1024**3  # LOCAL E2E ONLY
+        base = (
+            30 // pipeline_config.model.kv_cache.cache_dtype.size_in_bytes
+        ) * 1024**3
         if pipeline_config.runtime.device_graph_capture:
             base += _GRAPH_CAPTURE_HEADROOM_BYTES
         return base
