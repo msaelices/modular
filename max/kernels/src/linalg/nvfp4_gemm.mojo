@@ -433,6 +433,15 @@ def _nvfp4_gemm_kernel[
         a_smem_iter._incr()
         b_smem_iter._incr()
         async_copy_wait_group(Int32(num_pipeline_stages - 2))
+        # When staging packed weights, `_decode_b_stage` reads the W slot that
+        # was cp.async'd into SMEM THIS iteration. `async_copy_wait_group` only
+        # guarantees the copies are visible to the issuing thread; a decode
+        # thread reads bytes copied by OTHER threads, so a block-wide barrier is
+        # required between the wait and the read (the prologue already has one).
+        # Without it the decode races the staging stores -> nondeterministic
+        # results on GPUs that expose the timing (e.g. sm_86).
+        comptime if stage_w:
+            barrier()
         var next_k = k_iter + 1
         if next_k < num_k_iters:
             _decode_b_stage(k_tile_start + next_k, next_k % num_pipeline_stages)
