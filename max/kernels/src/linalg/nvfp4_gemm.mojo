@@ -538,7 +538,9 @@ def _nvfp4_gemm_finalize_kernel[
 # Host launcher
 # ===----------------------------------------------------------------------=== #
 @always_inline
-def nvfp4_gemm(
+def nvfp4_gemm[
+    tune_ns: Int = 0, tune_sk: Int = 0
+](
     ctx: DeviceContext,
     c: TileTensor,
     a: TileTensor,
@@ -683,7 +685,12 @@ def nvfp4_gemm(
     # The occupancy-bound M<=64 tile keeps the arithmetic decode (MD=False);
     # the larger M>64 tile (BM=128/BK=32) has the register headroom to profit
     # from the cheaper Marlin decode (MD=True). See `_decode_b_stage`.
+    # Autotune overrides (tune_ns/tune_sk > 0): sweep pipeline-stages / split-k.
+    comptime ns0 = tune_ns if tune_ns > 0 else 2
+    comptime sk0 = tune_sk if tune_sk > 0 else 4
+    comptime ns1 = tune_ns if tune_ns > 0 else 3
+    comptime sk1 = tune_sk if tune_sk > 0 else 2
     if m <= 64:
-        _launch[64, 64, 2, 4, SW=True, BK=64, MD=False]()
+        _launch[64, 64, ns0, sk0, SW=True, BK=64, MD=False]()
     else:
-        _launch[128, 64, 3, 2, SW=True, BK=32, MD=True]()
+        _launch[128, 64, ns1, sk1, SW=True, BK=32, MD=True]()
