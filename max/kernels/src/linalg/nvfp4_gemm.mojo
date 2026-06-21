@@ -110,6 +110,9 @@ def _nvfp4_gemm_kernel[
     stage_w: Bool = False,
     split_k: Int = 1,
     marlin_decode: Bool = True,
+    direct_b: Bool = False,
+    prepermuted: Bool = False,
+    wide_b: Bool = False,
 ](
     c: LayoutTensor[mut=True, c_type, c_layout, MutAnyOrigin],
     a: LayoutTensor[mut=False, a_type, a_layout, ImmutAnyOrigin],
@@ -179,7 +182,7 @@ def _nvfp4_gemm_kernel[
     # stages than the A/W pipeline depth shrinks the SMEM footprint and raises
     # block occupancy (the dominant lever at M=64).
     comptime b_stages = min(2, num_pipeline_stages)
-    comptime b_smem_size = b_stages * BN * BK
+    comptime b_smem_size = 0 if direct_b else b_stages * BN * BK
     comptime BIter = LayoutTensorIter[
         a_type,
         Layout.row_major(BN, BK),
@@ -411,7 +414,8 @@ def _nvfp4_gemm_kernel[
     # reads packed weight straight from DRAM, so only A is prefetched. ------- #
     comptime for stage in range(num_pipeline_stages - 1):
         _copy_a_stage(stage)
-        _copy_w_stage(k_tile_start + stage, stage)
+        comptime if not direct_b:
+            _copy_w_stage(k_tile_start + stage, stage)
         async_copy_commit_group()
     async_copy_wait_group(Int32(num_pipeline_stages - 2))
     barrier()
@@ -422,29 +426,141 @@ def _nvfp4_gemm_kernel[
     # Decode the first K-tile's weights into the B slot the first main-loop
     # iteration will consume. Subsequent tiles are decoded one iteration ahead
     # (below) so the decode overlaps the MMAs.
-    _decode_b_stage(k_tile_start, 0)
-    barrier()
+    comptime if not direct_b:
+        _decode_b_stage(k_tile_start, 0)
+        barrier()
 
     # ---- Main loop. -------------------------------------------------------- #
     for k_iter in range(num_k_iters):
         var a_wt = a_smem_iter[].tile[WM, BK](warp_y, 0)
-        var b_wt = b_smem_iter[].tile[WN, BK](warp_x, 0)
 
-        # Single-buffered fragments: with only `num_k_mmas` (=2) MMAs per tile
-        # the double-buffer prefetch saved little but doubled the B fragment
-        # register footprint, capping occupancy at 2 blocks/SM. Loading each
-        # k-mma's fragments just-in-time frees those registers for more
-        # resident warps, which is what hides the SMEM-pipe latency here.
-        comptime for k_mma in range(num_k_mmas):
-            mma_op.load_a[swizzle_a](
-                a_wt, a_reg_tiles[0].vectorize[1, a_frag](), k_mma
-            )
-            mma_op.load_b(b_wt, b_reg_tiles[0], k_mma)
-            mma_op.mma(
-                a_reg_tiles[0].vectorize[1, a_frag](),
-                b_reg_tiles[0],
-                c_reg_tile.vectorize[1, c_frag](),
-            )
+        comptime if wide_b:
+            # Marlin wide-load layer: preload all A k-fragments (A reuse), then
+            # each lane loads its whole-K-tile weight (8 bytes covering all
+            # num_k_mmas) in ONE coalesced vector load and batch-decodes. W is
+            # pre-permuted into contiguous 256-byte (n-tile x K-tile) blocks
+            # laid out [lane*8 + (k_mma*2+half)].
+            var a_wide = LayoutTensor[
+                a_type,
+                Layout.row_major(num_k_mmas, a_frag),
+                MutAnyOrigin,
+                address_space=AddressSpace.LOCAL,
+            ].stack_allocation()
+            comptime for k_mma in range(num_k_mmas):
+                mma_op.load_a[swizzle_a](
+                    a_wt,
+                    a_wide.tile[1, a_frag](k_mma, 0).vectorize[1, a_frag](),
+                    k_mma,
+                )
+            comptime WIDE_BYTES = 2 * num_k_mmas  # = BK // 8
+            comptime TILE_BYTES = 8 * (BK // 2)  # 8 n-rows x byte_cols
+            var lane = Int(lane_id())
+            var tt = lane % 4
+            var gp = lane // 4
+            var nkt = k // BK  # number of K-tiles
+            var kt = k_tile_start + k_iter
+            var b_dir1 = LayoutTensor[
+                a_type,
+                Layout.row_major(1, b_frag),
+                MutAnyOrigin,
+                address_space=AddressSpace.LOCAL,
+            ].stack_allocation()
+            comptime for nm in range(num_n_mmas):
+                var n0 = block_n * BN + warp_x * WN + nm * MMA_N
+                var ng = n0 + gp
+                var chunk = SIMD[DType.uint8, WIDE_BYTES](0)
+                if ng < n:
+                    chunk = (
+                        w_packed.ptr
+                        + (
+                            ((n0 // 8) * nkt + kt) * TILE_BYTES
+                            + lane * WIDE_BYTES
+                        )
+                    ).load[width=WIDE_BYTES]()
+                comptime for k_mma in range(num_k_mmas):
+                    var gk = kt * BK + k_mma * MMA_K
+                    var sc = Scalar[DType.float32](0)
+                    if ng < n:
+                        sc = (
+                            rebind[Scalar[DType.float32]](
+                                scales[ng, (gk + 2 * tt) // GROUP]
+                            )
+                            * FP4E2M1_MARLIN_BIAS
+                        )
+                    var pk = SIMD[DType.uint8, 2](
+                        chunk[2 * k_mma], chunk[2 * k_mma + 1]
+                    )
+                    var dv = (decode_fp4e2m1_marlin(pk) * sc).cast[a_type]()
+                    comptime for e in range(b_frag):
+                        b_dir1[0, e] = dv[e]
+                    mma_op.mma(
+                        a_wide.tile[1, a_frag](k_mma, 0).vectorize[1, a_frag](),
+                        b_dir1.vectorize[1, b_frag](),
+                        c_reg_tile.tile[1, c_frag](nm, 0).vectorize[
+                            1, c_frag
+                        ](),
+                    )
+        else:
+            comptime for k_mma in range(num_k_mmas):
+                mma_op.load_a[swizzle_a](
+                    a_wt, a_reg_tiles[0].vectorize[1, a_frag](), k_mma
+                )
+                comptime if direct_b:
+                    # Decode FP4 straight into the B fragment registers -- no
+                    # SMEM B tile, no ldmatrix. Lane owns row n=...+lane//4 and
+                    # k-pairs from t=lane%4 (layout verified vs `_load_b_nvidia`).
+                    var b_dir = LayoutTensor[
+                        a_type,
+                        Layout.row_major(num_n_mmas, b_frag),
+                        MutAnyOrigin,
+                        address_space=AddressSpace.LOCAL,
+                    ].stack_allocation()
+                    var lane = Int(lane_id())
+                    var tt = lane % 4
+                    var gp = lane // 4
+                    var gk = (k_tile_start + k_iter) * BK + k_mma * MMA_K
+                    var by0 = gk // 2 + tt
+                    var by1 = gk // 2 + 4 + tt
+                    var sblk = (gk + 2 * tt) // GROUP
+                    comptime for nm in range(num_n_mmas):
+                        var n0 = block_n * BN + warp_x * WN + nm * MMA_N
+                        var ng = n0 + gp
+                        var pk = SIMD[DType.uint8, 2](0)
+                        var sc = Scalar[DType.float32](0)
+                        if ng < n:
+                            comptime if prepermuted:
+                                # W in contiguous 8x8 (n x packed-byte) tiles:
+                                # the warp's 64 bytes per (n_mma,k_mma) coalesce.
+                                var nct = (k // 2) // 8
+                                var tile = (n0 // 8) * nct + (gk // 2) // 8
+                                var base = tile * 64 + gp * 8 + tt
+                                pk[0] = w_packed.ptr[base]
+                                pk[1] = w_packed.ptr[base + 4]
+                            else:
+                                pk[0] = w_packed[ng, by0][0]
+                                pk[1] = w_packed[ng, by1][0]
+                            sc = (
+                                rebind[Scalar[DType.float32]](scales[ng, sblk])
+                                * FP4E2M1_MARLIN_BIAS
+                            )
+                        var dv = (
+                            decode_fp4e2m1_marlin(pk) * sc
+                        ).cast[a_type]()
+                        comptime for e in range(b_frag):
+                            b_dir[nm, e] = dv[e]
+                    mma_op.mma(
+                        a_reg_tiles[0].vectorize[1, a_frag](),
+                        b_dir.vectorize[1, b_frag](),
+                        c_reg_tile.vectorize[1, c_frag](),
+                    )
+                else:
+                    var b_wt = b_smem_iter[].tile[WN, BK](warp_x, 0)
+                    mma_op.load_b(b_wt, b_reg_tiles[0], k_mma)
+                    mma_op.mma(
+                        a_reg_tiles[0].vectorize[1, a_frag](),
+                        b_reg_tiles[0],
+                        c_reg_tile.vectorize[1, c_frag](),
+                    )
 
         # Prefetch the next K-tile's A (and, when staging, packed-W bytes) via
         # cp.async, and DECODE the next K-tile's B into the slot the
@@ -455,12 +571,14 @@ def _nvfp4_gemm_kernel[
         var prefetch = k_iter + num_pipeline_stages - 1
         if prefetch < num_k_iters:
             _copy_a_stage(num_pipeline_stages - 1)
-            _copy_w_stage(
-                k_tile_start + prefetch, prefetch % num_pipeline_stages
-            )
+            comptime if not direct_b:
+                _copy_w_stage(
+                    k_tile_start + prefetch, prefetch % num_pipeline_stages
+                )
         async_copy_commit_group()
         a_smem_iter._incr()
-        b_smem_iter._incr()
+        comptime if not direct_b:
+            b_smem_iter._incr()
         async_copy_wait_group(Int32(num_pipeline_stages - 2))
         # When staging packed weights, `_decode_b_stage` reads the W slot that
         # was cp.async'd into SMEM THIS iteration. `async_copy_wait_group` only
@@ -471,9 +589,12 @@ def _nvfp4_gemm_kernel[
         # results on GPUs that expose the timing (e.g. sm_86).
         comptime if stage_w:
             barrier()
-        var next_k = k_iter + 1
-        if next_k < num_k_iters:
-            _decode_b_stage(k_tile_start + next_k, next_k % num_pipeline_stages)
+        comptime if not direct_b:
+            var next_k = k_iter + 1
+            if next_k < num_k_iters:
+                _decode_b_stage(
+                    k_tile_start + next_k, next_k % num_pipeline_stages
+                )
         barrier()
 
     # ---- Epilogue: write the f32 accumulators to C with explicit bounds
@@ -538,7 +659,10 @@ def _nvfp4_gemm_finalize_kernel[
 # Host launcher
 # ===----------------------------------------------------------------------=== #
 @always_inline
-def nvfp4_gemm(
+def nvfp4_gemm[
+    prepermuted: Bool = False,
+    wide_b: Bool = False,
+](
     ctx: DeviceContext,
     c: TileTensor,
     a: TileTensor,
@@ -587,13 +711,17 @@ def nvfp4_gemm(
         SW: Bool = False,
         BK: Int = 64,
         MD: Bool = True,
+        DB: Bool = False,
+        PP: Bool = False,
+        WB: Bool = False,
     ]() raises:
         comptime num_warps = (BM // WM) * (BN // WN)
         comptime num_threads = num_warps * WARP_SIZE
         comptime b_stages = min(2, NS)  # B needs only 2 live slots
         comptime a_bytes = NS * BM * BK * size_of[a.dtype]()
-        comptime b_bytes = b_stages * BN * BK * size_of[a.dtype]()
-        comptime w_bytes = NS * BN * (BK // 2) if SW else 0  # packed staging
+        # direct_b decodes straight into fragments: no B SMEM tile, no W staging.
+        comptime b_bytes = 0 if DB else b_stages * BN * BK * size_of[a.dtype]()
+        comptime w_bytes = NS * BN * (BK // 2) if (SW and not DB) else 0
         comptime c_bytes = BM * BN * size_of[c.dtype]()
         comptime smem = max(a_bytes + b_bytes + w_bytes, c_bytes)
         comptime kernel = _nvfp4_gemm_kernel[
@@ -612,6 +740,9 @@ def nvfp4_gemm(
             split_k=SK,
             stage_w=SW,
             marlin_decode=MD,
+            direct_b=DB,
+            prepermuted=PP,
+            wide_b=WB,
         ]
 
         comptime if SK > 1:
@@ -684,6 +815,10 @@ def nvfp4_gemm(
     # the larger M>64 tile (BM=128/BK=32) has the register headroom to profit
     # from the cheaper Marlin decode (MD=True). See `_decode_b_stage`.
     if m <= 64:
-        _launch[64, 64, 2, 4, SW=True, BK=64, MD=False]()
+        _launch[
+            64, 64, 2, 4, SW=False, BK=64, DB=True, PP=prepermuted, WB=wide_b
+        ]()
     else:
-        _launch[128, 64, 3, 2, SW=True, BK=32, MD=True]()
+        _launch[
+            128, 64, 3, 2, SW=False, BK=32, DB=True, PP=prepermuted, WB=wide_b
+        ]()
