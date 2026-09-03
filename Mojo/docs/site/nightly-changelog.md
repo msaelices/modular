@@ -354,6 +354,14 @@ This version is still a work in progress.
 
 This release completes the removal of APIs deprecated during the v1.0 cycle.
 
+- Removed `is_npu()` from `max.gpu.host.info`. A custom op's `target` says
+  whether the op was placed on the host or on a device, not which kind of
+  device it landed on -- that comes from the build, via `_accelerator_arch()`,
+  `get_gpu_target()` or `ctx.default_device_info`. `is_npu()` invited the
+  target string to be asked a question it cannot answer, and nothing called
+  it. `is_accelerator()` is unchanged in meaning for every target a graph
+  produces: use it to ask whether an op is off the host.
+
 - Implicit variable declaration now produces an error instead of a warning. The
   walrus operator also only overwrite existing values, not implicitly declare
   new ones.
