@@ -1144,6 +1144,11 @@ the [container](/container) page now links to the new page.
 
 ## Fixes
 
+- Fixed constrained decoding producing invalid output when combined with
+  speculative decoding on AMD GPUs. The in-graph wait that gates the grammar
+  bitmask copy was not recorded into captured device graphs, so replays read a
+  stale mask.
+
 - Fixed tool calls being returned as raw markup in the assistant's `content`
   when a request did not declare a `tools` array. A tool established only by
   the conversation history, such as retrying a call that previously failed,
