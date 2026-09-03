@@ -906,6 +906,28 @@ def test_oneof_const_disjoint_compiles_and_enforces() -> None:
     assert not _accepts(compiled, '"ab"')
 
 
+def test_const_enum_control_char_string_is_escaped() -> None:
+    # A const/enum string value with a control char must render as its escaped
+    # JSON form; the grammar must reject the raw control byte (invalid JSON).
+    nl = _compiler().compile_json_schema(
+        json.dumps({"const": "a\nb"}), reject_unsupported=True
+    )
+    assert _accepts(nl, '"a\\nb"')  # escaped newline -> valid JSON, accepted
+    assert not _accepts(nl, '"a\nb"')  # raw newline -> invalid JSON, rejected
+
+    en = _compiler().compile_json_schema(
+        json.dumps({"enum": ["a\nb"]}), reject_unsupported=True
+    )
+    assert _accepts(en, '"a\\nb"')
+    assert not _accepts(en, '"a\nb"')
+
+    nul = _compiler().compile_json_schema(
+        json.dumps({"const": "x\x00y"}), reject_unsupported=True
+    )
+    assert _accepts(nul, '"x\\u0000y"')  # escaped NUL -> valid, accepted
+    assert not _accepts(nul, '"x\x00y"')  # raw NUL -> invalid, rejected
+
+
 def test_oneof_enum_disjoint_compiles_and_enforces() -> None:
     compiled = _compiler().compile_json_schema(
         '{"oneOf": [{"enum": ["a", "b"]}, {"enum": [1]}]}',
