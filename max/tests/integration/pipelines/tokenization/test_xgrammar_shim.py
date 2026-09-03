@@ -3193,6 +3193,81 @@ def test_cache_key_distinguishes_property_names_default_type() -> None:
     assert not _accepts(compiled, '{"b": 1, "a": {1: 1}}')
 
 
+def test_property_names_non_string_shape_rejected() -> None:
+    for property_names in (
+        {"type": ["integer", "string"]},
+        {"type": ["string"]},
+        {"anyOf": [{"type": "string"}, {"type": ["integer"]}]},
+    ):
+        schema = {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "propertyNames": property_names,
+        }
+        with pytest.raises(Exception, match="non-string"):
+            _gemma_compile(schema)
+        with pytest.raises(Exception, match="non-string"):
+            _compiler().compile_json_schema(json.dumps(schema))
+
+
+def test_property_names_non_string_const_enum_rejected() -> None:
+    for property_names in (
+        {"const": 42},
+        {"const": True},
+        {"const": None},
+        {"enum": [1, 2]},
+        {"enum": ["a", 2]},
+        {"enum": [None]},
+    ):
+        schema = {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "propertyNames": property_names,
+        }
+        with pytest.raises(Exception, match="non-string"):
+            _gemma_compile(schema)
+        with pytest.raises(Exception, match="non-string"):
+            _compiler().compile_json_schema(json.dumps(schema))
+
+
+def test_property_names_string_const_enum_accepted() -> None:
+    for property_names in ({"const": "foo"}, {"enum": ["a", "b"]}):
+        schema = {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "propertyNames": property_names,
+        }
+        _gemma_compile(schema)
+        _compiler().compile_json_schema(json.dumps(schema))
+
+
+def test_property_names_allof_folds_to_string_shape() -> None:
+    for accepted in (
+        {"allOf": [{"type": "string"}]},
+        {"allOf": [{"type": "string"}, {"minLength": 1}]},
+        {"allOf": [{"const": "foo"}]},
+    ):
+        schema = {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "propertyNames": accepted,
+        }
+        _compiler().compile_json_schema(json.dumps(schema))
+    for rejected in (
+        {"allOf": [{"type": "number"}]},
+        {"allOf": [{"type": "string"}, {"type": "number"}]},
+    ):
+        schema = {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "propertyNames": rejected,
+        }
+        with pytest.raises(
+            Exception, match="must be an object that validates string"
+        ):
+            _compiler().compile_json_schema(json.dumps(schema))
+
+
 def test_cache_key_not_forgeable_via_property_name() -> None:
     # A property name may contain quotes and colons that make one
     # subschema's text resemble a structurally different sibling's. Such
