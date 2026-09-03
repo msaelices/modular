@@ -3880,8 +3880,10 @@ LogicalResult ClosureEmitter::checkStructCompatibility(ASTType structType,
                  CallSyntax::kMethodCallSynthetic);
   /// Perform rebind on method that implements the trait function but with
   /// different argument names.
-  auto [newWitness, _] =
+  auto newWitnessResult =
       ov.filterOverloadSetForValueType(traitSignature, nullptr);
+  PValue newWitness =
+      newWitnessResult.isYes() ? newWitnessResult.getYes().callee : PValue();
   if (newWitness) {
     SmallVector<StringRef> traitAliasNames;
     for (AliasDeclOp traitAlias :

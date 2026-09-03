@@ -251,11 +251,11 @@ ParamInf::inferCValue(ASTExprAnd<AnyValue> operand, size_t argIdx,
       return getMojoDiag(loc);
     };
 
-    auto [argVal, _] =
+    auto argValResult =
         orValue->filterOverloadSetForValueType(expectedType, emitError);
-    if (!argVal)
+    if (!argValResult.isYes())
       return failure();
-    return SmartVariant<CValue, ASTType>(CValue(argVal));
+    return SmartVariant<CValue, ASTType>(CValue(argValResult.getYes().callee));
   }
 
   // FIXME: This emits an error unconditionally (not to getDiags) on failure.

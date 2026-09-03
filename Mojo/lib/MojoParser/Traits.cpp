@@ -225,8 +225,10 @@ static LogicalResult signatureResolveDefaultTraitFnStubs(
         !isTriviallyTrueConstraint(conformanceConstraint))
       ov.additionalAssumptions.push_back(conformanceConstraint);
 
-    auto [_, decl] =
+    auto wrapperResult =
         ov.filterOverloadSetForValueType(wrapperSignature, nullptr);
+    ASTDecl *decl =
+        wrapperResult.isYes() ? wrapperResult.getYes().decl : nullptr;
     if (decl) {
       // Since we are not using the default implementation, set the ASTDecl
       // which were inserted for referencing default method to be fully
@@ -618,20 +620,20 @@ LIT::verifyAndBuildConformance(ASTDecl &structDecl, TraitSymbolAttr parent,
         return diag->attachNote(op->getLoc());
       return diag->attachNote(*traitFnDecl);
     };
-    bool inconclusive = false;
-    auto [result, selectedStructMethod] = ov.filterOverloadSetForValueType(
-        traitSignature, emitError, &inconclusive);
+    auto calleeResult =
+        ov.filterOverloadSetForValueType(traitSignature, emitError);
 
-    if (!result) {
+    if (!calleeResult.isYes()) {
       // When a candidate was undecidable rather than simply mismatched, point
       // at the requirement: the reader has to weigh the candidate's `where`
       // clause against what the conformance demands, and needs both in view.
       // A plain signature mismatch is already self-explanatory, and the note
       // would drag the requirement's synthesized signature along with it.
-      if (inconclusive)
+      if (calleeResult.isUnknown())
         diag->attachNote(*traitFnDecl) << "required by trait method here";
       return failure();
     }
+    auto [result, selectedStructMethod] = calleeResult.getYes();
 
     // Check for API author error: stable struct implementing stable trait
     // must use stable methods for stable trait methods.
