@@ -43,20 +43,24 @@ class TraitType;
 // ConversionFailure
 //===----------------------------------------------------------------------===//
 
-/// Why an implicit conversion was rejected. `canImplicitlyConvertToType` tries
+/// Why an implicit conversion was rejected. `classifyImplicitConversion` tries
 /// a sequence of unrelated conversion strategies, and each one fails for its
 /// own kind of reason, so each gets its own alternative here.
+///
+/// This is only used when an answer is definitively `no`. For inconclusive
+/// answers, the `ImplicitConversionResult` returned by
+/// `classifyImplicitConversionWithDetails` carries the undecided constraints.
 class ConversionFailure {
 public:
   /// Rejected without recording a reason.
   struct None {};
 
-  /// A constraint was refuted or could not be proven.
-  struct UnsatisfiedConstraints {
-    ConstraintFailure constraints;
+  /// A constraint was refuted.
+  struct RefutedConstraints {
+    SmallVector<ConstraintAttr, 2> constraints;
   };
 
-  using Reason = std::variant<None, UnsatisfiedConstraints>;
+  using Reason = std::variant<None, RefutedConstraints>;
 
   ConversionFailure() = default;
   ConversionFailure(ConversionFailure &&) = default;
@@ -388,29 +392,37 @@ public:
   /// Return true if 'value' may be implicitly converted to 'requiredType'
   /// by invoking (one level of) conversion operations.  This does not generate
   /// any IR.
-  // When `deferralCtx` is non-null and the only obstacle to the conversion is
-  // an unprovable (`unknown`) trait conformance, the conversion is
-  // reported as convertible (and not cached since it's context-dependent).
-  //
-  // When `failure` is non-null it receives why the conversion was rejected.
-  // Only the strategies that know a reason record one, so it can come back
-  // empty even for a rejection.
+  /// When `deferralCtx` is non-null and the only obstacle to the conversion is
+  /// an unprovable (`unknown`) trait conformance, the conversion is
+  /// reported as convertible (and not cached since it's context-dependent).
   static TriState classifyImplicitConversion(
       ASTExprAnd<CValue> value, ASTType requiredType, ASTDecl &declScope,
       ArrayRef<ConstraintAttr> additionalAssumptions = {},
-      DeferredTypingContext *deferralCtx = nullptr,
-      ConversionFailure *failure = nullptr);
+      DeferredTypingContext *deferralCtx = nullptr);
+
+  /// The answer from `classifyImplicitConversionWithDetails`:
+  /// - A `no`/`unknown` carries why the conversion was rejected. Only the
+  ///   strategies that know a reason record one, so it can come back empty even
+  ///   for a rejection.
+  /// - An `unknown` carries the undecided constraints.
+  using ImplicitConversionResult =
+      TriResult<void, ConversionFailure, SmallVector<ConstraintAttr, 2>>;
+
+  /// Same as `classifyImplicitConversion`, additionally collecting non-yes
+  /// reasons.
+  static ImplicitConversionResult classifyImplicitConversionWithDetails(
+      ASTExprAnd<CValue> value, ASTType requiredType, ASTDecl &declScope,
+      ArrayRef<ConstraintAttr> additionalAssumptions,
+      DeferredTypingContext *deferralCtx);
 
   /// Boolean form of `classifyImplicitConversion`, collapsing an undecided
-  /// verdict the way callers that cannot represent one have always seen it.
+  /// answer the way callers that cannot represent one have always seen it.
   static bool canImplicitlyConvertToType(
       ASTExprAnd<CValue> value, ASTType requiredType, ASTDecl &declScope,
       ArrayRef<ConstraintAttr> additionalAssumptions = {},
-      DeferredTypingContext *deferralCtx = nullptr,
-      ConversionFailure *failure = nullptr) {
-    TriState verdict =
-        classifyImplicitConversion(value, requiredType, declScope,
-                                   additionalAssumptions, deferralCtx, failure);
+      DeferredTypingContext *deferralCtx = nullptr) {
+    TriState verdict = classifyImplicitConversion(
+        value, requiredType, declScope, additionalAssumptions, deferralCtx);
     if (verdict.isUnknown())
       return deferralCtx != nullptr;
     return verdict.isTrue();

@@ -1000,22 +1000,17 @@ std::pair<PValue, ASTDecl *> OverloadSet::filterOverloadSetForValueType(
     unprovableConstraints.clear();
     // Pass our assumptions along: dropping the candidate's generator body
     // constraints to reach `functionType` may depend on them.
-    ConversionFailure failure;
-    TriState verdict = IREmitter::classifyImplicitConversion(
+    auto conversion = IREmitter::classifyImplicitConversionWithDetails(
         {UnboundAttr::get(boundCandidateType), getExpr()}, functionType,
-        getDeclScope(), additionalAssumptions, /*deferralCtx=*/nullptr,
-        &failure);
-    if (verdict.isTrue())
+        getDeclScope(), additionalAssumptions, /*deferralCtx=*/nullptr);
+    if (conversion.isYes())
       return Candidacy::kValid;
-    if (verdict.isFalse())
+    if (conversion.isNo())
       return Candidacy::kInvalid;
 
-    // Undecided: Only an unsatisfied constraint names anything this diagnostic
-    // can use.
-    if (auto *unsatisfied =
-            failure.getReasonIf<ConversionFailure::UnsatisfiedConstraints>())
-      llvm::append_range(unprovableConstraints,
-                         unsatisfied->constraints.unprovenConstraints);
+    // Undecided: Record the constraints it could not discharge.
+    llvm::append_range(unprovableConstraints,
+                       std::move(conversion).getUnknown());
     return Candidacy::kInconclusive;
   };
 

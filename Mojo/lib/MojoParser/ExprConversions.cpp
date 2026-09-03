@@ -908,7 +908,7 @@ struct ConversionResult {
   };
 
   Sensitivity sensitivity;
-  TriState isConvertible;
+  TriState isConvertible; // TODO: Change into ConstraintResult.
 
   static ConversionResult notApplicable() {
     return {Sensitivity::NotApplicable, TriState::no()};
@@ -1754,20 +1754,21 @@ static ASTDecl *getClosureTraitDecl(SharedState &shared,
 // type value to a trait. Returns failure for non-applicable cases (i.e.,
 // `fromType` is not a typetype and/or `toType` is not a trait type).
 //
-// Shared body of the two public entry points. `details`, when non-null, is
-// filled with the constraints behind a non-`yes` verdict; when passed null, the
-// conformance query short-circuits.
+// Shared body of the two public entry points. `unsatConstraints`, when
+// non-null, is filled with the constraints behind a non-`yes` verdict; when
+// passed null, the conformance query short-circuits.
 static FailureOr<TriState>
 canMetaTypeUpCastToImpl(SharedState &shared, SMLoc loc, ASTType fromType,
                         ASTType toType, ASTDecl *declScope,
-                        bool *scopeDependent, ConstraintFailure *details) {
+                        bool *scopeDependent,
+                        SmallVectorImpl<ConstraintAttr> *unsatConstraints) {
   auto conformanceVerdict = [&](ASTType type, TraitType trait) {
     // Owned, not an ArrayRef: `getAssumptionsFromScope` returns by value.
     SmallVector<ConstraintAttr> assumptions =
         ASTDecl::getAssumptionsFromScope(declScope);
     if (scopeDependent && !assumptions.empty())
       *scopeDependent = true;
-    if (!details)
+    if (!unsatConstraints)
       return type.doesConformTo(trait, shared, assumptions);
 
     ConstraintResult result =
@@ -1775,10 +1776,10 @@ canMetaTypeUpCastToImpl(SharedState &shared, SMLoc loc, ASTType fromType,
     if (result.isYes())
       return TriState::yes();
     if (result.isNo()) {
-      details->failedConstraints = std::move(result).getNo();
+      *unsatConstraints = std::move(result).getNo();
       return TriState::no();
     }
-    details->unprovenConstraints = std::move(result).getUnknown();
+    *unsatConstraints = std::move(result).getUnknown();
     return TriState::unknown();
   };
 
@@ -1933,16 +1934,17 @@ FailureOr<TriState> IREmitter::canMetaTypeUpCastTo(SharedState &shared,
 FailureOr<ConstraintResult> IREmitter::canMetaTypeUpCastToWithDetails(
     SharedState &shared, SMLoc loc, ASTType fromType, ASTType toType,
     ASTDecl *declScope, bool *scopeDependent) {
-  ConstraintFailure details;
-  FailureOr<TriState> verdict = canMetaTypeUpCastToImpl(
-      shared, loc, fromType, toType, declScope, scopeDependent, &details);
+  SmallVector<ConstraintAttr, 2> unsatConstraints;
+  FailureOr<TriState> verdict =
+      canMetaTypeUpCastToImpl(shared, loc, fromType, toType, declScope,
+                              scopeDependent, &unsatConstraints);
   if (failed(verdict))
     return failure();
   if (verdict->isTrue())
     return ConstraintResult::yes();
   if (verdict->isFalse())
-    return ConstraintResult::no(std::move(details.failedConstraints));
-  return ConstraintResult::unknown(std::move(details.unprovenConstraints));
+    return ConstraintResult::no(std::move(unsatConstraints));
+  return ConstraintResult::unknown(std::move(unsatConstraints));
 }
 
 //===----------------------------------------------------------------------===//
@@ -1984,25 +1986,38 @@ static bool isClosureWrapperStruct(SharedState &shared, PValue value,
 }
 
 void ConversionFailure::addExplanation(MojoInflightDiag &diag) && {
-  if (auto *unsatisfied = std::get_if<UnsatisfiedConstraints>(&reason))
-    unsatisfied->constraints.attachNotes(diag);
+  if (auto *refuted = std::get_if<RefutedConstraints>(&reason))
+    attachConstraintNotes(diag, refuted->constraints, "failed");
 }
 
-/// Return true if 'value' may be implicitly converted to 'requiredType'
-/// by invoking (one level of) conversion operations.  This does not generate
-/// any IR.
+namespace {
+/// A struct for collecting the reasons for a non-`yes` answer from
+/// `classifyImplicitConversionImpl`.
+struct ConversionNonYesReason {
+  ConversionFailure rejection;
+  SmallVector<ConstraintAttr, 2> unproven;
+
+  void recordUnprovenIfEmpty(SmallVector<ConstraintAttr, 2> constraints) {
+    if (unproven.empty())
+      unproven = std::move(constraints);
+  }
+};
+} // namespace
+
+/// Shared body of the two public `classifyImplicitConversion` entry points:
+/// `reason` non-null means the caller asked why the answer was not `yes`.
 ///
-/// CAUTION: This method must line up with `emitImplicitConversionToType`!!!
-TriState IREmitter::classifyImplicitConversion(
+/// CAUTION: This must line up with `IREmitter::emitImplicitConversionToType`!!!
+static TriState classifyImplicitConversionImpl(
     ASTExprAnd<CValue> value, ASTType requiredType, ASTDecl &declScope,
     ArrayRef<ConstraintAttr> additionalAssumptions,
-    DeferredTypingContext *deferralCtx, ConversionFailure *failure) {
+    DeferredTypingContext *deferralCtx, ConversionNonYesReason *reason) {
   auto &shared = declScope.getShared();
   assert(value.ir && "Should only query valid values");
   ASTType rvType = value.ir.getRValueType();
   // Clear so an early return leaves no stale reason behind.
-  if (failure)
-    failure->clear();
+  if (reason)
+    *reason = {};
 
   // If it already matches, then we're done.
   if (rvType.isEqualCanon(requiredType))
@@ -2013,13 +2028,11 @@ TriState IREmitter::classifyImplicitConversion(
   SmallVector<ConstraintAttr, 2> zeroCostUnproven;
   TriState zeroCost = canZeroCostConvertImpl(
       rvType, requiredType, shared, declScope, additionalAssumptions,
-      failure ? &zeroCostUnproven : nullptr);
+      reason ? &zeroCostUnproven : nullptr);
   if (zeroCost.isTrue())
     return TriState::yes();
-  if (failure && zeroCost.isUnknown())
-    failure->recordIfEmpty(
-        ConversionFailure::UnsatisfiedConstraints{ConstraintFailure{
-            /*failedConstraints=*/{}, std::move(zeroCostUnproven)}});
+  if (reason && zeroCost.isUnknown())
+    reason->recordUnprovenIfEmpty(std::move(zeroCostUnproven));
   // An undecided zero-cost verdict does not stop the other strategies from
   // finding a definitive answer, but if none of them does, undecided is the
   // honest result rather than a flat no.
@@ -2030,11 +2043,11 @@ TriState IREmitter::classifyImplicitConversion(
   if (sugarIsa<OriginType>(rvType) && sugarIsa<OriginSetType>(requiredType))
     return TriState::yes();
 
-  // Check to see if we already cached this convertibility check. If user
-  // requested failure details, we use the cached only if the verdict was true.
+  // Check to see if we already cached this convertibility check. If the caller
+  // asked why, we use the cached value only if the verdict was true.
   std::optional<bool> cache =
       shared.getCachedImplicitConvertibility(rvType, requiredType);
-  if (cache.has_value() && (!failure || cache.value()))
+  if (cache.has_value() && (!reason || cache.value()))
     return TriState::fromBool(cache.value());
 
   // Cache and return a convertibility verdict. When `scopeDependent` is true
@@ -2044,20 +2057,20 @@ TriState IREmitter::classifyImplicitConversion(
   // from scopes with a different assumption set. `reason` is recorded on a
   // false verdict; `None` (the default) is a no-op.
   auto cacheAndReturnVal =
-      [&shared, failure](ASTType from, ASTType to, bool isConvertible,
-                         bool scopeDependent = false,
-                         ConversionFailure::Reason reason = {}) -> TriState {
+      [&shared, reason](ASTType from, ASTType to, bool isConvertible,
+                        bool scopeDependent = false,
+                        ConversionFailure::Reason rejection = {}) -> TriState {
     if (!scopeDependent)
       shared.cacheImplicitConvertibility(from, to, isConvertible);
-    if (!isConvertible && failure)
-      failure->recordIfEmpty(std::move(reason));
+    if (!isConvertible && reason)
+      reason->rejection.recordIfEmpty(std::move(rejection));
     return TriState::fromBool(isConvertible);
   };
 
-  // Cache, return, or fall through based on a converter's caching sensitivity.
-  // Scope-dependent results must never be cached, since the cache is keyed only
-  // on the type pair and would otherwise poison queries from other scopes.
-  auto resolveGeneratorConv =
+  // Handle turning a ConversionResult into a TriState for returning from this
+  // function, or for falling through to the next conversion strategy. Also
+  // handles caching & recording the rejection reason if needed.
+  auto resolveConversionResult =
       [&](ConversionResult conv) -> std::optional<TriState> {
     if (!conv.applies())
       return std::nullopt;
@@ -2070,18 +2083,25 @@ TriState IREmitter::classifyImplicitConversion(
     return conv.isConvertible;
   };
 
-  // Resolve a tri-state conformance verdict into a boolean result that is
-  // potentially cached. Returns the boolean result. `reason` is recorded on a
-  // definitive false.
-  auto resolveTriStateVerdict =
-      [&](TriState verdict, bool scopeDependent,
-          ConversionFailure::Reason reason = {}) -> TriState {
-    if (verdict.isTrue())
+  // Handle turning a ConstraintResult into a TriState for returning from this
+  // function. Also handles caching & recording the rejection reason if needed.
+  auto resolveConstraintResult = [&](ConstraintResult result,
+                                     bool scopeDependent) -> TriState {
+    if (result.isYes())
       return cacheAndReturnVal(rvType, requiredType, true, scopeDependent);
-    if (verdict.isUnknown())
+    if (result.isUnknown()) {
+      // An undecided result is never cached. Record and return directly.
+      if (reason)
+        reason->recordUnprovenIfEmpty(std::move(result.getUnknown()));
       return TriState::unknown();
+    }
+    // A failure result may need a rejection reason.
+    ConversionFailure::Reason rejection;
+    if (reason)
+      rejection =
+          ConversionFailure::RefutedConstraints{std::move(result.getNo())};
     return cacheAndReturnVal(rvType, requiredType, false, scopeDependent,
-                             std::move(reason));
+                             std::move(rejection));
   };
 
   // Empty generators are zero-cost convertible to their body type when the
@@ -2089,19 +2109,17 @@ TriState IREmitter::classifyImplicitConversion(
   // A conversion that "applies" but fails the convertibility check returns
   // false immediately intentionally.
   if (std::optional<TriState> resolved =
-          resolveGeneratorConv(classifyEmptyGeneratorToBody(
+          resolveConversionResult(classifyEmptyGeneratorToBody(
               value, requiredType, declScope, additionalAssumptions)))
     return *resolved;
 
   bool upCastScopeDependent = false;
-  ConstraintFailure upCastConstraints;
-  FailureOr<TriState> canUpCast = canMetaTypeUpCastToImpl(
-      shared, value.expr->getLoc(), rvType, requiredType, &declScope,
-      &upCastScopeDependent, failure ? &upCastConstraints : nullptr);
+  FailureOr<ConstraintResult> canUpCast =
+      IREmitter::canMetaTypeUpCastToWithDetails(
+          shared, value.expr->getLoc(), rvType, requiredType, &declScope,
+          &upCastScopeDependent);
   if (succeeded(canUpCast))
-    return resolveTriStateVerdict(*canUpCast, upCastScopeDependent,
-                                  ConversionFailure::UnsatisfiedConstraints{
-                                      std::move(upCastConstraints)});
+    return resolveConstraintResult(*canUpCast, upCastScopeDependent);
 
   if (sugarIsa<ParamListType>(rvType) &&
       sugarIsa<ParamListType>(requiredType)) {
@@ -2117,14 +2135,12 @@ TriState IREmitter::classifyImplicitConversion(
     ASTType fromEltTp = sugarCast<ParamListType>(rvType).getElementType();
     // Reuse assumptions from above for variadic element upcast.
     bool eltUpCastScopeDependent = false;
-    ConstraintFailure eltUpCastConstraints;
-    FailureOr<TriState> canEltUpCast = canMetaTypeUpCastToImpl(
-        shared, value.expr->getLoc(), fromEltTp, toEltTp, &declScope,
-        &eltUpCastScopeDependent, failure ? &eltUpCastConstraints : nullptr);
+    FailureOr<ConstraintResult> canEltUpCast =
+        IREmitter::canMetaTypeUpCastToWithDetails(
+            shared, value.expr->getLoc(), fromEltTp, toEltTp, &declScope,
+            &eltUpCastScopeDependent);
     if (succeeded(canEltUpCast))
-      return resolveTriStateVerdict(*canEltUpCast, eltUpCastScopeDependent,
-                                    ConversionFailure::UnsatisfiedConstraints{
-                                        std::move(eltUpCastConstraints)});
+      return resolveConstraintResult(*canEltUpCast, eltUpCastScopeDependent);
   }
 
   // Support implicit conversions of generator types, including dropping
@@ -2132,7 +2148,7 @@ TriState IREmitter::classifyImplicitConversion(
   // relative order as the generator-conversion path in
   // `emitImplicitConversionToType` so the two stay in lockstep.
   if (auto requiredGenerator = sugarDynCast<GeneratorType>(requiredType)) {
-    if (std::optional<TriState> resolved = resolveGeneratorConv(
+    if (std::optional<TriState> resolved = resolveConversionResult(
             classifyGeneratorToGenerator(value, requiredGenerator, rvType,
                                          declScope, additionalAssumptions)))
       return *resolved;
@@ -2143,7 +2159,7 @@ TriState IREmitter::classifyImplicitConversion(
   if (sugarIsa<FnTypeGeneratorType, FnLiteralTypeGeneratorType>(rvType)) {
     if (auto structMeta =
             sugarDynCast<StructMetaType>(requiredType.extractMetaType())) {
-      StructType structTy = structMeta.getType();
+      LIT::StructType structTy = structMeta.getType();
       PValue target = value.ir.getIfPValue();
       if (auto fnLiteral = sugarDynCast<FnLiteralTypeGeneratorType>(rvType))
         target = PValue(fnLiteral.getSymbolConstantAttr());
@@ -2175,6 +2191,31 @@ TriState IREmitter::classifyImplicitConversion(
   shared.cacheImplicitConvertibility(value.ir.getType(), requiredType,
                                      isConvertible);
   return TriState::fromBool(isConvertible);
+}
+
+TriState IREmitter::classifyImplicitConversion(
+    ASTExprAnd<CValue> value, ASTType requiredType, ASTDecl &declScope,
+    ArrayRef<ConstraintAttr> additionalAssumptions,
+    DeferredTypingContext *deferralCtx) {
+  return classifyImplicitConversionImpl(value, requiredType, declScope,
+                                        additionalAssumptions, deferralCtx,
+                                        /*reason=*/nullptr);
+}
+
+IREmitter::ImplicitConversionResult
+IREmitter::classifyImplicitConversionWithDetails(
+    ASTExprAnd<CValue> value, ASTType requiredType, ASTDecl &declScope,
+    ArrayRef<ConstraintAttr> additionalAssumptions,
+    DeferredTypingContext *deferralCtx) {
+  ConversionNonYesReason reason;
+  TriState verdict = classifyImplicitConversionImpl(
+      value, requiredType, declScope, additionalAssumptions, deferralCtx,
+      &reason);
+  if (verdict.isTrue())
+    return ImplicitConversionResult::yes();
+  if (verdict.isFalse())
+    return ImplicitConversionResult::no(std::move(reason.rejection));
+  return ImplicitConversionResult::unknown(std::move(reason.unproven));
 }
 
 FailureOr<PValue>
