@@ -1981,8 +1981,8 @@ struct SelfPrependShifter : IndexParameterReplacer<SelfPrependShifter> {
 };
 } // namespace
 
-TraitType IREmitter::bindParamsToClosureTraitFromSig(const ExprNode *expr,
-                                                     FnTypeGeneratorType sig) {
+TraitSymbolAttr
+IREmitter::bindParamsToClosureTraitFromSig(FnTypeGeneratorType sig) {
   MLIRContext *ctx = shared.getContext();
   ASTDecl *closureTraitDecl = shared.getUniversalParametricClosureTrait();
 
@@ -2050,9 +2050,7 @@ TraitType IREmitter::bindParamsToClosureTraitFromSig(const ExprNode *expr,
   llvm::append_range(pogArgs, sig.getArgListAttrs().getPogs());
 
   auto traitDeclOp = cast<TraitDeclOp>(closureTraitDecl->getIfOperation());
-  TraitSymbolAttr boundClosure = traitDeclOp.bindReference(
-      {paramDeclList, argTypeList, resultType, metadata,
-       PogListAttr::get(ctx, pogParams), PogListAttr::get(ctx, pogArgs)});
-
-  return shared.declResolver->getCanonicalTrait(boundClosure);
+  return traitDeclOp.bindReference({paramDeclList, argTypeList, resultType,
+                                    metadata, PogListAttr::get(ctx, pogParams),
+                                    PogListAttr::get(ctx, pogArgs)});
 }

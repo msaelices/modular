@@ -4960,8 +4960,8 @@ AnyValue FunctionTypeNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
     ASTDecl *moduleDecl =
         emitter.getDeclScope().getNearestDeclOfType<FileModuleOp>();
     if (argList.isExperimentalParamTrait) {
-      TraitType traitType =
-          emitter.bindParamsToClosureTraitFromSig(this, signature);
+      TraitType traitType = emitter.shared.declResolver->getCanonicalTrait(
+          emitter.bindParamsToClosureTraitFromSig(signature));
       return emitter.emitResult(ASTType(traitType), this, dest);
     }
     ASTDecl *trait = emitter.shared.getOrCreateClosureTrait(

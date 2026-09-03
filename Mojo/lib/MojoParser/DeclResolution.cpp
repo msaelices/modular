@@ -1472,8 +1472,7 @@ static MLValue emitClosureInstance(ArrayRef<Capture> captures,
     }
   }
   Value closureInstance =
-      emitter.emitClosure(*moduleDecl, nestedFnDecl, captures,
-                          cast<TraitDeclOp>(closureTrait->getIfOperation()),
+      emitter.emitClosure(*moduleDecl, nestedFnDecl, captures, *closureTrait,
                           mlirLoc, isCopyable, closureSig, capturedRefs);
   if (!closureInstance)
     return {};

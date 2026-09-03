@@ -2693,8 +2693,10 @@ ClosureEmitter::Closure ClosureEmitter::liftClosure(
     WitnessOp::create(builder, closureParent.getWitnessName(),
                       /*sym_visibility=*/nullptr, symbol);
 
-    // add the alias entries
-    if (closureParent.getClosureMethod() == ClosureMethod::CALL) {
+    // add the alias entries if this is not a parametric trait: Non-parametric
+    // trait always has a `_Self` parameter.
+    if (closureParent.getClosureMethod() == ClosureMethod::CALL &&
+        traitParent.getInputParams().size() == 1) {
       SmallVector<AliasDeclOp> traitAliases;
       for (AliasDeclOp alias : traitParent.getFields().getOps<AliasDeclOp>())
         traitAliases.push_back(alias);
@@ -2787,10 +2789,13 @@ static TypeConvention typeConventionOf(SharedState &shared, ParamType paramType,
 }
 
 Value ClosureEmitter::emitClosure(ASTDecl &moduleDecl, ASTDecl &nestedFnDecl,
-                                  ArrayRef<Capture> captures, TraitDeclOp trait,
-                                  Location location, bool isCopyable,
+                                  ArrayRef<Capture> captures,
+                                  ASTDecl &traitDecl, Location location,
+                                  bool isCopyable,
                                   FnTypeGeneratorType closureSig,
                                   ArrayRef<ParamDeclRefAttr> paramCaptures) {
+  TraitDeclOp trait = cast<TraitDeclOp>(traitDecl.getIfOperation());
+
   // (1) Lift the nested function into a storage struct and instantiate it.
   FnOp nestedFn = cast<FnOp>(nestedFnDecl.getIfOperation());
   FnOp parent = nestedFn->getParentOfType<FnOp>();
@@ -2916,10 +2921,26 @@ Value ClosureEmitter::emitClosure(ASTDecl &moduleDecl, ASTDecl &nestedFnDecl,
       highestCaptureConvention == TypeConvention::MemoryOnly)
     allCapturesEncodable = false;
 
-  SmallVector<ClosureParent> closureParents{
-      ClosureParent(shared, trait.bindReference({}), "__call__",
-                    ClosureMethod::CALL),
-      getMoveParent(), getDeinitableParent(), getAnyParent()};
+  SmallVector<ClosureParent> closureParents;
+  if (trait.getInputParams().size() > 1) {
+    TraitSymbolAttr boundSymbol =
+        emitter.bindParamsToClosureTraitFromSig(closureSig);
+    ParameterEvaluator evaluator =
+        *populateTraitBindingEvaluator(boundSymbol, shared);
+    auto callAlias = cast<AliasDeclOp>(
+        traitDecl.lookupInCurrentScope("__call__").front()->getIfOperation());
+    assert(callAlias.getDeclName() == "__call__");
+    closureParents.emplace_back(
+        boundSymbol,
+        cast<FnTypeGeneratorType>(evaluator.replace(callAlias.getType())),
+        callAlias.getDeclName(), ClosureMethod::CALL);
+  } else {
+    closureParents.emplace_back(shared, trait.bindReference({}), "__call__",
+                                ClosureMethod::CALL);
+  }
+  closureParents.append(
+      {getMoveParent(), getDeinitableParent(), getAnyParent()});
+
   if (isCopyable) {
     closureParents.push_back(getCopyParent());
     closureParents.push_back(getImplicitlyCopyableParent());

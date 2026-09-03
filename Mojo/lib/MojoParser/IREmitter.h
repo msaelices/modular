@@ -370,8 +370,7 @@ public:
 
   /// Bind the universal parametric closure trait's parameters to match the
   /// given function signature, returning the resulting concrete `TraitType`.
-  TraitType bindParamsToClosureTraitFromSig(const ExprNode *expr,
-                                            FnTypeGeneratorType sig);
+  TraitSymbolAttr bindParamsToClosureTraitFromSig(FnTypeGeneratorType sig);
   //===--------------------------------------------------------------------===//
   // Emission helpers for various value classifications.
 
