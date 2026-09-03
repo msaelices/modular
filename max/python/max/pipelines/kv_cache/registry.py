@@ -36,6 +36,9 @@ _JENGA_MODEL_NAME_SUBSTRINGS = (
     "gpt-oss",  # full + SWA
     "gptoss",  # same as gpt-oss
     "olmo",  # Olmo 2: full; Olmo 3: 3:1 SWA:full
+    "step-3",  # Step-3.5: full + SWA
+    "step3",  # same as step-3
+    "inkling",  # full + SWA
 )
 
 

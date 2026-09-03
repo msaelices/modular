@@ -34,6 +34,10 @@ def hybrid_swa_full_kv_params(
     n_kv_heads: int,
     head_dim: int,
     allow_kv_head_replication: bool = False,
+    sliding_n_kv_heads: int | None = None,
+    sliding_head_dim: int | None = None,
+    full_n_kv_heads: int | None = None,
+    full_head_dim: int | None = None,
 ) -> MultiKVCacheParams:
     sliding_layers = 0
     full_layers = 0
@@ -57,8 +61,10 @@ def hybrid_swa_full_kv_params(
     )
     sliding_kv_params = kv_cache_config.to_params(
         dtype=cache_dtype,
-        n_kv_heads=n_kv_heads,
-        head_dim=head_dim,
+        n_kv_heads=(
+            n_kv_heads if sliding_n_kv_heads is None else sliding_n_kv_heads
+        ),
+        head_dim=head_dim if sliding_head_dim is None else sliding_head_dim,
         num_layers=sliding_layers,
         devices=devices,
         data_parallel_degree=pipeline_config.model.data_parallel_degree,
@@ -69,8 +75,8 @@ def hybrid_swa_full_kv_params(
     )
     full_kv_params = kv_cache_config.to_params(
         dtype=cache_dtype,
-        n_kv_heads=n_kv_heads,
-        head_dim=head_dim,
+        n_kv_heads=n_kv_heads if full_n_kv_heads is None else full_n_kv_heads,
+        head_dim=head_dim if full_head_dim is None else full_head_dim,
         num_layers=full_layers,
         devices=devices,
         data_parallel_degree=pipeline_config.model.data_parallel_degree,

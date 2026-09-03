@@ -83,3 +83,50 @@ def test_hybrid_swa_full_kv_params_olmo3_pattern() -> None:
     assert full.num_layers == 8
     assert sliding.window_size == 4096
     assert full.group_id.is_full()
+
+
+def test_hybrid_swa_full_kv_params_gemma3_pattern() -> None:
+    # Pattern 6: five sliding, then one full.
+    layer_types = (["sliding_attention"] * 5 + ["full_attention"]) * 6
+    params = hybrid_swa_full_kv_params(
+        layer_types=layer_types,
+        sliding_window=1024,
+        pipeline_config=_pipeline_config(),
+        devices=[DeviceRef.CPU()],
+        kv_cache_config=KVCacheConfig(),
+        cache_dtype=DType.bfloat16,
+        n_kv_heads=4,
+        head_dim=256,
+    )
+    sliding, full = params.children.values()
+    assert isinstance(sliding, MHAKVCacheParams)
+    assert isinstance(full, MHAKVCacheParams)
+    assert sliding.num_layers == 30
+    assert full.num_layers == 6
+    assert sliding.window_size == 1024
+    assert full.window_size is None
+
+
+def test_hybrid_swa_full_kv_params_step3p5_unequal_heads() -> None:
+    layer_types = ["sliding_attention", "full_attention"] * 8
+    params = hybrid_swa_full_kv_params(
+        layer_types=layer_types,
+        sliding_window=512,
+        pipeline_config=_pipeline_config(),
+        devices=[DeviceRef.CPU()],
+        kv_cache_config=KVCacheConfig(),
+        cache_dtype=DType.bfloat16,
+        n_kv_heads=8,
+        head_dim=128,
+        sliding_n_kv_heads=16,
+        full_n_kv_heads=8,
+    )
+    sliding, full = params.children.values()
+    assert isinstance(sliding, MHAKVCacheParams)
+    assert isinstance(full, MHAKVCacheParams)
+    assert sliding.num_layers == 8
+    assert full.num_layers == 8
+    assert sliding.n_kv_heads == 16
+    assert full.n_kv_heads == 8
+    assert sliding.window_size == 512
+    assert full.window_size is None
