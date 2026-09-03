@@ -166,6 +166,11 @@ This version is still a work in progress.
   `has_sse4()`, `has_avx2()`, and friends to gate code on a specific
   instruction set.
 
+- `Hasher.update` now takes a `ImmSpan[Byte, _]` instead of
+  `Some[Hashable]`. Code such as `hasher.update(some_subobject)`
+  in `__hash__` implementations should be changed to
+  `some_subobject.__hash__(hasher)`.
+
 - `CompilationTarget` can now describe RISC-V targets: `is_riscv()`,
   `is_rv32()`, and `is_rv64()` report the architecture, and
   `has_riscv_extension["m"]()` reports a single ISA extension by its lowercase
