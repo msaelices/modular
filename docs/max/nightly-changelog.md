@@ -461,6 +461,14 @@ the [container](/container) page now links to the new page.
   now resolve on this path, folded into the handshake's `kv_config_hash`. A
   single-tenant node spanning more than one GPU must set the dKV server's
   `--fair-share-partitions` to its GPU count.
+- The dKV external KV-cache connector now waits out a busy node instead of
+  failing model load on it. dKV refuses a handshake when it has no room for
+  another share, which is a transient condition that clears once a departing
+  share's memory is released, so the refusal is now retriable and the
+  connector's admission budget (`MODULAR_DKV_ADMISSION_TIMEOUT_S`, default
+  raised from 120s to 600s) retries it. A budget too small to cover several
+  attempts is raised to that floor with a warning rather than rejected, so a
+  deployment that pinned the old default keeps starting.
 - A request's `dkv_cache_hint` now reaches the dKV external KV-cache connector,
   which reads it to load a cached prefix from the instance that holds it rather
   than only from the co-located one. The serving layer forwards the field
