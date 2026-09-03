@@ -646,9 +646,6 @@ LIT::verifyAndBuildConformance(ASTDecl &structDecl, TraitSymbolAttr parent,
 
   auto checkAlias = [&](StringAttr name, ASTDecl *traitAliasDecl,
                         AliasDeclOp traitAlias) -> LogicalResult {
-    if (traitAlias.getInheritedFrom())
-      return success();
-
     if (failed(shared.declResolver->resolveSignature(*traitAliasDecl,
                                                      structDecl.getLoc()))) {
       hadErrors = true;
@@ -837,9 +834,6 @@ LIT::verifyAndBuildConformance(ASTDecl &structDecl, TraitSymbolAttr parent,
       for (ASTDecl *decl : decls) {
         // Skip any children that aren't methods or aliases.
         if (auto traitFn = dyn_cast_or_null<FnOp>(decl->getIfOperation())) {
-          // Skip inherited methods, they're checked at a different time.
-          if (traitFn.getInheritedFrom())
-            continue;
           if (failed(checkMethod(name, decl, traitFn.getSymNameAttr(),
                                  traitFn.getFullSignature()))) {
             allMatchFound = false;
