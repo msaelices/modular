@@ -937,17 +937,8 @@ class JengaBlockManager:
         return max(num_required_blocks - num_current_blocks, 0)
 
     def _num_filled_blocks(self, ctx: TextContext) -> int:
-        """Returns how many of the request's blocks a forward has filled.
-
-        Trailing future-token placeholders count as processed positions once a
-        later forward is enqueued behind them, but nothing has written their
-        KV yet, so they do not fill a block.
-        """
-        num_realized_tokens = len(ctx.tokens) - ctx.pending_future_count
-        return (
-            min(ctx.tokens.processed_length, num_realized_tokens)
-            // self._block_size
-        )
+        """Returns how many of the request's blocks a forward has filled."""
+        return ctx.tokens.processed_length // self._block_size
 
     @traced
     def _compute_block_hashes(
