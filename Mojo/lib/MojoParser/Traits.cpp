@@ -913,15 +913,14 @@ static TraitType getDeclProvidedTrait(ASTDecl *decl) {
 /// a conformance-contributing extension of `self` is erroneous, signaling the
 /// caller that the result is unstable and must not be cached.
 ///
-/// When `details` is non-null, its `constraints` are populated with the
-/// conditional-conformance constraints behind each failing/unproven required
-/// symbol.
-static TriState
-doesNominalTypeConformToUncached(ASTDecl *self, TraitType trait,
-                                 ASTType concreteType,
-                                 ArrayRef<ConstraintAttr> callerAssumptions,
-                                 bool *sawErroneousExtension = nullptr,
-                                 ConstraintFailure *details = nullptr);
+/// When `details` is non-null, it is populated with the
+/// conditional-conformance constraints behind the verdict: those refuted, or
+/// if none was, those left unproven.
+static TriState doesNominalTypeConformToUncached(
+    ASTDecl *self, TraitType trait, ASTType concreteType,
+    ArrayRef<ConstraintAttr> callerAssumptions,
+    bool *sawErroneousExtension = nullptr,
+    SmallVectorImpl<ConstraintAttr> *details = nullptr);
 
 /// Given a decl for a struct or trait type, check if this type conforms to the
 /// specified trait type. If concreteType is provided, it is used to extract
@@ -932,9 +931,11 @@ doesNominalTypeConformToUncached(ASTDecl *self, TraitType trait,
 /// - `no` if the type definitely does not conform
 /// - `unknown` if conformance depends on constraints that cannot be evaluated
 ///   statically
-static TriState doesNominalTypeConformToCached(
-    ASTDecl *self, TraitType trait, ASTType concreteType,
-    ArrayRef<ConstraintAttr> callerAssumptions, ConstraintFailure *details) {
+static TriState
+doesNominalTypeConformToCached(ASTDecl *self, TraitType trait,
+                               ASTType concreteType,
+                               ArrayRef<ConstraintAttr> callerAssumptions,
+                               SmallVectorImpl<ConstraintAttr> *details) {
   TriState result = TriState::no();
   if (!callerAssumptions.empty()) {
     // Only the assumption-free queries are context-independent enough to
@@ -1008,20 +1009,16 @@ ASTDecl::doesNominalTypeConformTo(TraitType trait, ASTType concreteType,
 ConstraintResult ASTDecl::doesNominalTypeConformToWithDetails(
     TraitType trait, ASTType concreteType,
     ArrayRef<ConstraintAttr> callerAssumptions) {
-  ConstraintFailure details;
+  SmallVector<ConstraintAttr, 2> details;
   TriState result = doesNominalTypeConformToCached(this, trait, concreteType,
                                                    callerAssumptions, &details);
-  if (result.isTrue())
-    return ConstraintResult::yes();
-  if (result.isFalse())
-    return ConstraintResult::no(std::move(details.failedConstraints));
-  return ConstraintResult::unknown(std::move(details.unprovenConstraints));
+  return makeConstraintResult(result, std::move(details));
 }
 
 static TriState doesNominalTypeConformToUncached(
     ASTDecl *self, TraitType trait, ASTType concreteType,
     ArrayRef<ConstraintAttr> callerAssumptions, bool *sawErroneousExtension,
-    ConstraintFailure *details) {
+    SmallVectorImpl<ConstraintAttr> *details) {
   SharedState &shared = self->getShared();
 
   // Clear so an early return leaves no stale constraints behind.
@@ -1150,11 +1147,12 @@ static TriState doesNominalTypeConformToUncached(
       });
   SmallVector<TypedAttr> scratch;
 
-  // With `details`, bucket every failed/unproven provider constraint and
+  // With `details`, collect every provider constraint behind the verdict and
   // dedupe on (loc, proposition) so derived/ancestor copies of the same
   // `where` clause emit once. Cold path.
   const bool collectAll = details != nullptr;
   DenseSet<std::pair<LocationAttr, Attribute>> seenConstraints;
+  TriState result = TriState::yes();
   auto recordFailure = [&](TraitSymbolAttr required, TriState kind) {
     if (!collectAll)
       return;
@@ -1164,17 +1162,24 @@ static TriState doesNominalTypeConformToUncached(
     // conditionally); the primary "does not conform" diagnostic covers that.
     if (!constraint || isTriviallyTrueConstraint(constraint))
       return;
+    // Update the details based on the new failure kind.
+    if (kind.isFalse() && !result.isFalse()) {
+      // If the result is not false, we're seeing false for the first time.
+      // Clear the details since it currently contains unproven constraints,
+      // which no longer matter.
+      details->clear();
+      seenConstraints.clear();
+    } else if (result.isFalse() && kind.isUnknown()) {
+      // If the result is already false and we're only seeing unknown, ignore.
+      return;
+    }
     if (!seenConstraints
              .insert({constraint.getLoc(), constraint.getProposition()})
              .second)
       return;
-    if (kind.isFalse())
-      details->failedConstraints.push_back(constraint);
-    else
-      details->unprovenConstraints.push_back(constraint);
+    details->push_back(constraint);
   };
 
-  TriState result = TriState::yes();
   for (auto [i, required] : llvm::enumerate(trait.getSymbols())) {
     // Assume each requirement's own condition while checking it. Remember that
     // an empty constraints array means every requirement is unconditional.

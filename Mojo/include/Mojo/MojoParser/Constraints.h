@@ -44,30 +44,17 @@ class DeclResolver;
 class MojoInflightDiag;
 class SharedState;
 
-/// Failed and/or unproven conditional-conformance constraints from a check, for
-/// diagnostic notes. Populated today by nominal conformance queries.
-struct ConstraintFailure {
-  /// Constraints that evaluated to false.
-  SmallVector<ConstraintAttr, 2> failedConstraints;
-
-  /// Constraints that could not be proven.
-  SmallVector<ConstraintAttr, 2> unprovenConstraints;
-
-  void clear() {
-    failedConstraints.clear();
-    unprovenConstraints.clear();
-  }
-
-  /// Add a note per captured constraint ("failed"/"unproven constraint"). No-op
-  /// if empty.
-  void attachNotes(MojoInflightDiag &diag) const;
-};
-
 /// A TriResult that carries the problematic constraints with it: the ones that
 /// were refuted on a `no`, the ones that could not be proven on an `unknown`. A
 /// `yes` carries nothing, having no problem to explain.
 using ConstraintResult = TriResult<void, SmallVector<ConstraintAttr, 2>,
                                    SmallVector<ConstraintAttr, 2>>;
+
+/// Pair a verdict with the constraints behind it. A `yes` has nothing to
+/// explain, so `constraints` is dropped there.
+ConstraintResult
+makeConstraintResult(TriState verdict,
+                     SmallVector<ConstraintAttr, 2> constraints);
 
 /// Attach one note per constraint, each labeled `kind` ("failed"/"unproven")
 /// and carrying the constraint's user message when it has one.

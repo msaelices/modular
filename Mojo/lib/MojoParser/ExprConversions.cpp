@@ -1940,11 +1940,7 @@ FailureOr<ConstraintResult> IREmitter::canMetaTypeUpCastToWithDetails(
                               scopeDependent, &unsatConstraints);
   if (failed(verdict))
     return failure();
-  if (verdict->isTrue())
-    return ConstraintResult::yes();
-  if (verdict->isFalse())
-    return ConstraintResult::no(std::move(unsatConstraints));
-  return ConstraintResult::unknown(std::move(unsatConstraints));
+  return makeConstraintResult(*verdict, std::move(unsatConstraints));
 }
 
 //===----------------------------------------------------------------------===//

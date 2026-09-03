@@ -39,7 +39,6 @@ class DocStringAttr;
 class DocString;
 class TraitDeclOp;
 class TraitType;
-struct ConstraintFailure;
 
 // TODO(MOCO-4712): This should just be a CValue variant, we should
 // simplify how trait witness are created in general, then it should be merged

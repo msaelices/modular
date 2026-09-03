@@ -31,6 +31,16 @@ using namespace M;
 using namespace M::KGEN;
 using namespace M::KGEN::LIT;
 
+ConstraintResult
+LIT::makeConstraintResult(TriState verdict,
+                          SmallVector<ConstraintAttr, 2> constraints) {
+  if (verdict.isTrue())
+    return ConstraintResult::yes();
+  if (verdict.isFalse())
+    return ConstraintResult::no(std::move(constraints));
+  return ConstraintResult::unknown(std::move(constraints));
+}
+
 void LIT::attachConstraintNotes(MojoInflightDiag &diag,
                                 ArrayRef<ConstraintAttr> constraints,
                                 StringRef kind) {
@@ -47,11 +57,6 @@ void LIT::attachConstraintNotes(MojoInflightDiag &diag,
     attachConstraintNotes(diag, result.getNo(), "failed");
   else if (result.isUnknown())
     attachConstraintNotes(diag, result.getUnknown(), "unproven");
-}
-
-void ConstraintFailure::attachNotes(MojoInflightDiag &diag) const {
-  LIT::attachConstraintNotes(diag, failedConstraints, "failed");
-  LIT::attachConstraintNotes(diag, unprovenConstraints, "unproven");
 }
 
 /// Emit a note explaining why a constraint is inconclusive. The incoming
