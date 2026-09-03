@@ -919,7 +919,10 @@ struct List[T: AnyType, /](
     # FIXME: This annotation is needed to support List[Span[x, o]] types with
     # mutable origins.
     @__unsafe_nested_origins_read_only
-    def append(mut self, var value: Self.T) where conforms_to(Self.T, Movable):
+    @stable(since="1.1")
+    def append(
+        mut self, var value: Self.T, /
+    ) where conforms_to(Self.T, Movable):
         """Appends a value to this list.
 
         Args:

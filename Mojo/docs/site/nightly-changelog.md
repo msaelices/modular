@@ -124,6 +124,8 @@ This version is still a work in progress.
   - `def __init__(out self):`
   - `def __init__(out self, *, capacity_bytes: Int):`
   - `def reserve_bytes(mut self, new_capacity_bytes: Int, /):`
+- List
+  - `def append(mut self, var value: Self.T, /):`
 
 ## Library performance improvements
 
