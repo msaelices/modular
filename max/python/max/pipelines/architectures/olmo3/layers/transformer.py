@@ -11,40 +11,37 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-"""Implements the GPT OSS transformer block."""
+"""Olmo3 transformer block (experimental KV types)."""
 
 from __future__ import annotations
 
+from max.experimental import functional as F
 from max.experimental.nn import Module
 from max.experimental.nn.common_layers.kv_cache import PagedCacheValues
+from max.experimental.nn.common_layers.mlp import MLP
 from max.experimental.nn.norm import RMSNorm
 from max.experimental.tensor import Tensor
 
-from .attention import GptOssAttention
-from .moe import GptOssMoE
 
-
-class GptOssTransformerBlock(Module[..., Tensor]):
-    """Stack of Attention, MoE, and RMSNorm layers for GPT OSS.
-
-    This is a distributed transformer block that uses a Mixture of Experts (MoE)
-    layer instead of a standard feedforward network.
-    Block's attention type (full or window) is specified in the model config.
-    """
+class Olmo3TransformerBlock(
+    Module[[Tensor, Tensor, PagedCacheValues, Tensor], Tensor]
+):
+    """Post-norm Attention -> Norm -> MLP -> Norm block for Olmo3."""
 
     def __init__(
         self,
-        attention: GptOssAttention,
-        mlp: GptOssMoE,
-        input_layernorm: RMSNorm,
+        attention: Module[[Tensor, PagedCacheValues, Tensor], Tensor],
+        mlp: MLP,
         post_attention_layernorm: RMSNorm,
+        post_feedforward_layernorm: RMSNorm,
+        residual_multiplier: float = 1.0,
     ) -> None:
         super().__init__()
         self.self_attn = attention
         self.mlp = mlp
-
-        self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
+        self.post_feedforward_layernorm = post_feedforward_layernorm
+        self.residual_multiplier = residual_multiplier
 
     def forward(
         self,
@@ -52,27 +49,30 @@ class GptOssTransformerBlock(Module[..., Tensor]):
         x: Tensor,
         kv_collection: PagedCacheValues,
         input_row_offsets: Tensor,
-        **kwargs,
     ) -> Tensor:
-        residual = x
-        norm_xs = self.input_layernorm(x)
         attn_out = self.self_attn(
-            norm_xs,
+            x,
             kv_collection,
-            input_row_offsets=input_row_offsets,
-            **kwargs,
+            input_row_offsets,
         )
+        attn_out = self.post_attention_layernorm(attn_out)
 
-        # Add residual connection after attention
-        hidden_states = residual + attn_out
+        if self.residual_multiplier != 1.0:
+            multiplier = F.constant(
+                self.residual_multiplier, x.dtype, device=x.device
+            )
+            attn_out = attn_out * multiplier
 
-        # Apply post-attention layer norm and then MoE
-        residual = hidden_states
-        norm_xs = self.post_attention_layernorm(hidden_states)
+        h = x + attn_out
+        residual = h
 
-        # Apply MoE - it returns (output, router_logits)
-        mlp_outputs = self.mlp(norm_xs)
+        mlp_out = self.mlp(h)
+        mlp_out = self.post_feedforward_layernorm(mlp_out)
 
-        # Add residual connection
-        hidden_states = residual + mlp_outputs
-        return hidden_states
+        if self.residual_multiplier != 1.0:
+            multiplier = F.constant(
+                self.residual_multiplier, x.dtype, device=x.device
+            )
+            mlp_out = mlp_out * multiplier
+
+        return mlp_out + residual
