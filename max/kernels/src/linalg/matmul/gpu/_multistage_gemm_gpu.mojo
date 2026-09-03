@@ -909,7 +909,7 @@ def multistage_gemm_kernel[
     var warp_col = Int(block_idx_swizzle[0]) * BN + Int(warp_x) * WN
     comptime store_vec_rows = 1 if is_nvidia_gpu() else 4
     var c_tile_in_range = (
-        warp_row < M and warp_col + WN <= N and M % store_vec_rows == 0
+        warp_row + WM <= M and warp_col + WN <= N and M % store_vec_rows == 0
     )
 
     @always_inline
