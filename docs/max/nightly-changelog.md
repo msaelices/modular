@@ -1150,6 +1150,14 @@ the [container](/container) page now links to the new page.
   now comes back as a structured `tool_calls` entry. Parsing runs whenever the
   model has a tool parser configured; `tool_choice="none"` still opts out.
 
+- Fixed `max-debug.source-tracebacks` (for example
+  `MODULAR_DEBUG=source-tracebacks` or
+  `Graph.debug.source_tracebacks = True`) being silently ignored when it
+  was enabled after `max.graph` was first imported. The flag was cached at
+  import time, so runtime error messages lacked the `Source Traceback`
+  section pointing back at the Python code that built the failing op, even
+  though the config reported the feature as enabled.
+
 - Fixed the `disk_bytes_written` KV cache metric counting blocks the tiered
   connector's disk tier declined to write because they were already saved or
   had a write pending. Re-offloading a block that had been evicted from the
