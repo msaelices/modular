@@ -1241,7 +1241,16 @@ def multistage_gemm_split_k_kernel[
             work_space_type,
             transpose_b,
             k_partition_config,
-        ].run(ws_tt, a_amd, b_amd)
+        ].run[
+            type_of(ws_tt).LayoutType,
+            type_of(a_amd).LayoutType,
+            type_of(b_amd).LayoutType,
+            type_of(ws_tt).Engine,
+            type_of(a_amd).Engine,
+            type_of(b_amd).Engine,
+        ](
+            ws_tt, a_amd, b_amd
+        )
 
     else:
         # If K is not divisible by num_partitions, the first
