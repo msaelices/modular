@@ -25,7 +25,7 @@
 #include "Mojo/MojoParser/Constraints.h"
 #include "Mojo/MojoParser/IRValues.h"
 #include "Mojo/MojoParser/SharedState.h"
-#include "Mojo/Support/TriState.h"
+#include "Mojo/Support/TriBool.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/SMLoc.h"
@@ -178,13 +178,13 @@ public:
   /// `declScope` supplies the `where` assumptions used to discharge generator
   /// body constraints; `additionalAssumptions` are extra facts to consider
   /// alongside it.
-  static TriState
+  static TriBool
   canZeroCostConvert(ASTType fromType, ASTType toType, SharedState &shared,
                      ASTDecl &declScope,
                      ArrayRef<ConstraintAttr> additionalAssumptions = {});
 
   /// Same as the above, using this emitter's shared state and scope.
-  TriState
+  TriBool
   canZeroCostConvert(ASTType fromType, ASTType toType,
                      ArrayRef<ConstraintAttr> additionalAssumptions = {}) {
     return canZeroCostConvert(fromType, toType, shared, declScope,
@@ -206,10 +206,11 @@ public:
   // scope with a different assumption set, so callers that memoize keyed on the
   // type pair must not cache a scope-dependent verdict.
 
-  static FailureOr<TriState>
-  canMetaTypeUpCastTo(SharedState &shared, SMLoc loc, ASTType fromType,
-                      ASTType toType, ASTDecl *declScope,
-                      bool *scopeDependent = nullptr);
+  static FailureOr<TriBool> canMetaTypeUpCastTo(SharedState &shared, SMLoc loc,
+                                                ASTType fromType,
+                                                ASTType toType,
+                                                ASTDecl *declScope,
+                                                bool *scopeDependent = nullptr);
 
   /// Same, additionally collecting the problematic constraints so a diagnosing
   /// caller can name them. An upcast to a trait is decided by a conformance
@@ -394,7 +395,7 @@ public:
   /// When `deferralCtx` is non-null and the only obstacle to the conversion is
   /// an unprovable (`unknown`) trait conformance, the conversion is
   /// reported as convertible (and not cached since it's context-dependent).
-  static TriState classifyImplicitConversion(
+  static TriBool classifyImplicitConversion(
       ASTExprAnd<CValue> value, ASTType requiredType, ASTDecl &declScope,
       ArrayRef<ConstraintAttr> additionalAssumptions = {},
       DeferredTypingContext *deferralCtx = nullptr);
@@ -420,7 +421,7 @@ public:
       ASTExprAnd<CValue> value, ASTType requiredType, ASTDecl &declScope,
       ArrayRef<ConstraintAttr> additionalAssumptions = {},
       DeferredTypingContext *deferralCtx = nullptr) {
-    TriState verdict = classifyImplicitConversion(
+    TriBool verdict = classifyImplicitConversion(
         value, requiredType, declScope, additionalAssumptions, deferralCtx);
     if (verdict.isUnknown())
       return deferralCtx != nullptr;

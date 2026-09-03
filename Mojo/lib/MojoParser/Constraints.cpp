@@ -32,7 +32,7 @@ using namespace M::KGEN;
 using namespace M::KGEN::LIT;
 
 ConstraintResult
-LIT::makeConstraintResult(TriState verdict,
+LIT::makeConstraintResult(TriBool verdict,
                           SmallVector<ConstraintAttr, 2> constraints) {
   if (verdict.isTrue())
     return ConstraintResult::yes();
@@ -90,7 +90,7 @@ void LIT::emitConstraintInconclusive(DeclResolver &resolver,
   });
 }
 
-TriState LIT::canDischargeConstraintsInScope(
+TriBool LIT::canDischargeConstraintsInScope(
     ASTDecl &declScope, PogListAttr paramListAttr,
     ArrayRef<ConstraintAttr> constraints,
     ArrayRef<ConstraintAttr> origConstraints,
@@ -100,7 +100,7 @@ TriState LIT::canDischargeConstraintsInScope(
     ArrayRef<ConstraintAttr> additionalAssumptions,
     llvm::BitVector *provenConstraints) {
   if (constraints.empty())
-    return TriState::yes();
+    return TriBool::yes();
 
   SmallVector<ConstraintAttr> assumptions;
   declScope.getKnownAssumptionsIncludingParents(assumptions);
@@ -126,8 +126,7 @@ TriState LIT::canDischargeConstraintsInScope(
 
     // If assumptions imply the constraint, skip it; if they contradict it,
     // treat it as violated.
-    TriState result =
-        isPropositionImplied(canonProp, overallAssumptionOperands);
+    TriBool result = isPropositionImplied(canonProp, overallAssumptionOperands);
     if (result.isTrue()) {
       if (provenConstraints)
         provenConstraints->set(idx);
@@ -165,7 +164,7 @@ TriState LIT::canDischargeConstraintsInScope(
         diag << ": " << message.getValue();
     }
 
-    return TriState::no();
+    return TriBool::no();
   }
 
   if (!localUnprovableConstraints.empty()) {
@@ -173,10 +172,10 @@ TriState LIT::canDischargeConstraintsInScope(
     if (unprovableConstraints)
       unprovableConstraints->append(localUnprovableConstraints.begin(),
                                     localUnprovableConstraints.end());
-    return TriState::unknown();
+    return TriBool::unknown();
   }
 
-  return TriState::yes();
+  return TriBool::yes();
 }
 
 /// Rewrite cond(a, b, a) patterns to and(a, b) for constraint propositions.

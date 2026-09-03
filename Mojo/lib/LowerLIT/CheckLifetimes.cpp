@@ -550,7 +550,7 @@ SpecialMemberInfo TypeDeclInfo::getDestructorForType(Type type, FnOp fnContext,
   // constraint of Deinitable (if any).
   //
   // Returns nullopt if the trait isn't in the composition at all.
-  auto isTypeDeinitable = [&](StructInfo info, Type structType) -> TriState {
+  auto isTypeDeinitable = [&](StructInfo info, Type structType) -> TriBool {
     TraitType canonTrait = info.decl.getCanonicalTrait();
     ArrayRef<TraitSymbolAttr> symbols = canonTrait.getSymbols();
     ArrayRef<ConstraintAttr> constraints = canonTrait.getConstraints();
@@ -558,7 +558,7 @@ SpecialMemberInfo TypeDeclInfo::getDestructorForType(Type type, FnOp fnContext,
       if (symbol.getSymbol().getLeafReference() != "Deinitable")
         continue;
       if (i >= constraints.size())
-        return TriState::yes(); // Unconditional conformance.
+        return TriBool::yes(); // Unconditional conformance.
 
       auto actualStructType = sugarCast<LIT::StructType>(structType);
       ParameterEvaluator evaluator(info.decl.getParams(),
@@ -578,7 +578,7 @@ SpecialMemberInfo TypeDeclInfo::getDestructorForType(Type type, FnOp fnContext,
 
       return isPropositionImplied(conformanceCondition, overallAssumption);
     }
-    return TriState::no();
+    return TriBool::no();
   };
 
   auto getDestructor = [&](StructInfo info) -> SpecialMemberInfo {
@@ -586,7 +586,7 @@ SpecialMemberInfo TypeDeclInfo::getDestructorForType(Type type, FnOp fnContext,
     // Determine conformance to Deinitable via the declared trait bound
     // of the struct type. This info is always available (in both LSP & normal
     // compile).
-    TriState isDeinitable = isTypeDeinitable(info, type);
+    TriBool isDeinitable = isTypeDeinitable(info, type);
 
     // - If the conformance condition is provably False, the type is NOT
     // Deinitable.

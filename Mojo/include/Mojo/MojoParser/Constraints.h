@@ -21,8 +21,8 @@
 #define KGEN_MOJOPARSER_CONSTRAINTS_H
 
 #include "Mojo/LITDialect/LITAttrs.h"
+#include "Mojo/Support/TriBool.h"
 #include "Mojo/Support/TriResult.h"
-#include "Mojo/Support/TriState.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -53,7 +53,7 @@ using ConstraintResult = TriResult<void, SmallVector<ConstraintAttr, 2>,
 /// Pair a verdict with the constraints behind it. A `yes` has nothing to
 /// explain, so `constraints` is dropped there.
 ConstraintResult
-makeConstraintResult(TriState verdict,
+makeConstraintResult(TriBool verdict,
                      SmallVector<ConstraintAttr, 2> constraints);
 
 /// Attach one note per constraint, each labeled `kind` ("failed"/"unproven")
@@ -86,7 +86,7 @@ void emitConstraintInconclusive(DeclResolver &resolver, MojoInflightDiag &diag,
 /// has a bit set per constraint the assumptions proved, letting a caller that
 /// needs per-constraint verdicts read them off this one pass instead of
 /// re-checking each constraint on its own.
-TriState canDischargeConstraintsInScope(
+TriBool canDischargeConstraintsInScope(
     ASTDecl &declScope, PogListAttr paramListAttr,
     ArrayRef<ConstraintAttr> constraints,
     ArrayRef<ConstraintAttr> origConstraints,

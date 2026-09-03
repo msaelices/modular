@@ -916,7 +916,7 @@ static TraitType getDeclProvidedTrait(ASTDecl *decl) {
 /// When `details` is non-null, it is populated with the
 /// conditional-conformance constraints behind the verdict: those refuted, or
 /// if none was, those left unproven.
-static TriState doesNominalTypeConformToUncached(
+static TriBool doesNominalTypeConformToUncached(
     ASTDecl *self, TraitType trait, ASTType concreteType,
     ArrayRef<ConstraintAttr> callerAssumptions,
     bool *sawErroneousExtension = nullptr,
@@ -931,12 +931,12 @@ static TriState doesNominalTypeConformToUncached(
 /// - `no` if the type definitely does not conform
 /// - `unknown` if conformance depends on constraints that cannot be evaluated
 ///   statically
-static TriState
+static TriBool
 doesNominalTypeConformToCached(ASTDecl *self, TraitType trait,
                                ASTType concreteType,
                                ArrayRef<ConstraintAttr> callerAssumptions,
                                SmallVectorImpl<ConstraintAttr> *details) {
-  TriState result = TriState::no();
+  TriBool result = TriBool::no();
   if (!callerAssumptions.empty()) {
     // Only the assumption-free queries are context-independent enough to
     // memoize; where-clause assumptions make the result caller-dependent, so
@@ -965,7 +965,7 @@ doesNominalTypeConformToCached(ASTDecl *self, TraitType trait,
       if (conforms.has_value() && (!details || *conforms)) {
         if (details)
           details->clear();
-        return TriState::fromBool(*conforms);
+        return TriBool::fromBool(*conforms);
       }
     }
 
@@ -999,7 +999,7 @@ doesNominalTypeConformToCached(ASTDecl *self, TraitType trait,
   return result;
 }
 
-TriState
+TriBool
 ASTDecl::doesNominalTypeConformTo(TraitType trait, ASTType concreteType,
                                   ArrayRef<ConstraintAttr> callerAssumptions) {
   return doesNominalTypeConformToCached(this, trait, concreteType,
@@ -1010,12 +1010,12 @@ ConstraintResult ASTDecl::doesNominalTypeConformToWithDetails(
     TraitType trait, ASTType concreteType,
     ArrayRef<ConstraintAttr> callerAssumptions) {
   SmallVector<ConstraintAttr, 2> details;
-  TriState result = doesNominalTypeConformToCached(this, trait, concreteType,
-                                                   callerAssumptions, &details);
+  TriBool result = doesNominalTypeConformToCached(this, trait, concreteType,
+                                                  callerAssumptions, &details);
   return makeConstraintResult(result, std::move(details));
 }
 
-static TriState doesNominalTypeConformToUncached(
+static TriBool doesNominalTypeConformToUncached(
     ASTDecl *self, TraitType trait, ASTType concreteType,
     ArrayRef<ConstraintAttr> callerAssumptions, bool *sawErroneousExtension,
     SmallVectorImpl<ConstraintAttr> *details) {
@@ -1028,7 +1028,7 @@ static TriState doesNominalTypeConformToUncached(
   // We only need trait symbol to verify trait conformance, not the resolved
   // witness table.
   if (failed(shared.declResolver->resolveSignature(*self, self->getLoc())))
-    return TriState::no(); // Error emitted.
+    return TriBool::no(); // Error emitted.
 
   // `where` clauses with messages only live on struct conformance lists, so
   // only a struct can supply diagnostic witnesses.
@@ -1060,7 +1060,7 @@ static TriState doesNominalTypeConformToUncached(
   TraitType providedCanonTrait = TraitType::get(
       self->getContext(), providedSymbols, declProvidedTrait.getConstraints());
   if (providedCanonTrait == trait)
-    return TriState::yes();
+    return TriBool::yes();
 
   ArrayRef<TraitSymbolAttr> providedSymbolsArr =
       providedCanonTrait.getSymbols();
@@ -1152,8 +1152,8 @@ static TriState doesNominalTypeConformToUncached(
   // `where` clause emit once. Cold path.
   const bool collectAll = details != nullptr;
   DenseSet<std::pair<LocationAttr, Attribute>> seenConstraints;
-  TriState result = TriState::yes();
-  auto recordFailure = [&](TraitSymbolAttr required, TriState kind) {
+  TriBool result = TriBool::yes();
+  auto recordFailure = [&](TraitSymbolAttr required, TriBool kind) {
     if (!collectAll)
       return;
     assert(kind.isFalse() || kind.isUnknown());
@@ -1195,19 +1195,18 @@ static TriState doesNominalTypeConformToUncached(
     }
 
     auto it = providedConditions.find(required);
-    TriState provided =
-        it == providedConditions.end() ? TriState::no()
-        : (!it->second || isTriviallyTrueProposition(it->second))
-            ? TriState::yes()
-            : isPropositionImplied(it->second, assumptions);
+    TriBool provided = it == providedConditions.end() ? TriBool::no()
+                       : (!it->second || isTriviallyTrueProposition(it->second))
+                           ? TriBool::yes()
+                           : isPropositionImplied(it->second, assumptions);
 
     if (provided.isTrue())
       continue; // Symbol is definitely provided.
 
     if (provided.isUnknown()) {
       // Symbol is conditionally provided but its constraint is unproven.
-      recordFailure(required, TriState::unknown());
-      result &= TriState::unknown();
+      recordFailure(required, TriBool::unknown());
+      result &= TriBool::unknown();
       continue;
     }
 
@@ -1227,23 +1226,23 @@ static TriState doesNominalTypeConformToUncached(
                 assumptions)
                 .isTrue())
           continue;
-        recordFailure(required, TriState::unknown());
-        result &= TriState::unknown();
+        recordFailure(required, TriBool::unknown());
+        result &= TriBool::unknown();
         // Not a pure short-circuit: a later refuted symbol can still fold this
         // to `no`. Bailing here trades that refinement away for the early exit,
         // which is safe only because `unknown` is the conservative answer.
         // TODO: fold both paths the same way and delete this exit.
         if (!collectAll)
-          return TriState::unknown();
+          return TriBool::unknown();
         continue;
       }
     }
-    recordFailure(required, TriState::no());
-    result &= TriState::no();
+    recordFailure(required, TriBool::no());
+    result &= TriBool::no();
     // `no` is a definitive answer, so early exiting here is safe.
     // Collecting details keeps going only to name every failing symbol.
     if (!collectAll)
-      return TriState::no();
+      return TriBool::no();
   }
 
   // All required symbols are present (proven `yes`), or `result` already folded
