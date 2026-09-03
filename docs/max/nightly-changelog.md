@@ -1112,9 +1112,7 @@ the [container](/container) page now links to the new page.
 
 - `DeviceGraphBuilder.add_function[kernel](*args, ...)` takes a thin
   function pointer (`func: def(...) thin -> None`), the same identity as
-  `DeviceContext.compile_function[kernel]()`. The capturing compile-and-add
-  overloads are removed; capturing kernels use
-  `DeviceContext.enqueue_function()` or `recording_context()`.
+  `DeviceContext.compile_function[kernel]()`.
 
 - `PipelineRegistry.retrieve_factory` now returns a `RetrievedPipeline`
   dataclass with `tokenizer`, `factory`, and `memory_plan` fields instead of
