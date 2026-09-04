@@ -1179,6 +1179,14 @@ the [container](/container) page now links to the new page.
   batch` when requests in one batch finish on different steps, which happens
   whenever they are given different `max_new_tokens`.
 
+- Fixed the offline `generate()` and `generate_async()` APIs releasing only a
+  finished request's KV cache blocks, and never the pipeline itself. The
+  pipeline-level release is what frees a recurrent state pool slot and drops a
+  request's vision encoder cache references, so architectures that carry
+  recurrent state — such as Nemotron-H, Mamba, and LFM2 — leaked one state slot
+  per request, and a second run in the same process could inherit the first
+  run's slot and return different greedy tokens.
+
 - Fixed `DeviceExternalFunction` crashing on Metal instead of launching, so
   separately compiled kernels now load and launch there as they already did on
   other GPU backends.
