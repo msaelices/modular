@@ -829,7 +829,7 @@ index d68479f..360396f 100644
    XGRAMMAR_CHECK(!IsStopTokenAccepted())
        << "GrammarMatcher has terminated after accepting the stop token, but is trying to "
 diff --git a/cpp/json_schema_converter.cc b/cpp/json_schema_converter.cc
-index da8b516..a001b1c 100644
+index da8b516..e4758a8 100644
 --- a/cpp/json_schema_converter.cc
 +++ b/cpp/json_schema_converter.cc
 @@ -5,15 +5,20 @@
@@ -1728,15 +1728,15 @@ index da8b516..a001b1c 100644
 +
 +// A local reference is "#" or a JSON Pointer fragment. RFC 6901 evaluates a
 +// fragment once it is percent-decoded, so "#%2F$defs%2Fx" names the same place
-+// as "#/$defs/x" and the decoded text is what decides. Upstream read the
-+// fragment raw, so permissive mode keeps reading it raw and only the stricter
-+// mode gains the escape handling.
++// as "#/$defs/x" and the decoded text is what decides. The fragment is decoded
++// before evaluation in both modes; decode_escapes gates only whether a
++// malformed escape is reported or left to a best-effort not-found.
 +static bool IsLocalPointerUri(const std::string& uri, bool decode_escapes) {
 +  if (uri.empty() || uri[0] != '#') return false;
 +  std::string path = uri.substr(1);
 +  // A malformed escape is still a local reference. Saying otherwise would
 +  // report it as a foreign URI instead of as the bad escape it is.
-+  if (decode_escapes && !DecodePercentEncoded(&path)) return true;
++  if (!DecodePercentEncoded(&path) && decode_escapes) return true;
 +  return path.empty() || path[0] == '/';
 +}
 +
@@ -1815,7 +1815,7 @@ index da8b516..a001b1c 100644
 +  if (!IsLocalPointerUri(uri, decode_escapes)) return {LocalPointerStatus::kNotFound, nullptr};
 +  const picojson::value* current = &root;
 +  std::string path = uri.substr(1);
-+  if (decode_escapes && !DecodePercentEncoded(&path)) {
++  if (!DecodePercentEncoded(&path) && decode_escapes) {
 +    return {LocalPointerStatus::kMalformedPercentEscape, nullptr};
 +  }
 +  for (size_t start = 0; start < path.size();) {
@@ -2167,7 +2167,7 @@ index da8b516..a001b1c 100644
  }
 
  Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
-@@ -262,7 +1431,16 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
+@@ -262,7 +1437,16 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
      const std::string& rule_name_hint,
      std::optional<std::string> default_type
  ) {
@@ -2184,7 +2184,7 @@ index da8b516..a001b1c 100644
    if (schema_cache_.count(cache_key)) {
      return ResultOk(schema_cache_[cache_key]);
    }
-@@ -286,9 +1464,102 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
+@@ -286,9 +1470,102 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
    }
 
    const auto& schema_obj = schema.get<picojson::object>();
@@ -2290,7 +2290,7 @@ index da8b516..a001b1c 100644
 
    SchemaSpecPtr result;
 
-@@ -305,10 +1576,24 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
+@@ -305,10 +1582,24 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
      auto enum_result = ParseEnum(schema_obj);
      if (enum_result.IsErr()) return ResultErr(std::move(enum_result).UnwrapErr());
      result = SchemaSpec::Make(std::move(enum_result).Unwrap(), cache_key, rule_name_hint);
@@ -2317,7 +2317,7 @@ index da8b516..a001b1c 100644
    } else if (schema_obj.count("allOf")) {
      auto allof_result = ParseAllOf(schema_obj);
      if (allof_result.IsErr()) return ResultErr(std::move(allof_result).UnwrapErr());
-@@ -358,18 +1643,93 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
+@@ -358,18 +1649,93 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
          );
        }
      }
@@ -2422,7 +2422,7 @@ index da8b516..a001b1c 100644
    }
 
    schema_cache_[cache_key] = result;
-@@ -377,7 +1737,9 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
+@@ -377,7 +1743,9 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
  }
 
  Result<IntegerSpec, SchemaError> SchemaParser::ParseInteger(const picojson::object& schema) {
@@ -2433,7 +2433,7 @@ index da8b516..a001b1c 100644
    IntegerSpec spec;
 
    auto checkAndConvertIntegerBound = [](const picojson::value& value
-@@ -462,14 +1824,24 @@ Result<IntegerSpec, SchemaError> SchemaParser::ParseInteger(const picojson::obje
+@@ -462,14 +1830,24 @@ Result<IntegerSpec, SchemaError> SchemaParser::ParseInteger(const picojson::obje
  }
 
  Result<NumberSpec, SchemaError> SchemaParser::ParseNumber(const picojson::object& schema) {
@@ -2461,7 +2461,7 @@ index da8b516..a001b1c 100644
    };
 
    if (schema.count("minimum")) {
-@@ -521,17 +1893,53 @@ Result<NumberSpec, SchemaError> SchemaParser::ParseNumber(const picojson::object
+@@ -521,17 +1899,53 @@ Result<NumberSpec, SchemaError> SchemaParser::ParseNumber(const picojson::object
    return ResultOk(std::move(spec));
  }
 
@@ -2518,7 +2518,7 @@ index da8b516..a001b1c 100644
    }
    if (schema.count("maxLength")) {
      if (!schema.at("maxLength").is<int64_t>()) {
-@@ -539,7 +1947,14 @@ Result<StringSpec, SchemaError> SchemaParser::ParseString(const picojson::object
+@@ -539,7 +1953,14 @@ Result<StringSpec, SchemaError> SchemaParser::ParseString(const picojson::object
            SchemaErrorType::kInvalidSchema, "maxLength must be an integer"
        );
      }
@@ -2534,7 +2534,7 @@ index da8b516..a001b1c 100644
    }
    if (spec.max_length != -1 && spec.min_length > spec.max_length) {
      return ResultErr<SchemaError>(
-@@ -548,9 +1963,80 @@ Result<StringSpec, SchemaError> SchemaParser::ParseString(const picojson::object
+@@ -548,9 +1969,80 @@ Result<StringSpec, SchemaError> SchemaParser::ParseString(const picojson::object
              std::to_string(spec.max_length)
      );
    }
@@ -2615,7 +2615,7 @@ index da8b516..a001b1c 100644
  Result<BooleanSpec, SchemaError> SchemaParser::ParseBoolean(const picojson::object&) {
    return ResultOk(BooleanSpec{});
  }
-@@ -560,7 +2046,18 @@ Result<NullSpec, SchemaError> SchemaParser::ParseNull(const picojson::object&) {
+@@ -560,7 +2052,18 @@ Result<NullSpec, SchemaError> SchemaParser::ParseNull(const picojson::object&) {
  }
 
  Result<ArraySpec, SchemaError> SchemaParser::ParseArray(const picojson::object& schema) {
@@ -2635,7 +2635,7 @@ index da8b516..a001b1c 100644
    ArraySpec spec;
 
    if (schema.count("prefixItems")) {
-@@ -615,7 +2112,12 @@ Result<ArraySpec, SchemaError> SchemaParser::ParseArray(const picojson::object&
+@@ -615,7 +2118,12 @@ Result<ArraySpec, SchemaError> SchemaParser::ParseArray(const picojson::object&
        if (items_result.IsErr()) return ResultErr(std::move(items_result).UnwrapErr());
        spec.additional_items = std::move(items_result).Unwrap();
      }
@@ -2649,7 +2649,7 @@ index da8b516..a001b1c 100644
      spec.allow_additional_items = true;
      spec.additional_items = SchemaSpec::Make(AnySpec{}, "", "any");
    } else {
-@@ -681,8 +2183,49 @@ Result<ArraySpec, SchemaError> SchemaParser::ParseArray(const picojson::object&
+@@ -681,8 +2189,49 @@ Result<ArraySpec, SchemaError> SchemaParser::ParseArray(const picojson::object&
    return ResultOk(std::move(spec));
  }
 
@@ -2699,7 +2699,7 @@ index da8b516..a001b1c 100644
 
    if (schema.count("properties")) {
      if (!schema.at("properties").is<picojson::object>()) {
-@@ -692,7 +2235,29 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
+@@ -692,7 +2241,29 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
      }
      auto properties_obj = schema.at("properties").get<picojson::object>();
      for (const auto& key : properties_obj.ordered_keys()) {
@@ -2730,7 +2730,7 @@ index da8b516..a001b1c 100644
        if (prop_result.IsErr()) return ResultErr(std::move(prop_result).UnwrapErr());
        spec.properties.push_back({key, std::move(prop_result).Unwrap()});
      }
-@@ -703,7 +2268,49 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
+@@ -703,7 +2274,49 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
        return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, "required must be an array");
      }
      for (const auto& req : schema.at("required").get<picojson::array>()) {
@@ -2781,7 +2781,7 @@ index da8b516..a001b1c 100644
      }
    }
 
-@@ -714,6 +2321,51 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
+@@ -714,6 +2327,51 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
        );
      }
      auto pattern_props = schema.at("patternProperties").get<picojson::object>();
@@ -2833,7 +2833,7 @@ index da8b516..a001b1c 100644
      for (const auto& key : pattern_props.ordered_keys()) {
        auto prop_result = Parse(pattern_props.at(key), "pattern_prop");
        if (prop_result.IsErr()) return ResultErr(std::move(prop_result).UnwrapErr());
-@@ -721,18 +2373,139 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
+@@ -721,18 +2379,139 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
      }
    }
 
@@ -2978,7 +2978,7 @@ index da8b516..a001b1c 100644
        );
      }
      auto prop_names_result = Parse(schema.at("propertyNames"), "property_name", "string");
-@@ -740,7 +2513,8 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
+@@ -740,7 +2519,8 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
      spec.property_names = std::move(prop_names_result).Unwrap();
    }
 
@@ -2988,7 +2988,7 @@ index da8b516..a001b1c 100644
    if (schema.count("additionalProperties")) {
      auto add_props = schema.at("additionalProperties");
      if (add_props.is<bool>()) {
-@@ -797,6 +2571,50 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
+@@ -797,6 +2577,50 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
      }
    }
 
@@ -3039,7 +3039,7 @@ index da8b516..a001b1c 100644
    if (spec.max_properties != -1 && spec.min_properties > spec.max_properties) {
      return ResultErr<SchemaError>(
          SchemaErrorType::kUnsatisfiableSchema,
-@@ -826,7 +2644,15 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
+@@ -826,7 +2650,15 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
 
  Result<ConstSpec, SchemaError> SchemaParser::ParseConst(const picojson::object& schema) {
    ConstSpec spec;
@@ -3056,7 +3056,7 @@ index da8b516..a001b1c 100644
    return ResultOk(std::move(spec));
  }
 
-@@ -840,7 +2666,14 @@ Result<EnumSpec, SchemaError> SchemaParser::ParseEnum(const picojson::object& sc
+@@ -840,7 +2672,14 @@ Result<EnumSpec, SchemaError> SchemaParser::ParseEnum(const picojson::object& sc
      return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, "enum array must not be empty");
    }
    for (const auto& value : enum_array) {
@@ -3071,7 +3071,7 @@ index da8b516..a001b1c 100644
    }
    return ResultOk(std::move(spec));
  }
-@@ -854,9 +2687,22 @@ Result<RefSpec, SchemaError> SchemaParser::ParseRef(const picojson::object& sche
+@@ -854,9 +2693,22 @@ Result<RefSpec, SchemaError> SchemaParser::ParseRef(const picojson::object& sche
    return ResultOk(std::move(spec));
  }
 
@@ -3094,7 +3094,7 @@ index da8b516..a001b1c 100644
    if (ref_cache_.count(uri)) return ResultOk(ref_cache_[uri]);
 
    if (uri == "#") {
-@@ -869,71 +2715,331 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ResolveRef(
+@@ -869,71 +2721,331 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ResolveRef(
      return ResultOk(resolved);
    }
 
@@ -3263,8 +3263,7 @@ index da8b516..a001b1c 100644
 +    ++idx;
 +  }
 +  if (spec.options.empty()) {
-     return ResultErr<SchemaError>(
--        SchemaErrorType::kInvalidSchema, std::string(anyof_key) + " must be an array"
++    return ResultErr<SchemaError>(
 +        SchemaErrorType::kUnsatisfiableSchema,
 +        keyword + " has no satisfiable branch"
 +    );
@@ -3286,7 +3285,8 @@ index da8b516..a001b1c 100644
 +  // Prove before ParseAnyOf folds the base keywords in: folding only narrows, and
 +  // narrowing cannot create an overlap the declared branches did not have.
 +  if (!TryProvePairwiseDisjointOneOf(options, &work_remaining_)) {
-+    return ResultErr<SchemaError>(
+     return ResultErr<SchemaError>(
+-        SchemaErrorType::kInvalidSchema, std::string(anyof_key) + " must be an array"
 +        SchemaErrorType::kUnsupportedSchema,
 +        "unsupported schema keyword: oneOf with overlapping or non-provably-disjoint branches"
      );
@@ -3458,7 +3458,7 @@ index da8b516..a001b1c 100644
  }
 
  Result<TypeArraySpec, SchemaError> SchemaParser::ParseTypeArray(
-@@ -1102,6 +3208,7 @@ const std::string JSONSchemaConverter::kBasicArray = "basic_array";
+@@ -1102,6 +3214,7 @@ const std::string JSONSchemaConverter::kBasicArray = "basic_array";
  const std::string JSONSchemaConverter::kBasicObject = "basic_object";
  const std::string JSONSchemaConverter::kBasicEscape = "basic_escape";
  const std::string JSONSchemaConverter::kBasicStringSub = "basic_string_sub";
@@ -3466,7 +3466,7 @@ index da8b516..a001b1c 100644
 
  // ==================== JSONSchemaConverter Implementation ====================
 
-@@ -1111,7 +3218,11 @@ JSONSchemaConverter::JSONSchemaConverter(
+@@ -1111,7 +3224,11 @@ JSONSchemaConverter::JSONSchemaConverter(
      bool any_whitespace,
      std::optional<int> max_whitespace_cnt,
      RefResolver ref_resolver,
@@ -3479,7 +3479,7 @@ index da8b516..a001b1c 100644
  )
      : indent_manager_(
            indent,
-@@ -1123,9 +3234,24 @@ JSONSchemaConverter::JSONSchemaConverter(
+@@ -1123,9 +3240,24 @@ JSONSchemaConverter::JSONSchemaConverter(
        any_whitespace_(any_whitespace),
        max_whitespace_cnt_(max_whitespace_cnt),
        any_order_(any_order),
@@ -3504,7 +3504,7 @@ index da8b516..a001b1c 100644
    if (any_whitespace) {
      std::string whitespace_part;
      if (!max_whitespace_cnt_.has_value()) {
-@@ -1137,6 +3263,12 @@ JSONSchemaConverter::JSONSchemaConverter(
+@@ -1137,6 +3269,12 @@ JSONSchemaConverter::JSONSchemaConverter(
    } else {
      colon_pattern_ = "\"" + colon_sep + "\"";
    }
@@ -3517,7 +3517,7 @@ index da8b516..a001b1c 100644
  }
 
  std::string JSONSchemaConverter::Convert(const SchemaSpecPtr& spec) {
-@@ -1145,7 +3277,7 @@ std::string JSONSchemaConverter::Convert(const SchemaSpecPtr& spec) {
+@@ -1145,7 +3283,7 @@ std::string JSONSchemaConverter::Convert(const SchemaSpecPtr& spec) {
    // Register the root rule for circular reference handling
    // This allows $ref: "#" to resolve to "root"
    std::string root_rule_name = ebnf_script_creator_.AllocateRuleName("root");
@@ -3526,7 +3526,7 @@ index da8b516..a001b1c 100644
 
    // Check if the spec can be directly mapped to an existing rule
    auto cached_rule = GetCache(spec->cache_key);
-@@ -1157,7 +3289,8 @@ std::string JSONSchemaConverter::Convert(const SchemaSpecPtr& spec) {
+@@ -1157,7 +3295,8 @@ std::string JSONSchemaConverter::Convert(const SchemaSpecPtr& spec) {
      if (!spec->cache_key.empty()) {
        AddCache(spec->cache_key, root_rule_name);
      }
@@ -3536,7 +3536,7 @@ index da8b516..a001b1c 100644
      ebnf_script_creator_.AddRuleWithAllocatedName(root_rule_name, root_body);
    }
 
-@@ -1175,44 +3308,49 @@ void JSONSchemaConverter::AddBasicRules() {
+@@ -1175,44 +3314,49 @@ void JSONSchemaConverter::AddBasicRules() {
      indent_manager_ = IndentManager(std::nullopt, ", ", false, std::nullopt);
    }
 
@@ -3592,7 +3592,7 @@ index da8b516..a001b1c 100644
    ebnf_script_creator_.AddRule(kBasicNull, null_body);
    AddCache(kNullCacheKey, kBasicNull);
 
-@@ -1222,7 +3360,8 @@ void JSONSchemaConverter::AddBasicRules() {
+@@ -1222,7 +3366,8 @@ void JSONSchemaConverter::AddBasicRules() {
    array_spec_val.allow_additional_items = true;
    array_spec_val.additional_items = any_spec;
    auto array_spec = SchemaSpec::Make(std::move(array_spec_val), kArrayCacheKey, kBasicArray);
@@ -3602,7 +3602,7 @@ index da8b516..a001b1c 100644
    ebnf_script_creator_.AddRule(kBasicArray, array_body);
    AddCache(kArrayCacheKey, kBasicArray);
 
-@@ -1232,10 +3371,15 @@ void JSONSchemaConverter::AddBasicRules() {
+@@ -1232,10 +3377,15 @@ void JSONSchemaConverter::AddBasicRules() {
    obj_spec_val.allow_additional_properties = true;
    obj_spec_val.additional_properties_schema = any_spec;
    auto obj_spec = SchemaSpec::Make(std::move(obj_spec_val), kObjectCacheKey, kBasicObject);
@@ -3619,7 +3619,7 @@ index da8b516..a001b1c 100644
    indent_manager_ = saved_indent_manager;
  }
 
-@@ -1263,15 +3407,170 @@ std::string JSONSchemaConverter::NextSeparator(bool is_end) {
+@@ -1263,15 +3413,170 @@ std::string JSONSchemaConverter::NextSeparator(bool is_end) {
    return indent_manager_.NextSeparator(is_end);
  }
 
@@ -3792,9 +3792,20 @@ index da8b516..a001b1c 100644
  std::string BuildTrieBody(const TrieNode& node) {
    std::string result;
    bool first = true;
-@@ -1288,11 +3587,8 @@ std::string BuildTrieBody(const TrieNode& node) {
+@@ -1281,63 +3586,246 @@ std::string BuildTrieBody(const TrieNode& node) {
+     result += s;
+   };
+-
++  bool edge_quote = node.children.count('"') != 0;
++  bool edge_backslash = node.children.count('\\') != 0;
++
+   // 1. Close quote - only if no excluded key ends here
+   if (!node.is_terminal) {
+     add("\"\\\"\"");
+   }
 
-   // 2. Negated char class - excludes edge chars + JSON specials
+-  // 2. Negated char class - excludes edge chars + JSON specials
++  // 2. Negated char class - excludes unescaped edge chars + JSON specials
    std::string neg = "[^";
 -  for (const auto& [c, _] : node.children) {
 -    if (c == ']' || c == '\\' || c == '^' || c == '-') {
@@ -3802,26 +3813,46 @@ index da8b516..a001b1c 100644
 -    }
 -    neg += c;
 +  for (const auto& [codepoint, _] : node.children) {
++    if (codepoint == '"' || codepoint == '\\') continue;
 +    AppendEscapedCodepoint(&neg, codepoint, "]\\^-");
    }
    neg += "\\0-\\x1f\\\"\\\\\\r\\n]";
    add(neg + " " + JSONSchemaConverter::kBasicStringSub);
-@@ -1301,43 +3597,209 @@ std::string BuildTrieBody(const TrieNode& node) {
-   add("\"\\\\\" " + JSONSchemaConverter::kBasicEscape + " " + JSONSchemaConverter::kBasicStringSub);
 
-   // 4. Trie edges - recurse
+-  // 3. Escape sequence
+-  add("\"\\\\\" " + JSONSchemaConverter::kBasicEscape + " " + JSONSchemaConverter::kBasicStringSub);
++  // 3. Escape sequence - except for `"`/`\` edges (handled below)
++  if (!edge_quote && !edge_backslash) {
++    add("\"\\\\\" " + JSONSchemaConverter::kBasicEscape + " " +
++        JSONSchemaConverter::kBasicStringSub);
++  } else {
++    std::string esc_class = "[";
++    if (!edge_quote) esc_class += "\\\"";
++    if (!edge_backslash) esc_class += "\\\\";
++    esc_class += "/bfnrt]";
++    std::string escape_body = esc_class +
++                              " | \"u\" [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9]";
++    add("\"\\\\\" (" + escape_body + ") " + JSONSchemaConverter::kBasicStringSub);
++  }
+
+-  // 4. Trie edges - recurse
 -  for (const auto& [c, child] : node.children) {
 -    std::string child_body = BuildTrieBody(child);
++  // 4. Trie edges - recurse.
 +  for (const auto& [codepoint, child] : node.children) {
      std::string char_lit = "\"";
 -    if (c == '"') {
 -      char_lit += "\\\"";
 -    } else if (c == '\\') {
 -      char_lit += "\\\\";
--    } else {
++    if (codepoint == '"') {
++      char_lit += "\\\\\\\"";
++    } else if (codepoint == '\\') {
++      char_lit += "\\\\\\\\";
+     } else {
 -      char_lit += c;
--    }
-+    AppendEscapedCodepoint(&char_lit, codepoint, "\"\\");
++      AppendEscapedCodepoint(&char_lit, codepoint, "\"\\");
+     }
      char_lit += "\"";
 -    add(char_lit + " " + child_body);
 +    add(char_lit + " " + BuildTrieBody(child));
@@ -4036,7 +4067,7 @@ index da8b516..a001b1c 100644
    // Generate EBNF body
    std::string inner = BuildTrieBody(root);
    std::string ws = GetWhitespacePattern();
-@@ -1346,24 +3808,57 @@ std::string JSONSchemaConverter::GetKeyPatternExcluding(
+@@ -1346,24 +3843,57 @@ std::string JSONSchemaConverter::GetKeyPatternExcluding(
    return ebnf_script_creator_.AddRule(rule_name + "_addl_key", body);
  }
 
@@ -4097,7 +4128,7 @@ index da8b516..a001b1c 100644
  ) {
    // Only check cache for basic rules (pre-populated in AddBasicRules)
    // Don't cache other rules to match original behavior
-@@ -1373,46 +3868,57 @@ std::string JSONSchemaConverter::CreateRule(
+@@ -1373,46 +3913,57 @@ std::string JSONSchemaConverter::CreateRule(
    }
 
    std::string rule_name = ebnf_script_creator_.AllocateRuleName(rule_name_hint);
@@ -4172,7 +4203,7 @@ index da8b516..a001b1c 100644
          } else {
            XGRAMMAR_LOG(FATAL) << "Unknown spec type";
            return "";
-@@ -1425,7 +3941,7 @@ std::string JSONSchemaConverter::GenerateFromSpec(
+@@ -1425,7 +3976,7 @@ std::string JSONSchemaConverter::GenerateFromSpec(
  // ==================== Generate Methods ====================
 
  std::string JSONSchemaConverter::GenerateInteger(
@@ -4181,7 +4212,7 @@ index da8b516..a001b1c 100644
  ) {
    std::optional<int64_t> start, end;
    if (spec.minimum.has_value()) {
-@@ -1457,7 +3973,7 @@ std::string JSONSchemaConverter::GenerateInteger(
+@@ -1457,7 +4008,7 @@ std::string JSONSchemaConverter::GenerateInteger(
  }
 
  std::string JSONSchemaConverter::GenerateNumber(
@@ -4190,7 +4221,7 @@ index da8b516..a001b1c 100644
  ) {
    std::optional<double> start, end;
    bool exclusive_start = false;
-@@ -1491,55 +4007,220 @@ std::string JSONSchemaConverter::GenerateNumber(
+@@ -1491,55 +4042,220 @@ std::string JSONSchemaConverter::GenerateNumber(
    return "\"-\"? (\"0\" | [1-9] [0-9]*) (\".\" [0-9]+)? ([eE] [+-]? [0-9]+)?";
  }
 
@@ -4433,7 +4464,7 @@ index da8b516..a001b1c 100644
  ) {
    indent_manager_.StartIndent();
 
-@@ -1554,13 +4234,13 @@ std::string JSONSchemaConverter::GenerateArray(
+@@ -1554,13 +4269,13 @@ std::string JSONSchemaConverter::GenerateArray(
    // Handle prefix items
    for (size_t i = 0; i < spec.prefix_items.size(); ++i) {
      item_rule_names.push_back(
@@ -4449,7 +4480,7 @@ index da8b516..a001b1c 100644
    }
 
    indent_manager_.EndIndent();
-@@ -1641,6 +4321,11 @@ std::string JSONSchemaConverter::GenerateArray(
+@@ -1641,6 +4356,11 @@ std::string JSONSchemaConverter::GenerateArray(
  }
 
  std::string JSONSchemaConverter::FormatPropertyKey(const std::string& key) {
@@ -4461,7 +4492,7 @@ index da8b516..a001b1c 100644
    return "\"" + JSONStrToPrintableStr(picojson::value(key).serialize()) + "\"";
  }
 
-@@ -1687,6 +4372,7 @@ std::string JSONSchemaConverter::GetAnyOrderRuleForProperties(
+@@ -1687,6 +4407,7 @@ std::string JSONSchemaConverter::GetAnyOrderRuleForProperties(
      const std::string& additional_suffix,
      int min_properties,
      int max_properties,
@@ -4469,7 +4500,7 @@ index da8b516..a001b1c 100644
      const std::string& additional_prop_pattern_override
  ) {
    std::string first_sep = NextSeparator();
-@@ -1698,14 +4384,14 @@ std::string JSONSchemaConverter::GetAnyOrderRuleForProperties(
+@@ -1698,14 +4419,14 @@ std::string JSONSchemaConverter::GetAnyOrderRuleForProperties(
    std::vector<std::string> item_patterns;
    for (size_t idx = 0; idx < properties.size(); ++idx) {
      const auto& prop = properties[idx];
@@ -4486,7 +4517,7 @@ index da8b516..a001b1c 100644
        item_patterns.push_back(FormatOtherProperty(
            GetKeyPatternExcluding(properties, rule_name),
            add_value_rule,
-@@ -1742,6 +4428,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
+@@ -1742,6 +4463,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
      const std::string& additional_suffix,
      int min_properties,
      int max_properties,
@@ -4494,7 +4525,7 @@ index da8b516..a001b1c 100644
      const std::string& additional_prop_pattern_override
  ) {
    if (max_properties == 0) {
-@@ -1757,6 +4444,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
+@@ -1757,6 +4479,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
          additional_suffix,
          min_properties,
          max_properties,
@@ -4502,7 +4533,7 @@ index da8b516..a001b1c 100644
          additional_prop_pattern_override
      );
    }
-@@ -1770,7 +4458,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
+@@ -1770,7 +4493,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
    std::vector<std::string> prop_patterns;
    for (size_t idx = 0; idx < properties.size(); ++idx) {
      const auto& prop = properties[idx];
@@ -4511,7 +4542,7 @@ index da8b516..a001b1c 100644
      prop_patterns.push_back(FormatProperty(prop.name, value_rule, rule_name, idx));
    }
 
-@@ -1786,7 +4474,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
+@@ -1786,7 +4509,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
        if (!additional_prop_pattern_override.empty()) {
          additional_prop_pattern = additional_prop_pattern_override;
        } else {
@@ -4520,7 +4551,7 @@ index da8b516..a001b1c 100644
          additional_prop_pattern = FormatOtherProperty(
              GetKeyPatternExcluding(properties, rule_name),
              add_value_rule,
-@@ -1850,7 +4538,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
+@@ -1850,7 +4573,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
        if (!additional_prop_pattern_override.empty()) {
          additional_prop_pattern = additional_prop_pattern_override;
        } else {
@@ -4529,7 +4560,7 @@ index da8b516..a001b1c 100644
          additional_prop_pattern = FormatOtherProperty(
              GetKeyPatternExcluding(properties, rule_name),
              add_value_rule,
-@@ -1969,7 +4657,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
+@@ -1969,7 +4692,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
        if (!additional_prop_pattern_override.empty()) {
          additional_prop_pattern = additional_prop_pattern_override;
        } else {
@@ -4538,7 +4569,7 @@ index da8b516..a001b1c 100644
          additional_prop_pattern = FormatOtherProperty(
              GetKeyPatternExcluding(properties, rule_name),
              add_value_rule,
-@@ -2094,8 +4782,10 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
+@@ -2094,8 +4817,10 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
  }
 
  std::string JSONSchemaConverter::GenerateObject(
@@ -4550,7 +4581,7 @@ index da8b516..a001b1c 100644
    std::string result = "";
    if (need_braces) {
      result += "\"{\"";
-@@ -2127,21 +4817,24 @@ std::string JSONSchemaConverter::GenerateObject(
+@@ -2127,21 +4852,24 @@ std::string JSONSchemaConverter::GenerateObject(
      std::string effective_suffix = additional_suffix;
      std::string pp_override = "";
 
@@ -4579,7 +4610,7 @@ index da8b516..a001b1c 100644
          std::string add_prop =
              FormatOtherProperty(GetKeyPattern(), add_value_rule, rule_name, effective_suffix);
          pp_body += " | " + add_prop;
-@@ -2156,8 +4849,9 @@ std::string JSONSchemaConverter::GenerateObject(
+@@ -2156,8 +4884,9 @@ std::string JSONSchemaConverter::GenerateObject(
        // propertyNames constrains keys of additional properties.
        // Only apply when additional properties are allowed — when additionalProperties
        // is false, no extra keys beyond named properties should be permitted.
@@ -4591,7 +4622,7 @@ index da8b516..a001b1c 100644
        pp_override = key_pattern + " " + colon_pattern_ + " " + val_rule;
        effective_suffix = "pn";
      }
-@@ -2170,6 +4864,7 @@ std::string JSONSchemaConverter::GenerateObject(
+@@ -2170,6 +4899,7 @@ std::string JSONSchemaConverter::GenerateObject(
                          effective_suffix,
                          spec.min_properties,
                          spec.max_properties,
@@ -4599,7 +4630,7 @@ index da8b516..a001b1c 100644
                          pp_override
                      );
      could_be_empty = spec.required.empty() && spec.min_properties == 0;
-@@ -2179,12 +4874,14 @@ std::string JSONSchemaConverter::GenerateObject(
+@@ -2179,12 +4909,14 @@ std::string JSONSchemaConverter::GenerateObject(
 
      std::string property_rule_body = "(";
      if (spec.max_properties != 0) {
@@ -4617,7 +4648,7 @@ index da8b516..a001b1c 100644
            if (i != 0) {
              property_rule_body += " | ";
            }
-@@ -2192,9 +4889,10 @@ std::string JSONSchemaConverter::GenerateObject(
+@@ -2192,9 +4924,10 @@ std::string JSONSchemaConverter::GenerateObject(
          }
          property_rule_body += ")";
        } else {
@@ -4630,7 +4661,7 @@ index da8b516..a001b1c 100644
        }
 
        auto prop_rule_name = ebnf_script_creator_.AllocateRuleName(rule_name + "_prop");
-@@ -2217,16 +4915,21 @@ std::string JSONSchemaConverter::GenerateObject(
+@@ -2217,16 +4950,21 @@ std::string JSONSchemaConverter::GenerateObject(
                          rule_name,
                          additional_suffix,
                          spec.min_properties,
@@ -4656,7 +4687,7 @@ index da8b516..a001b1c 100644
        result += " " + NextSeparator() + " " + other_property_pattern + " ";
        result += GetPropertyWithNumberConstraints(
                      NextSeparator() + " " + other_property_pattern,
-@@ -2260,117 +4963,143 @@ std::string JSONSchemaConverter::GenerateObject(
+@@ -2260,117 +4993,143 @@ std::string JSONSchemaConverter::GenerateObject(
      }
    }
 
@@ -4853,7 +4884,7 @@ index da8b516..a001b1c 100644
    }
    return result;
  }
-@@ -2391,12 +5115,18 @@ std::optional<std::string> JSONSchemaConverter::JSONFormatToRegexPattern(const s
+@@ -2391,12 +5150,18 @@ std::optional<std::string> JSONSchemaConverter::JSONFormatToRegexPattern(const s
          ")";
      m["email"] = "^(" + dot_string + "|" + quoted_string + ")@" + domain + "$";
 
@@ -4876,7 +4907,7 @@ index da8b516..a001b1c 100644
      m["duration"] =
          "^P((\\d+D|\\d+M(\\d+D)?|\\d+Y(\\d+M(\\d+D)?)?)(T(\\d+S|\\d+M(\\d+S)?|\\d+H(\\d+M(\\d+"
          "S)?"
-@@ -3328,7 +6058,16 @@ std::string JSONSchemaToEBNF(
+@@ -3328,7 +6093,16 @@ std::string JSONSchemaToEBNF(
      bool strict_mode,
      std::optional<int> max_whitespace_cnt,
      JSONFormat json_format,
@@ -4894,7 +4925,7 @@ index da8b516..a001b1c 100644
  ) {
    picojson::value schema_value;
    std::string err = picojson::parse(schema_value, schema);
-@@ -3342,7 +6081,16 @@ std::string JSONSchemaToEBNF(
+@@ -3342,7 +6116,16 @@ std::string JSONSchemaToEBNF(
        strict_mode,
        max_whitespace_cnt,
        json_format,
@@ -4912,7 +4943,7 @@ index da8b516..a001b1c 100644
    );
  }
 
-@@ -3354,11 +6102,58 @@ std::string JSONSchemaToEBNF(
+@@ -3354,11 +6137,58 @@ std::string JSONSchemaToEBNF(
      bool strict_mode,
      std::optional<int> max_whitespace_cnt,
      JSONFormat json_format,
@@ -4975,7 +5006,7 @@ index da8b516..a001b1c 100644
    if (spec_result.IsErr()) {
      XGRAMMAR_LOG(FATAL) << std::move(spec_result).UnwrapErr().what();
    }
-@@ -3372,18 +6167,36 @@ std::string JSONSchemaToEBNF(
+@@ -3372,18 +6202,36 @@ std::string JSONSchemaToEBNF(
      return std::move(r).Unwrap();
    };
 
@@ -5014,7 +5045,7 @@ index da8b516..a001b1c 100644
        XMLToolCallingConverter converter(
            indent,
            separators,
-@@ -3391,7 +6204,13 @@ std::string JSONSchemaToEBNF(
+@@ -3391,7 +6239,13 @@ std::string JSONSchemaToEBNF(
            max_whitespace_cnt,
            ref_resolver,
            json_format,
@@ -5029,7 +5060,7 @@ index da8b516..a001b1c 100644
        );
        return converter.Convert(spec);
      }
-@@ -3414,7 +6233,9 @@ std::string GenerateFloatRangeRegex(
+@@ -3414,7 +6268,9 @@ std::string GenerateFloatRangeRegex(
    );
  }
 
@@ -5040,7 +5071,7 @@ index da8b516..a001b1c 100644
    picojson::value json_value;
    std::string err = picojson::parse(json_value, schema);
    if (!err.empty()) {
-@@ -3428,11 +6249,16 @@ std::string QwenXMLToolCallingToEBNF(const std::string& schema, bool any_order)
+@@ -3428,11 +6284,16 @@ std::string QwenXMLToolCallingToEBNF(const std::string& schema, bool any_order)
        true,
        std::nullopt,
        JSONFormat::kQwenXML,
@@ -5059,7 +5090,7 @@ index da8b516..a001b1c 100644
    picojson::value json_value;
    std::string err = picojson::parse(json_value, schema);
    if (!err.empty()) {
-@@ -3446,11 +6272,16 @@ std::string MiniMaxXMLToolCallingToEBNF(const std::string& schema, bool any_orde
+@@ -3446,11 +6307,16 @@ std::string MiniMaxXMLToolCallingToEBNF(const std::string& schema, bool any_orde
        true,
        std::nullopt,
        JSONFormat::kMiniMaxXML,
@@ -5078,7 +5109,7 @@ index da8b516..a001b1c 100644
    picojson::value json_value;
    std::string err = picojson::parse(json_value, schema);
    if (!err.empty()) {
-@@ -3464,11 +6295,16 @@ std::string DeepSeekXMLToolCallingToEBNF(const std::string& schema, bool any_ord
+@@ -3464,11 +6330,16 @@ std::string DeepSeekXMLToolCallingToEBNF(const std::string& schema, bool any_ord
        true,
        std::nullopt,
        JSONFormat::kDeepSeekXML,
@@ -5097,7 +5128,7 @@ index da8b516..a001b1c 100644
    picojson::value json_value;
    std::string err = picojson::parse(json_value, schema);
    if (!err.empty()) {
-@@ -3482,7 +6318,10 @@ std::string GlmXMLToolCallingToEBNF(const std::string& schema, bool any_order) {
+@@ -3482,7 +6353,10 @@ std::string GlmXMLToolCallingToEBNF(const std::string& schema, bool any_order) {
        true,
        std::nullopt,
        JSONFormat::kGlmXML,

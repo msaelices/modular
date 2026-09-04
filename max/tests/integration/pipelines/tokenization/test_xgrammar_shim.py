@@ -220,6 +220,33 @@ def test_property_name_escapes_cannot_forge_a_cache_key() -> None:
     )
 
 
+def test_property_key_with_embedded_quote_enforces_value_type() -> None:
+    key = 'foo"bar'
+    compiled = _compiler().compile_json_schema(
+        json.dumps(
+            {
+                "properties": {key: {"$ref": "#/definitions/foo%22bar"}},
+                "definitions": {key: {"type": "number"}},
+            }
+        )
+    )
+    assert _accepts(compiled, json.dumps({key: 1}))
+    assert not _accepts(compiled, json.dumps({key: "1"}))
+
+
+def test_property_key_with_embedded_backslash_enforces_value_type() -> None:
+    key = "a\\b"
+    compiled = _compiler().compile_json_schema(
+        json.dumps(
+            {
+                "properties": {key: {"type": "number"}},
+            }
+        )
+    )
+    assert _accepts(compiled, json.dumps({key: 1}))
+    assert not _accepts(compiled, json.dumps({key: "1"}))
+
+
 # Rejection of unenforceable keywords is opt-in: it happens only when the caller
 # passes reject_unsupported=True. The default (exercised by the guard tests below)
 # falls back to best-effort decoding instead.
