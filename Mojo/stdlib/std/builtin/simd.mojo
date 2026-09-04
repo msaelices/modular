@@ -3657,6 +3657,12 @@ def _pow[
 
     comptime if exp.dtype.is_floating_point() and base.dtype == exp.dtype:
         comptime if is_apple_gpu():
+            # AIR has no bf16 overload of `air.pow`; Metal rejects it, so
+            # evaluate in f32 and narrow the result back.
+            comptime if base.dtype == .bfloat16:
+                return _pow(base.cast[.float32](), exp.cast[.float32]()).cast[
+                    base.dtype
+                ]()
             return llvm_intrinsic[
                 "llvm.air.pow",
                 type_of(base),
