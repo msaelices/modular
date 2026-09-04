@@ -1181,6 +1181,16 @@ the [container](/container) page now links to the new page.
 
 ## Fixes
 
+- Fixed a pre-tokenized prompt longer than `--max-length` killing the model
+  worker instead of being rejected. Only a string prompt was length-checked,
+  so a token-array prompt — an OpenAI `/v1/completions` token array, or the
+  pre-tokenized prompt an orchestrator supplies for KV cache-aware routing —
+  was admitted at any length and produced a request whose length exceeded the
+  model's context window. Under speculative decoding the response path then
+  raised rather than capping, taking the worker down and wiping its prefix
+  cache; such a request now returns HTTP 400 like an over-length string
+  prompt.
+
 - Fixed constrained decoding producing invalid output when combined with
   speculative decoding on AMD GPUs. The in-graph wait that gates the grammar
   bitmask copy was not recorded into captured device graphs, so replays read a
