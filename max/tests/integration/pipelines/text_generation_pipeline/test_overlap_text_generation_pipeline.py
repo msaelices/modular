@@ -1268,6 +1268,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[],
+            curr_verify_width=0,
         )
 
         assert result is False
@@ -1280,6 +1281,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[],
+            curr_verify_width=0,
         )
 
         assert result is False
@@ -1294,6 +1296,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[],
+            curr_verify_width=0,
         )
 
         assert result is False
@@ -1305,7 +1308,7 @@ class TestEnqueuePrevBitmaskCallback:
         for name in (
             "persistent_bonus_tokens_pinned",
             "persistent_num_accepted_pinned",
-            "persistent_accepted_draft_tokens_pinned",
+            "accepted_token_pinned",
             "persistent_next_draft_tokens_pinned",
         ):
             setattr(mock_spec_state, name, MagicMock())
@@ -1314,6 +1317,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[],
+            curr_verify_width=0,
         )
 
         assert result is False
@@ -1325,7 +1329,7 @@ class TestEnqueuePrevBitmaskCallback:
         for name in (
             "persistent_bonus_tokens_pinned",
             "persistent_num_accepted_pinned",
-            "persistent_accepted_draft_tokens_pinned",
+            "accepted_token_pinned",
             "persistent_next_draft_tokens_pinned",
         ):
             setattr(mock_spec_state, name, MagicMock())
@@ -1336,6 +1340,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[],
+            curr_verify_width=0,
         )
 
         assert result is False
@@ -1347,7 +1352,7 @@ class TestEnqueuePrevBitmaskCallback:
         for name in (
             "persistent_bonus_tokens_pinned",
             "persistent_num_accepted_pinned",
-            "persistent_accepted_draft_tokens_pinned",
+            "accepted_token_pinned",
             "persistent_next_draft_tokens_pinned",
         ):
             setattr(mock_spec_state, name, MagicMock())
@@ -1358,6 +1363,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[],
+            curr_verify_width=0,
         )
 
         assert result is False
@@ -1375,7 +1381,7 @@ class TestEnqueuePrevBitmaskCallback:
         for name in (
             "persistent_bonus_tokens_pinned",
             "persistent_num_accepted_pinned",
-            "persistent_accepted_draft_tokens_pinned",
+            "accepted_token_pinned",
             "persistent_next_draft_tokens_pinned",
         ):
             setattr(mock_spec_state, name, MagicMock())
@@ -1394,6 +1400,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[curr_ctx],
+            curr_verify_width=0,
         )
 
         assert result is False
@@ -1427,9 +1434,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         mock_spec_state.persistent_bonus_tokens_pinned = bonus_tokens_pinned
         mock_spec_state.persistent_num_accepted_pinned = num_accepted_pinned
-        mock_spec_state.persistent_accepted_draft_tokens_pinned = (
-            accepted_draft_tokens_pinned
-        )
+        mock_spec_state.accepted_token_pinned = accepted_draft_tokens_pinned
         mock_spec_state.persistent_next_draft_tokens_pinned = (
             next_draft_tokens_pinned
         )
@@ -1476,6 +1481,7 @@ class TestEnqueuePrevBitmaskCallback:
         ):
             result = pipeline._enqueue_prev_bitmask_callback(
                 curr_context_batch=[curr_ctx],
+                curr_verify_width=num_draft,
             )
 
         assert result is True
@@ -1519,9 +1525,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         mock_spec_state.persistent_bonus_tokens_pinned = bonus_tokens_pinned
         mock_spec_state.persistent_num_accepted_pinned = num_accepted_pinned
-        mock_spec_state.persistent_accepted_draft_tokens_pinned = (
-            accepted_draft_tokens_pinned
-        )
+        mock_spec_state.accepted_token_pinned = accepted_draft_tokens_pinned
         mock_spec_state.persistent_next_draft_tokens_pinned = (
             next_draft_tokens_pinned
         )
@@ -1578,6 +1582,7 @@ class TestEnqueuePrevBitmaskCallback:
         ):
             result = pipeline._enqueue_prev_bitmask_callback(
                 curr_context_batch=[curr_ctx],
+                curr_verify_width=num_draft,
             )
 
         assert result is True
@@ -1621,9 +1626,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         mock_spec_state.persistent_bonus_tokens_pinned = bonus_tokens_pinned
         mock_spec_state.persistent_num_accepted_pinned = num_accepted_pinned
-        mock_spec_state.persistent_accepted_draft_tokens_pinned = (
-            accepted_draft_tokens_pinned
-        )
+        mock_spec_state.accepted_token_pinned = accepted_draft_tokens_pinned
         mock_spec_state.persistent_next_draft_tokens_pinned = (
             next_draft_tokens_pinned
         )
@@ -1708,6 +1711,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[producer, transferred],
+            curr_verify_width=2,
         )
 
         assert result is False
@@ -1751,6 +1755,7 @@ class TestEnqueuePrevBitmaskCallback:
         ):
             result = pipeline._enqueue_prev_bitmask_callback(
                 curr_context_batch=[ctx_a, ctx_b],
+                curr_verify_width=2,
             )
 
         assert result is True
@@ -1784,6 +1789,7 @@ class TestEnqueuePrevBitmaskCallback:
         ):
             result = pipeline._enqueue_prev_bitmask_callback(
                 curr_context_batch=[producer, padding],
+                curr_verify_width=2,
             )
 
         assert result is True

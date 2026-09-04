@@ -574,6 +574,34 @@ the [container](/container) page now links to the new page.
   included, and a disaggregated prefill node now reports the failure to
   the decode node instead of leaving the request to time out.
 
+- Speculative decoding can now verify only some of the draft tokens it
+  generates, varying that count with the decode batch size via the new
+  `num_speculative_tokens_per_batch_size` speculative-config field. Each entry
+  names an inclusive batch-size range and a count through the keys
+  `batch_start`, `batch_end`, and `num_tokens`, so a two-range schedule is
+  `[{"batch_start": 1, "batch_end": 16, "num_tokens": 3}, {"batch_start": 17,
+  "batch_end": 64, "num_tokens": 1}]`. The first range must start at batch size
+  1 so every batch size resolves to a count; gaps and the tail carry the
+  previous count forward. Drafting is cheap, but every draft the target verifies
+  is another query position in its forward pass, so at high concurrency those
+  positions compete with real tokens for the same compute and a rejected draft
+  is compute spent for nothing. Whether narrowing pays off therefore depends on
+  how well the drafts are being accepted, which is a property of the workload
+  rather than of the batch size. Measure your own workload before adopting a
+  schedule. The field is off by default, and unset behavior is unchanged. It
+  applies to every speculative method. A block drafter (`dflash`) still drafts
+  its whole checkpoint-fixed block every step, so a schedule narrows only how
+  much of that block the target verifies; the saving comes from the target's
+  verify pass, never from drafting less.
+
+  It is most useful for a block drafter, whose draft depth is fixed by its
+  checkpoint, making the verified count the only runtime lever on step cost.
+  Where the draft depth is itself configurable, as it is for `eagle` and
+  `mtp`, lowering `num_speculative_tokens` is the better tool: it removes the
+  draft passes as well as the verify positions, while a schedule pays for
+  drafts it then discards. A count of `0` is accepted and disables
+  verification for that batch-size range.
+
 - GLM models now map `reasoning_effort` onto the two thinking levels their
   chat template can express, instead of forwarding it verbatim. The template
   reads only `high` as a distinct level and treats every other value as
