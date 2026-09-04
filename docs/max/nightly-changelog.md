@@ -37,6 +37,9 @@ the [container](/container) page now links to the new page.
   releases each stage in turn within a request; the first request after a cold
   start pays a multi-minute compile that later ones replay from the
   compilation cache.
+- Startup no longer prints one `unknown dtype found in safetensors file`
+  warning for each tensor with a dtype that is not a weight encoding. Each
+  scan of the weight files now prints one warning for each unknown dtype.
 - Fixed unbounded host-memory usage in Gemma 4 video pre-processing: the
   server now decodes only the sampled frames of a video instead of
   materializing every frame before sampling, bounding peak memory at the
