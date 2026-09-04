@@ -162,7 +162,7 @@ def HLCF_ForOp : HLCFParentOp<"for"> {
     ` ``[` custom<ForBoundsWithOptionalType>($lowerBound, type($lowerBound),
                                             $upperBound, type($upperBound),
                                             $step, type($step))
-    $cmpPredicateType $indVarComputeType `]` ``
+    enum($cmpPredicateType) enum($indVarComputeType) `]` ``
     custom<Loop>($iterArgs, type($iterArgs), type($results), $body) attr-dict
   }];
 

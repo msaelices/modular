@@ -1736,7 +1736,7 @@ struct DType(TrivialRegisterPassable):
 
     @always_inline("builtin")
     def is_floating_point(self) -> Bool:
-        return __mlir_op.`pop.cmp`[pred=__mlir_attr.`#kgen<cmp_pred ne>`](
+        return __mlir_op.`pop.cmp`[pred=__mlir_attr.`#kgen.cmp_pred<ne>`](
             __mlir_op.`pop.simd.and`(
                 __mlir_op.`pop.cast_from_builtin`[
                     _type=__mlir_type.`!kgen.scalar<ui8>`
@@ -1871,7 +1871,7 @@ struct SIMD[dtype: DType, size: SIMDLength](
         return __mlir_op.`pop.cast_to_builtin`[_type=__mlir_type.index](
             __mlir_op.`pop.cast`[
                 _type=SIMD[.int, 1]._mlir_type,
-                fastmathFlags=__mlir_attr.`#pop<fmf fast>`,
+                fastmathFlags=__mlir_attr.`#pop.fmf<fast>`,
             ](rebind[SIMD[Self.dtype, SIMDLength(1)]](self)._mlir_value)
         )
 
@@ -1981,37 +1981,37 @@ struct SIMD[dtype: DType, size: SIMDLength](
     @always_inline("builtin")
     def __eq__(self, rhs: Self) -> Bool:
         return __mlir_op.`index.cmp`[
-            pred=__mlir_attr.`#index<cmp_predicate eq>`
+            pred=__mlir_attr.`#index.cmp_predicate<eq>`
         ](self.__mlir_index__(), rhs.__mlir_index__())
 
     @always_inline("builtin")
     def __ne__(self, rhs: Self) -> Bool:
         return __mlir_op.`index.cmp`[
-            pred=__mlir_attr.`#index<cmp_predicate ne>`
+            pred=__mlir_attr.`#index.cmp_predicate<ne>`
         ](self.__mlir_index__(), rhs.__mlir_index__())
 
     @always_inline("builtin")
     def __lt__(self, rhs: Self) -> Bool:
         return __mlir_op.`index.cmp`[
-            pred=__mlir_attr.`#index<cmp_predicate slt>`
+            pred=__mlir_attr.`#index.cmp_predicate<slt>`
         ](self.__mlir_index__(), rhs.__mlir_index__())
 
     @always_inline("builtin")
     def __le__(self, rhs: Self) -> Bool:
         return __mlir_op.`index.cmp`[
-            pred=__mlir_attr.`#index<cmp_predicate sle>`
+            pred=__mlir_attr.`#index.cmp_predicate<sle>`
         ](self.__mlir_index__(), rhs.__mlir_index__())
 
     @always_inline("builtin")
     def __gt__(self, rhs: Self) -> Bool:
         return __mlir_op.`index.cmp`[
-            pred=__mlir_attr.`#index<cmp_predicate sgt>`
+            pred=__mlir_attr.`#index.cmp_predicate<sgt>`
         ](self.__mlir_index__(), rhs.__mlir_index__())
 
     @always_inline("builtin")
     def __ge__(self, rhs: Self) -> Bool:
         return __mlir_op.`index.cmp`[
-            pred=__mlir_attr.`#index<cmp_predicate sge>`
+            pred=__mlir_attr.`#index.cmp_predicate<sge>`
         ](self.__mlir_index__(), rhs.__mlir_index__())
 
     @always_inline("builtin")
