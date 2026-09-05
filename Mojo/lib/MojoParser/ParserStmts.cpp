@@ -1620,6 +1620,17 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
   // Given we have the pile of pattern collected together in a list, we can add
   // emission optimizations to improve the order various sub-patterns are
   // emitted.  For now, we simply emit each linearly.
+
+  // Because we don't know whether a case is allowed to consume an RValue, we
+  // convert the subject to a BValue, so none of the pattern emission can
+  // consume the RValue.  For example, any "var" bindings will have to do a
+  // copy.
+  // TODO: maintain RValueness for as long as we can.
+  BValue subjectBVal =
+      getEmitter().emitBValue({subject, subjectExpr}, EC_MatchSubject);
+  if (!subjectBVal)
+    return failure();
+
   HLCF::ElifOp elifOp = HLCF::ElifOp::create(
       builder, matchLocation, TypeRange(), caseEntries.size() * 2);
 
@@ -1629,15 +1640,36 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
     auto &condBlock = elifOp.getElifRegions()[idx * 2].emplaceBlock();
     builder.setInsertionPointToStart(&condBlock);
 
-    // TODO: Emit the match condition; then the bind, then the guard.
-    // For now, we just emit a "false" condition.
-    // Create a 0 value of type !kgen.scalar<bool>.
+    // Pattern bindings (and the guard) live in a case-local scope that also
+    // wraps the body.
+    DebugInfo::DIBuilder::ScopeGuard scopeGuard;
+    llvm::SaveAndRestore<ASTDecl *> keepDecl(curDeclScope);
+    pushChildScope(scopeGuard, keepDecl);
+
+    // Emit the match condition and convert it to a bool we can test.
     auto caseLoc = translateLocation(caseEntry.patternExpr->getLoc());
-    auto boolAttr = SIMDAttr::getScalarBool(getContext(), false);
-    SRValue condRVal = getEmitter().emitSRValue(
-        {PValue(boolAttr), caseEntry.patternExpr}, EC_BoolCondition);
+    auto emitter = getEmitter();
+    CValue condCVal = caseEntry.patternExpr->emitMatch(emitter, subjectBVal);
+    SRValue condRVal = emitter.emitSRValue({condCVal, caseEntry.patternExpr},
+                                           EC_BoolCondition);
     if (!condRVal)
       return failure();
+
+    // Emit the guard if present.  We handle it with a nested if statement,
+    // since we only want to emit the body if the guard is true.
+    if (caseEntry.guardExpr) {
+      // TODO: If the existing predicate is a known true value, we don't have
+      // to emit a nested if.
+      // FIXME: implement this as:
+      // %final_pred = hlcf.elif {
+      //   yield %pred_so_far
+      // } cond {
+      //   the guard expression
+      //   yield it
+      // } else {
+      //   yield false
+      // }
+    }
     HLCF::ElifYieldOp::create(builder, caseLoc, condRVal,
                               /*no extra values*/ ValueRange());
 
@@ -1646,9 +1678,10 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
     builder.setInsertionPointToStart(&bodyBlock);
 
     // Change the parser cursor to the start of the case body so we can parse
-    // the right text.
+    // the right text. Use parseSuite (not parseLocalScopeSuite) so the body
+    // shares the case scope above — pattern bindings remain visible.
     caseEntry.caseCursor.restore(getLexer());
-    if (failed(parseLocalScopeSuite(curIndent)))
+    if (failed(parseSuite(curIndent)))
       return failure();
     HLCF::YieldOp::create(builder, caseLoc);
   }

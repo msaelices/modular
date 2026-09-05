@@ -205,6 +205,14 @@ public:
   virtual llvm::LogicalResult emitDestructuringPValue(PValue value,
                                                       IREmitter &emitter) const;
 
+  /// Emit this expression as a match pattern against `subject`.
+  ///
+  /// On success, returns a boolean CValue that is true when the subject
+  /// matches this pattern (and any bindings introduced by the pattern have
+  /// been declared in the current scope). The default implementation rejects
+  /// the expression as an invalid pattern.
+  virtual CValue emitMatch(IREmitter &emitter, CValue subject) const;
+
   /// Emit this expression to MLIR, returning a (possibly null!) AnyValue.  The
   /// ExprDest indicates information about where to emit the expression result
   /// into, e.g. the a/b target in `def f(): (a,b) = (1,2)`.  On success, the

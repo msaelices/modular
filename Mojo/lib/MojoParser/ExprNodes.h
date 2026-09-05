@@ -83,6 +83,7 @@ struct IntLiteralNode final : public ExprNode {
   SourceRange getRange() const override { return {getLoc(), getLoc()}; }
 
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 
@@ -138,6 +139,7 @@ struct SimpleLiteralNode final : public ExprNode {
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
   LogicalResult emitDestructuringPValue(PValue value,
                                         IREmitter &emitter) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 
@@ -441,6 +443,7 @@ struct ParenNode final : public ExprNode {
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
   LogicalResult emitDestructuringPValue(PValue value,
                                         IREmitter &emitter) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
   ELVIITResult
   emitLValueIfImplicitlyTyped(IREmitter &emitter, PatternDeclKind kind,
                               bool hasInferrableRHS) const override {
@@ -475,6 +478,7 @@ struct TupleNode final : public LValueCapableExprNode {
                          bool isSpeculative) const override;
   LogicalResult emitDestructuringPValue(PValue value,
                                         IREmitter &emitter) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 

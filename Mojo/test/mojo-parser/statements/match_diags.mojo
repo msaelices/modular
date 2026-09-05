@@ -40,8 +40,20 @@ def match_missing_cases(x: Int):
     # expected-error @+1 {{'__match' statement must have at least one 'case' block}}
     __match x:
 
+    __match x:
+    case foo(): # expected-error {{expression is not a valid match pattern}}
+        pass
+
 
 # expected-error @+1 {{'__match' must be contained in a function}}
 __match 1:
     case 0:
         pass
+
+def match_scoping(a: Int):
+    __match a:
+    case 0:
+        var x = 42
+    case _:
+        # expected-error @+1 {{use of unknown declaration 'x'}}
+        _ = x

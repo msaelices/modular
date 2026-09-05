@@ -32,8 +32,8 @@ def case_callee[p: Int](): pass
 # CHECK-NEXT:      lit.call {{.*}}@"case_callee{{.*}}<index> 1
 # CHECK-NEXT:      hlcf.yield
 # CHECK-NEXT:    } {
-# CHECK-NEXT:      %[[F2:.*]] = kgen.param.constant: scalar<bool> = <false>
-# CHECK-NEXT:      hlcf.elif.yield %[[F2]]
+# CHECK-NEXT:      %[[T2:.*]] = kgen.param.constant: scalar<bool> = <true>
+# CHECK-NEXT:      hlcf.elif.yield %[[T2]]
 # CHECK-NEXT:    } then {
 # CHECK-NEXT:      lit.call {{.*}}@"case_callee{{.*}}<index> 2
 # CHECK-NEXT:      hlcf.yield
@@ -58,7 +58,7 @@ def match_same_indent(x: Int):
 # CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 0
 # CHECK:         hlcf.yield
 # CHECK:       } {
-# CHECK:         kgen.param.constant: scalar<bool> = <false>
+# CHECK:         kgen.param.constant: scalar<bool> = <true>
 # CHECK:         hlcf.elif.yield
 # CHECK:       } then {
 # CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 1
@@ -82,7 +82,7 @@ def match_indented_cases(x: Int):
 # CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 0
 # CHECK:         hlcf.yield
 # CHECK:       } {
-# CHECK:         kgen.param.constant: scalar<bool> = <false>
+# CHECK:         kgen.param.constant: scalar<bool> = <true>
 # CHECK:         hlcf.elif.yield
 # CHECK:       } then {
 # CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 1
@@ -100,14 +100,14 @@ def match_tuple_subject(point: Tuple[Int, Int]):
 
 # CHECK-LABEL: lit.fn @"match_with_guard
 # CHECK-NEXT:    hlcf.elif {
-# CHECK-NEXT:      %[[G0:.*]] = kgen.param.constant: scalar<bool> = <false>
-# CHECK-NEXT:      hlcf.elif.yield %[[G0]]
+# CHECK-NEXT:      %[[T0:.*]] = kgen.param.constant: scalar<bool> = <true>
+# CHECK-NEXT:      hlcf.elif.yield %[[T0]]
 # CHECK-NEXT:    } then {
 # CHECK-NEXT:      lit.call {{.*}}@"case_callee{{.*}}<index> 0
 # CHECK-NEXT:      hlcf.yield
 # CHECK-NEXT:    } {
-# CHECK-NEXT:      %[[G1:.*]] = kgen.param.constant: scalar<bool> = <false>
-# CHECK-NEXT:      hlcf.elif.yield %[[G1]]
+# CHECK-NEXT:      %[[F1:.*]] = kgen.param.constant: scalar<bool> = <false>
+# CHECK-NEXT:      hlcf.elif.yield %[[F1]]
 # CHECK-NEXT:    } then {
 # CHECK-NEXT:      lit.call {{.*}}@"case_callee{{.*}}<index> 1
 # CHECK-NEXT:      hlcf.yield
@@ -130,7 +130,7 @@ def match_with_guard(x: Int, c: Int):
 # CHECK:         %inside_case = lit.var.decl "inside_case"
 # CHECK:         hlcf.yield
 # CHECK:       } {
-# CHECK:         kgen.param.constant: scalar<bool> = <false>
+# CHECK:         kgen.param.constant: scalar<bool> = <true>
 # CHECK:         hlcf.elif.yield
 # CHECK:       } then {
 # CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 0

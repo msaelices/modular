@@ -80,6 +80,11 @@ LogicalResult ExprNode::emitDestructuringPValue(PValue value,
   return failure();
 }
 
+CValue ExprNode::emitMatch(IREmitter &emitter, CValue subject) const {
+  emitter.emitError(getLoc(), "expression is not a valid match pattern");
+  return {};
+}
+
 ExprNode::ELVIITResult LValueCapableExprNode::emitLValueIfImplicitlyTyped(
     IREmitter &emitter, PatternDeclKind kind, bool /*hasInferrableRHS*/) const {
   ExprDest dest(EC_Assignment);
@@ -568,6 +573,14 @@ SimpleLiteralNode::emitDestructuringPValue(PValue value,
   return ExprNode::emitDestructuringPValue(value, emitter);
 }
 
+CValue SimpleLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
+  // `_` always succeeds and introduces no bindings.
+  if (kind == kDiscardLiteral)
+    return PValue(SIMDAttr::getScalarBool(emitter.getContext(), true));
+
+  return ExprNode::emitMatch(emitter, subject);
+}
+
 AnyValue SimpleLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   if (kind == kNoneLiteral)
     return emitter.emitResult(emitter.shared.getNoneAttr(), this, dest);
@@ -659,6 +672,12 @@ AnyValue IntLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   ASTType type = emitter.shared.lookupBuiltinType("IntLiteral",
                                                   emitter.declScope, getLoc());
   return handleIntFPStringLiteral(attr, type, this, dest, emitter);
+}
+
+CValue IntLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
+  // TODO: Compare the subject against this integer literal.
+  (void)subject;
+  return PValue(SIMDAttr::getScalarBool(emitter.getContext(), false));
 }
 
 AnyValue FloatLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
@@ -3480,6 +3499,10 @@ AnyValue ParenNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   return emitter.emitExpr(subExpr, dest);
 }
 
+CValue ParenNode::emitMatch(IREmitter &emitter, CValue subject) const {
+  return subExpr->emitMatch(emitter, subject);
+}
+
 static AnyValue emitListLiteral(const ExprNode *expr,
                                 ArrayRef<ExprNode *> elements,
                                 IREmitter &emitter) {
@@ -5522,7 +5545,6 @@ AnyValue MagicFunctionNode::emitStructFieldRef(ExprDest &dest,
 
 LogicalResult TupleNode::emitDestructuringPValue(PValue toUnpack,
                                                  IREmitter &emitter) const {
-
   auto getTupleItem = [&](Type eltType, unsigned index) {
     // Get the item from the tuple into the corresponding LValue.
     ExprDest eltDest(eltType, EC_TupleElement);
@@ -5588,6 +5610,12 @@ LogicalResult TupleNode::emitDestructuringPValue(PValue toUnpack,
   }
 
   return success();
+}
+
+CValue TupleNode::emitMatch(IREmitter &emitter, CValue subject) const {
+  // FIXME: Decompose the subject and recursively match each element.
+  (void)subject;
+  return PValue(SIMDAttr::getScalarBool(emitter.getContext(), false));
 }
 
 // There are two options. We are emitting an instance of Tuple.
