@@ -360,7 +360,7 @@ This version is still a work in progress.
 ## Removed
 
 - Legacy constructs replaced in 1.0 were removed in this release, including
-  the `alias` and `__comptime_assert` keywords, `@parameter if` and
+  the `fn`, `alias` and `__comptime_assert` keywords, `@parameter if` and
   `@parameter for` syntax.
 
 This release completes the removal of APIs deprecated during the v1.0 cycle.

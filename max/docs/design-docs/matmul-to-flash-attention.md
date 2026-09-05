@@ -305,7 +305,7 @@ for kv_offset in range(0, num_keys, kv_tile_size):
     # To avoid overflow
     #   y[i] = exp(x[i] - max(x)) / sum(exp(x[i] - max(x))
 
-    # fn softmax(x):
+    # def softmax(x):
     #   var x_max       = rowmax(x)            # Need the entire row !!!!
     #   var numerator   = exp(x - x_max)
     #   var denominator = rowsum(numerator)    # Need the entire row !!!!

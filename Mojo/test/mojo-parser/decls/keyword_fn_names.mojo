@@ -77,10 +77,6 @@ def else():
 def except():
     pass
 
-# expected-error @+1 {{'fn' cannot be used as a function name in this context}}
-def fn():
-    pass
-
 # expected-error @+1 {{'False' cannot be used as a function name in this context}}
 def False():
     pass

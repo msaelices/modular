@@ -1955,17 +1955,10 @@ LogicalResult DeclResolver::resolveSignature(FnOp funcOp, Lexer &lexer,
                                              ASTDecl &decl) {
   ParserBase p(shared, lexer);
   auto decoratorExprs = p.parseDecorators(decl);
-  assert(p.getToken().isAny(Token::kw_async, Token::kw_def, Token::kw_fn) &&
+  assert(p.getToken().isAny(Token::kw_async, Token::kw_def) &&
          "not a function definition?");
   bool isAsync = p.consumeIf(Token::kw_async);
-  // FIXME(26.5): Remove support for 'fn'.
-  if (p.getToken().is(Token::kw_fn)) {
-    shared.emitError(p.getToken().getLoc(),
-                     "'fn' has been removed; use 'def' instead")
-        << FixIt::replaceToken(p.getToken().getLoc(), "def");
-  }
-
-  p.consumeToken();
+  p.consumeToken(Token::kw_def);
 
   StringAttr baseName;
   SMLoc identifierLoc;

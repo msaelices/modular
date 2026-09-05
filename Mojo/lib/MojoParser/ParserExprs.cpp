@@ -412,7 +412,6 @@ bool ParserBase::isPrimaryExprStart(Token::Kind tokKind) {
   case Token::kw_async:
   case Token::kw_def:
   case Token::kw_lambda:
-  case Token::kw_fn:
   case Token::kw___generator_type:
   case Token::kw___get_mvalue_as_litref:
   case Token::kw___get_litref_as_mvalue:
@@ -632,7 +631,6 @@ ParseResult ExprParser::parsePrimaryExpr(ExprNode *&result) {
 
   case Token::kw_async:
   case Token::kw_def:
-  case Token::kw_fn:
     if (failed(parseFunctionType(result)))
       return failure();
     break;
@@ -1387,12 +1385,7 @@ ParseResult ExprParser::parseFunctionType(ExprNode *&result) {
 
   // Parse the function effects from the leading keyword.
   fnSignature.effects.setAsync(consumeIf(Token::kw_async));
-  // TODO(26.5): Remove support for 'fn' entirely.
-  if (getToken().is(Token::kw_fn)) {
-    emitError(getToken().getLoc(), "'fn' has been removed; use 'def' instead")
-        << FixIt::replaceToken(getToken().getLoc(), "def");
-  }
-  consumeToken();
+  consumeToken(Token::kw_def);
 
   // Parameter signature, argument list and the function effects next.
   if (paramList.parseParametersIfPresent(*this,

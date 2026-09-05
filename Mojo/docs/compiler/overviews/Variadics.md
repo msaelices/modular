@@ -220,7 +220,7 @@ struct VariadicStruct[*arg_types: MyTrait]:
 
 def variadic_capturing[
     *arg_types: MyTrait, //,
-    func: fn (*args: *arg_types) -> Int,
+    func: def (*args: *arg_types) -> Int,
 ]() -> VariadicStruct[*arg_types]:
     ...
 ```
@@ -265,7 +265,7 @@ struct DeviceFunction[*arg_types: MyTrait]:
 
 def infer_variadic[
     *arg_types: MyTrait, //, # paraphrased
-    func: fn (*args: *arg_types) -> Int,
+    func: def (*args: *arg_types) -> Int,
 ]() -> DeviceFunction[*arg_types]:
     return DeviceFunction[*arg_types]()
 

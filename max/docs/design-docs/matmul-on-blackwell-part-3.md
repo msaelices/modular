@@ -37,7 +37,7 @@ decorator:
 
 ```mojo
 @__llvm_metadata(`nvvm.cluster_dim`=cluster_shape)
-fn blackwell_tma_pair_umma_kernel[
+def blackwell_tma_pair_umma_kernel[
  a_type,
  ...other parameters...,
  cluster_shape
