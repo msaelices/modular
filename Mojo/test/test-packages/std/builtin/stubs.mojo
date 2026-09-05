@@ -591,6 +591,9 @@ struct String(ErrorConversionTrait, ImplicitlyCopyable, KeyElement):
     def __init__(out self, *, deinit move: String):
         pass
 
+    def __eq__(self, other: Self) -> Bool:
+        return True
+
     def __deinit__(deinit self):
         pass
 
@@ -666,6 +669,10 @@ struct Bool(TrivialRegisterPassable):
     @always_inline("builtin")
     def __and__(self, rhs: Bool) -> Bool:
         return __mlir_op.`pop.simd.and`(self._mlir_value, rhs._mlir_value)
+
+    @always_inline("nodebug")
+    def __eq__(self, rhs: Bool) -> Bool:
+        return True
 
 
 struct Slice(TrivialRegisterPassable):

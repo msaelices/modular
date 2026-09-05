@@ -99,6 +99,7 @@ struct FloatLiteralNode final : public ExprNode {
   SMLoc getLoc() const override { return getSMLocFromStringRef(spelling); }
   SourceRange getRange() const override { return {getLoc(), getLoc()}; }
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 
@@ -116,6 +117,7 @@ struct BoolLiteralNode final : public ExprNode {
   SMLoc getLoc() const override { return loc; }
   SourceRange getRange() const override { return {getLoc(), getLoc()}; }
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 
@@ -171,6 +173,7 @@ struct StringLiteralNode final : public ExprNode {
     return {getLoc(), getSMLocFromStringRef(spellings.back())};
   }
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 

@@ -674,10 +674,33 @@ AnyValue IntLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   return handleIntFPStringLiteral(attr, type, this, dest, emitter);
 }
 
+/// Match an Int/Float/String/Bool literal pattern by emitting the literal as
+/// the subject's type and comparing with `__eq__`, then converting to i1.
+static CValue matchLiteral(const ExprNode *expr, IREmitter &emitter,
+                           CValue subject) {
+  // Emit this literal as a value of the subject's type, then compare.
+  ExprDest litDest(subject.getRValueType(), EC_MatchSubject);
+  AnyValue litValue = emitter.emitExpr(expr, litDest);
+  if (!litValue)
+    return {};
+
+  CValue eqResult = emitter.emitNamedMethodCall(
+      "__eq__",
+      CallOperands(CallSyntax::kMethodCall, expr, ExprDest(EC_BoolCondition),
+                   {{AnyValue(subject), expr}, {litValue, expr}}));
+  if (!eqResult)
+    return {};
+
+  // Convert Bool (or other boolable) to scalar<bool> / i1 for hlcf.elif.
+  return emitter.emitScalarBool({eqResult, expr}, EC_BoolCondition);
+}
+
+CValue BoolLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
+  return matchLiteral(this, emitter, subject);
+}
+
 CValue IntLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
-  // TODO: Compare the subject against this integer literal.
-  (void)subject;
-  return PValue(SIMDAttr::getScalarBool(emitter.getContext(), false));
+  return matchLiteral(this, emitter, subject);
 }
 
 AnyValue FloatLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
@@ -686,6 +709,10 @@ AnyValue FloatLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   ASTType type = emitter.shared.lookupBuiltinType("FloatLiteral",
                                                   emitter.declScope, getLoc());
   return handleIntFPStringLiteral(attr, type, this, dest, emitter);
+}
+
+CValue FloatLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
+  return matchLiteral(this, emitter, subject);
 }
 
 /// The value of a string is the concatenated value with escapes and quotes
@@ -712,6 +739,10 @@ AnyValue StringLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   // Flatten multiple concat'd strings, remove """'s and "'s etc.
   std::string value = getValue();
   return emitCtorCall(value, this, dest, emitter);
+}
+
+CValue StringLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
+  return matchLiteral(this, emitter, subject);
 }
 
 /// Get the source range for a t-string, from start to the closing quote.

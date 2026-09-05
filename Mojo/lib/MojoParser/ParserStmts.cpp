@@ -1653,7 +1653,7 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
     SRValue condRVal = emitter.emitSRValue({condCVal, caseEntry.patternExpr},
                                            EC_BoolCondition);
     if (!condRVal)
-      return failure();
+      continue;
 
     // Emit the guard if present.  We handle it with a nested if statement,
     // since we only want to emit the body if the guard is true.
