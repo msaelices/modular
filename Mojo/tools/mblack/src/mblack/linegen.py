@@ -270,8 +270,32 @@ class LineGenerator(Visitor[Line]):
             for child in node.children:
                 yield from self.visit(child)
 
-    def visit_match_case(self, node: Node) -> Iterator[Line]:
-        """Visit either a match or case statement."""
+    def visit_match_stmt(self, node: Node) -> Iterator[Line]:
+        """Visit a match / __match statement.
+
+        In Mojo mode, cases share the match indent (no extra indent around the
+        case blocks). Skip the Python-style INDENT/DEDENT wrapper when present.
+        """
+        normalize_invisible_parens(
+            node, parens_after=set(), preview=self.mode.preview
+        )
+
+        yield from self.line()
+        for child in node.children:
+            if (
+                self.mode.is_mojo
+                and isinstance(child, Leaf)
+                and child.type in (token.INDENT, token.DEDENT)
+            ):
+                # Preserve any comments carried on DEDENT without changing depth.
+                if child.type == token.DEDENT and child.prefix:
+                    yield from self.line()
+                    yield from self.visit_default(child)
+                continue
+            yield from self.visit(child)
+
+    def visit_case_block(self, node: Node) -> Iterator[Line]:
+        """Visit a case block."""
         normalize_invisible_parens(
             node, parens_after=set(), preview=self.mode.preview
         )
@@ -651,10 +675,6 @@ class LineGenerator(Visitor[Line]):
         self.visit_del_stmt = partial(v, keywords=Ø, parens={"del"})
         self.visit_async_funcdef = self.visit_async_stmt
         self.visit_decorated = self.visit_decorators
-
-        # PEP 634
-        self.visit_match_stmt = self.visit_match_case
-        self.visit_case_block = self.visit_match_case
 
         # Mojo-specific declarations
         from mblib2to3.pgen2 import token as mtoken

@@ -316,6 +316,13 @@ yield_arg: 'from' test | testlist_star_expr
 
 
 # 3.10 match statement definition
+#
+# Soft keywords use double quotes ("match", "case", "__match").
+#
+# Two layouts are accepted after the subject colon:
+#   1. Python style: NEWLINE INDENT case_block+ DEDENT
+#   2. Mojo style:   NEWLINE case_block+   (cases share the match indent)
+# Mojo mode formatting always emits layout (2).
 
 # PS: normally the grammar is much much more restricted, but
 # at this moment for not trying to bother much with encoding the
@@ -329,7 +336,7 @@ yield_arg: 'from' test | testlist_star_expr
 # expressions, but who cares. If we can parse them, that is enough
 # to reformat them.
 
-match_stmt: "match" subject_expr ':' NEWLINE INDENT case_block+ DEDENT
+match_stmt: ("match" | "__match") subject_expr ':' NEWLINE (INDENT case_block+ DEDENT | case_block+)
 
 # This is more permissive than the actual version. For example it
 # accepts `match *something:`, even though single-item starred expressions

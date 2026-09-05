@@ -241,6 +241,10 @@ def __struct_field_ref():
 def __is_run_in_comptime_interpreter():
     pass
 
+# expected-error @+1 {{'__match' cannot be used as a function name in this context}}
+def __match():
+    pass
+
 
 # Nested free functions are rejected too.
 def outer():

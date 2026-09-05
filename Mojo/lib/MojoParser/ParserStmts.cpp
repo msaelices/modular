@@ -108,6 +108,7 @@ static bool isStatementThatMightHaveDecorators(Token::Kind tokenKind) {
   case Token::kw_while:
   case Token::kw_try:
   case Token::kw_with:
+  case Token::kw___match:
   case Token::kw_async:
   case Token::kw_def:
   case Token::kw_struct:
@@ -288,6 +289,7 @@ struct StmtParser : public ParserBase {
   ParseResult parseParamIf(Location ifLoc, LexerCursor startCursor,
                            size_t curIndent);
   ParseResult parseWhileStmt(size_t curIndent);
+  ParseResult parseMatchStmt(size_t curIndent);
 
   // This emits the pattern for a 'for' loop, calling the specified 'bodyFn'
   // closure on success when in the scope of the loop, and the specified
@@ -730,6 +732,12 @@ ParseResult StmtParser::parseStmt(bool onlySimpleStmt, bool &parsedCompound,
     if (rejectInNonFunctionScope())
       return success();
     return parseWhileStmt(stmtIndent);
+  case Token::kw___match:
+    rejectDecorator();  // Decorators not allowed.
+    rejectSimpleStmt(); // Not a simple_stmt.
+    if (rejectInNonFunctionScope())
+      return success();
+    return parseMatchStmt(stmtIndent);
   case Token::kw_try:
     rejectDecorator(); // Decorators not allowed.
     rejectSimpleStmt();
@@ -1523,6 +1531,56 @@ ParseResult StmtParser::parseWhileStmt(size_t curIndent) {
       return failure();
   }
   LIT::LoopYieldOp::create(builder, whileLoc);
+  return success();
+}
+
+/// match_stmt ::=  "__match" subject_expr ":" NEWLINE
+///                 case_block+
+/// case_block  ::= "case" pattern ":" suite
+///
+ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
+  SMLoc matchLoc = consumeToken(Token::kw___match).getLoc();
+
+  // Parse the match subject.
+  ExprNode *subjectExpr = nullptr;
+  if (parseExpression(subjectExpr, curIndent, Precedence::kAssignExpr) ||
+      parseToken(Token::colon, "expected ':' after match subject"))
+    return failure();
+
+  // Parse one or more case blocks. Cases may share the match indent (Mojo
+  // style) or be indented beneath it (Python style).
+  bool sawCase = false;
+  while (isTokenInCurrentStatement(curIndent, /*allowSameIndent=*/true) &&
+         getToken().is(Token::kw_case)) {
+    sawCase = true;
+    size_t caseIndent = getToken().getIndentation().value_or(curIndent);
+    consumeToken(Token::kw_case);
+
+    // Parse the case pattern as an expression.
+    ExprNode *patternExpr = nullptr;
+    if (parseExpression(patternExpr, caseIndent) ||
+        parseToken(Token::colon, "expected ':' after case pattern")) {
+      skipUntilIndentation(caseIndent);
+      continue;
+    }
+
+    // TODO: Support trailing case predicates, "case _ if c != 0:".
+
+    // Skip the case body without lowering it: match IR is not implemented.
+    skipUntilIndentation(caseIndent);
+    // Subject/pattern expressions are currently unused — match lowering is TBD.
+    (void)patternExpr;
+  }
+
+  if (!sawCase) {
+    emitError(matchLoc) << "'__match' statement must have at least one 'case' "
+                           "block";
+    return success();
+  }
+
+  // Subject expression is currently unused — match lowering is TBD.
+  (void)subjectExpr;
+  emitError(matchLoc) << "'__match' statement is not implemented yet";
   return success();
 }
 
