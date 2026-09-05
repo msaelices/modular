@@ -323,13 +323,6 @@ struct StmtParser : public ParserBase {
   ParseResult parseForTargetAndSequence(size_t curIndent, SMLoc &forLoc,
                                         ExprNode *&targetExpr,
                                         ExprNode *&seqExpr);
-  // Helper to check if decorators contain @parameter.
-  // If emitErrors is true, emits errors for non-@parameter decorators.
-  // Returns true if @parameter was found, restores cursor if restoreCursor is
-  // true.
-  bool hasParameterDecorator(LexerCursor startCursor, size_t curIndent,
-                             bool emitErrors, bool restoreCursor,
-                             StringRef stmtName);
   // Parses 'comptime assert' after keywords are consumed.
   ParseResult parseComptimeAssertStmtBody(LexerCursor startCursor,
                                           size_t curIndent, SMLoc kwLoc);
@@ -721,11 +714,13 @@ ParseResult StmtParser::parseStmt(bool onlySimpleStmt, bool &parsedCompound,
     // Compound statements.
     //===------------------------------------------------------------------===//
   case Token::kw_if:
+    rejectDecorator();  // Decorators not allowed.
     rejectSimpleStmt(); // Not a simple_stmt.
     if (rejectInNonFunctionScope())
       return success();
     return parseIfStmt(startCursor, stmtIndent);
   case Token::kw_for:
+    rejectDecorator();  // Decorators not allowed.
     rejectSimpleStmt(); // Not a simple_stmt.
     if (rejectInNonFunctionScope())
       return success();
@@ -896,27 +891,12 @@ ParseResult StmtParser::parseComptimeCompoundStmt(LexerCursor startCursor,
     if (!hadDecorators)
       return;
 
-    // Check if the decorator is @parameter to provide a more specific error.
-    bool hasParamDecorator =
-        hasParameterDecorator(startCursor, curIndent,
-                              /*emitErrors=*/false, /*restoreCursor=*/true,
-                              /*stmtName=*/{});
-
     auto diag = emitTokenError();
-    if (hasParamDecorator) {
-      // Special error for @parameter since it's redundant with comptime.
-      diag << "@parameter decorator is redundant on 'comptime";
-      if (isCompoundStmt)
-        diag << " " << getToken().getSpelling();
-      diag << "'";
-    } else {
-      // Generic error for other decorators.
-      diag << "'comptime";
-      if (isCompoundStmt)
-        diag << " " << getToken().getSpelling();
-      diag << "' statement " << (inFunctionBody ? "in function body " : "")
-           << "does not support decorators; remove the decorator";
-    }
+    diag << "'comptime";
+    if (isCompoundStmt)
+      diag << " " << getToken().getSpelling();
+    diag << "' statement " << (inFunctionBody ? "in function body " : "")
+         << "does not support decorators; remove the decorator";
   };
 
   // Check if we're in a non-function scope (type body or module scope) where
@@ -970,6 +950,16 @@ ParseResult StmtParser::parseComptimeCompoundStmt(LexerCursor startCursor,
   return parseAliasDeclStmtBody(startCursor, curIndent, kwLoc);
 }
 
+/// if_stmt ::=  "if" assignment_expression ":" suite
+///             ("elif" assignment_expression ":" suite)*
+///             ["else" ":" suite]
+ParseResult StmtParser::parseIfStmt(LexerCursor startCursor, size_t curIndent) {
+  Location ifLoc = translateLocation(getToken().getLoc());
+  if (parseToken(Token::kw_if, "expected 'if' token after decorators"))
+    return failure();
+  return parseElif(ifLoc, startCursor, curIndent);
+}
+
 /// Parses 'comptime if <condition>:' after 'comptime' has been consumed.
 /// Delegates to parseParamIf for the actual IR generation.
 ParseResult StmtParser::parseComptimeIfStmt(LexerCursor startCursor,
@@ -977,44 +967,6 @@ ParseResult StmtParser::parseComptimeIfStmt(LexerCursor startCursor,
   Location ifLoc = translateLocation(getToken().getLoc());
   consumeToken(Token::kw_if);
   return parseParamIf(ifLoc, startCursor, curIndent);
-}
-
-/// Helper to check if decorators contain @parameter.
-/// If emitErrors is true, emits errors for non-@parameter decorators.
-/// Returns true if @parameter was found, restores cursor if restoreCursor is
-/// true.
-bool StmtParser::hasParameterDecorator(LexerCursor startCursor,
-                                       size_t curIndent, bool emitErrors,
-                                       bool restoreCursor, StringRef stmtName) {
-  if (startCursor == getLexer().getCursor())
-    return false;
-
-  LexerCursor savedCursor = getLexer().getCursor();
-  startCursor.restore(getLexer());
-
-  bool foundParameter = false;
-  for (auto [decorator, cursor] : parseDecorators(curIndent)) {
-    if (auto *dre = dyn_cast<DeclRefNode>(decorator)) {
-      if (dre->spelling == "parameter") {
-        foundParameter = true;
-        if (!emitErrors)
-          break; // Early exit if we're just checking
-        continue;
-      }
-    }
-
-    if (emitErrors) {
-      emitError(decorator->getLoc())
-          << "'" << stmtName
-          << "' statement does not support decorators; remove the decorator"
-          << decorator->getRange();
-    }
-  }
-
-  if (restoreCursor)
-    savedCursor.restore(getLexer());
-
-  return foundParameter;
 }
 
 /// Helper to parse 'for <target> in <seq>:' syntax, used by both regular
@@ -1580,19 +1532,6 @@ ParseResult StmtParser::parseWhileStmt(size_t curIndent) {
 ///              ["else" ":" suite]
 ParseResult StmtParser::parseForStmt(LexerCursor startCursor,
                                      size_t curIndent) {
-  // This is enabled with the @parameter decorator or 'comptime' keyword.
-  // Check for decorators and emit errors for unsupported ones.
-  bool isParamFor = hasParameterDecorator(startCursor, curIndent,
-                                          /*emitErrors=*/true,
-                                          /*restoreCursor=*/false, "for");
-
-  if (isParamFor) {
-    SMLoc atLoc = startCursor.getToken().getLoc();
-    SMLoc forTokLoc = getToken().getLoc();
-    emitWarning(atLoc, "'@parameter for' is deprecated; use 'comptime for'")
-        << FixIt(SourceRange::getByteLevel(atLoc, forTokLoc), "comptime ");
-  }
-
   SMLoc forLoc;
   ExprNode *targetExpr = nullptr;
   ExprNode *seqExpr = nullptr;
@@ -1602,9 +1541,6 @@ ParseResult StmtParser::parseForStmt(LexerCursor startCursor,
   // We will be moving the builder into sub-regions that are created, make sure
   // we end up after it when this is done.
   llvm::SaveAndRestore builderSaver(builder);
-
-  if (isParamFor) // Comptime for stmt.
-    return parseParamFor(curIndent, forLoc, targetExpr, seqExpr);
 
   // Otherwise, this is a dynamic for stmt.
   auto forStmt = emitForStmt(
@@ -2969,32 +2905,6 @@ ParseResult StmtParser::parseElif(Location ifLoc, LexerCursor startCursor,
   }
 
   return success();
-}
-
-/// if_stmt ::=  "if" assignment_expression ":" suite
-///             ("elif" assignment_expression ":" suite)*
-///             ["else" ":" suite]
-ParseResult StmtParser::parseIfStmt(LexerCursor startCursor, size_t curIndent) {
-  // This is enabled with the @parameter decorator.
-  // Note that the `comptime if` pattern is parsed elsewhere.
-  // Check for decorators and emit errors for unsupported ones.
-  bool isParamIf = hasParameterDecorator(startCursor, curIndent,
-                                         /*emitErrors=*/true,
-                                         /*restoreCursor=*/false, "if");
-
-  if (isParamIf) {
-    SMLoc atLoc = startCursor.getToken().getLoc();
-    SMLoc ifTokLoc = getToken().getLoc();
-    emitWarning(atLoc, "'@parameter if' is deprecated; use 'comptime if'")
-        << FixIt(SourceRange::getByteLevel(atLoc, ifTokLoc), "comptime ");
-  }
-
-  Location ifLoc = translateLocation(getToken().getLoc());
-  if (parseToken(Token::kw_if, "expected 'if' token after decorators"))
-    return failure();
-  if (!isParamIf)
-    return parseElif(ifLoc, startCursor, curIndent);
-  return parseParamIf(ifLoc, startCursor, curIndent);
 }
 
 /// Validates that an import statement appears at a permitted scope: either

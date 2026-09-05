@@ -243,8 +243,7 @@ struct DJBX33A_Hasher[custom_secret: UInt64 = 0](Hasher):
     @always_inline
     fn __init__(out self):
         self.hash_data = 5361
-        @parameter
-        if custom_secret != 0:
+        comptime if custom_secret != 0:
             self.secret = custom_secret
         else:
             self.secret = _DJBX33A_SECRET()
@@ -260,8 +259,7 @@ struct DJBX33A_Hasher[custom_secret: UInt64 = 0](Hasher):
         """The algorithm is not optimal."""
         alias size_in_bytes = size * size_of[dt]()
         var bytes = bitcast[DType.uint8, size_in_bytes](value)
-        @parameter
-        for i in range(size_in_bytes):
+        comptime for i in range(size_in_bytes):
             self.hash_data = self.hash_data * 33 + bytes[i].cast[DType.uint64]()
 
     @always_inline

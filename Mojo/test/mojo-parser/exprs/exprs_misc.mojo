@@ -11,12 +11,12 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+# RUN: %parse-mojo-isolated %s -verify-diagnostics | FileCheck %s
+
 
 def marker():
     pass
 
-
-# RUN: %parse-mojo-isolated %s -verify-diagnostics | FileCheck %s
 struct Unmovable(Movable where False):
     def __init__(out self):
         pass

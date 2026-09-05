@@ -157,22 +157,20 @@ trait Copyable:
 ```
 
 These aliases allow containers to use custom logic with straight-forward
-`@parameter if`'s to conditionalize their behavior:
+`comptime if`'s to conditionalize their behavior:
 
 ```mojo
 struct List[T: Copyable & Movable]: # Look, no hint_trivial_type!
     ...
     fn __del__(owned self):
-        @parameter
-        if not T.__del__is_trivial_unsafe:
+        comptime if not T.__del__is_trivial_unsafe:
             for i in range(len(self)):
                 (self.data + i).destroy_pointee()
         self.data.free()
 
     fn __copyinit__(out self, existing: Self):
         self = Self(capacity=existing.capacity)
-        @parameter
-        if T.__copyinit__is_trivial_unsafe:
+        comptime if T.__copyinit__is_trivial_unsafe:
             # ... memcpy ...
         else:
             # ... append copies...
@@ -238,8 +236,7 @@ smart custom behavior:
 ```mojo
 struct InlineArray[ElementType: Copyable & Movable]:
     fn __copyinit__(out self, other: Self):
-        @parameter
-        if ElementType.__copyinit__is_trivial_unsafe:
+        comptime if ElementType.__copyinit__is_trivial_unsafe:
             # ... memcpy ...
         else:
             # ... append copies...

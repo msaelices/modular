@@ -765,7 +765,7 @@ void LowerSemanticCF::lowerBlock(Block &block, bool &doesRaise, bool &doesBreak,
     assert((isa<HLCF::IfOp, ParamIfOp>(op)) &&
            "Unknown operation with regions");
 
-    // If this is a dynamic `if False:` or @parameter if on known condition,
+    // If this is a dynamic `if False:` or comptime if on known condition,
     // mark the unreachable block as unreachable so we don't consider it live.
     Region *deadRegion = nullptr;
     bool constantCondValue = false;
@@ -790,7 +790,7 @@ void LowerSemanticCF::lowerBlock(Block &block, bool &doesRaise, bool &doesBreak,
     if (deadRegion) {
       Block &deadBlock = deadRegion->front();
       Operation *firstDeadOp = &deadBlock.front();
-      // Warn about unreachable code in an 'if', but not in a '@parameter if'.
+      // Warn about unreachable code in an 'if', but not in a 'comptime if'.
       // It serves the function of ifdef's, and conditions are often
       // known-statically true/false.
       if (!isa<ParamIfOp>(op) &&

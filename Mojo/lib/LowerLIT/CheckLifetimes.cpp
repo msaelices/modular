@@ -4775,7 +4775,7 @@ BitVector DestructorInsertion::unifyConsumedSets(const BitVector &set1,
 /// For a loop, we know the consume sets for any break statements, but need
 /// to iterate the loop to find the right continue sets to use.
 ///
-/// In terms of form, both standard for and @parameter for loops will have their
+/// In terms of form, both standard for and comptime for loops will have their
 /// 'else' block removed (merged into their body).
 void DestructorInsertion::checkLoopOp(Operation &loopOp) {
   // True if this is a parameter for, false if this is an infinite HLCF::LoopOp.
@@ -4786,7 +4786,7 @@ void DestructorInsertion::checkLoopOp(Operation &loopOp) {
 
   auto loopBodySets = DestructorInsertion::copy(*this);
   // Any 'break's within the loop will produce the consume set for the
-  // statement immediately after the loop.  However, @parameter for statements
+  // statement immediately after the loop.  However, comptime for statements
   // may have an 'else' block that break statements skip over. Save the exit
   // set for break statements.
   BitVector breakSet(consumedValues);
