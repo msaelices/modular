@@ -605,10 +605,6 @@ class LineGenerator(Visitor[Line]):
         self.visit_assert_stmt = partial(
             v, keywords={"assert"}, parens={"assert", ","}
         )
-        # Old __comptime_assert syntax (deprecated)
-        self.visit_old_comptime_assert_stmt = partial(
-            v, keywords={"__comptime_assert"}, parens={"__comptime_assert", ","}
-        )
         # New comptime assert syntax: "comptime assert expr, msg"
         # The comptime_assert_stmt_body rule contains "assert test [, test]"
         # and needs parens after "assert" and "," for line splitting.
@@ -1459,7 +1455,6 @@ def maybe_make_parens_invisible_in_atom(
             syms.annassign,
             syms.expr_stmt,
             syms.assert_stmt,
-            syms.old_comptime_assert_stmt,
             syms.comptime_assert_stmt_body,
             syms.return_stmt,
             # these ones aren't useful to end users, but they do please fuzzers

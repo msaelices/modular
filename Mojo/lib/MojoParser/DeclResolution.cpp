@@ -2675,15 +2675,14 @@ LogicalResult DeclResolver::resolveSignature(AliasDeclOp aliasDeclOp,
         .applySignatureDecorators(decoratorExprs);
   }
 
-  // Parse the type if present. Accept either 'alias' or 'comptime' keyword.
-  SMLoc identifierLoc;
-  if (p.getToken().isNot(Token::kw_alias, Token::kw_comptime)) {
+  // Parse the type if present. Accept 'comptime' keyword.
+  if (!p.consumeIf(Token::kw_comptime)) {
     p.emitError(p.getToken().getLoc(),
                 "internal error: checked by stmt parser");
     return failure();
   }
-  p.consumeToken(); // Consume either kw_alias or kw_comptime
 
+  SMLoc identifierLoc;
   if (p.parseIdentifier("internal error: checked by stmt parser",
                         &identifierLoc))
     return failure();

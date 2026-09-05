@@ -117,7 +117,6 @@ static bool isStatementThatMightHaveDecorators(Token::Kind tokenKind) {
   case Token::kw_import:
   case Token::kw_pass:
   case Token::kw_var:
-  case Token::kw_alias:
   case Token::kw_comptime:
   case Token::kw___mlir_region:
   case Token::kw_return:
@@ -791,15 +790,6 @@ ParseResult StmtParser::parseStmt(bool onlySimpleStmt, bool &parsedCompound,
     if (isa_and_nonnull<FnOp>(getParentDecl().getIfOperation()))
       break;
     return parseVarStmt(startCursor, stmtIndent);
-  case Token::kw_alias: {
-    // Decorators on aliases are not allowed inside function bodies.
-    if (isa_and_nonnull<FnOp>(getParentDecl().getIfOperation()))
-      rejectDecorator(/*inFunctionBody=*/true);
-    SMLoc kwLoc = consumeToken(Token::kw_alias).getLoc();
-    shared.emitWarning(kwLoc, "'alias' is deprecated; use 'comptime'")
-        << FixIt::replaceToken(kwLoc, "comptime");
-    return parseAliasDeclStmtBody(startCursor, stmtIndent, kwLoc);
-  }
   case Token::kw_comptime:
     return parseComptimeCompoundStmt(startCursor, stmtIndent, hadDecorators);
   case Token::kw___mlir_region:
@@ -815,14 +805,6 @@ ParseResult StmtParser::parseStmt(bool onlySimpleStmt, bool &parsedCompound,
   case Token::kw_assert:
     rejectDecorator(); // Decorators not allowed.
     return parseAssertStmt(stmtIndent);
-  case Token::kw___comptime_assert: {
-    rejectDecorator(); // Decorators not allowed.
-    SMLoc kwLoc = consumeToken(Token::kw___comptime_assert).getLoc();
-    shared.emitWarning(
-        kwLoc, "'__comptime_assert' is deprecated; use 'comptime assert'")
-        << FixIt::replaceToken(kwLoc, "comptime assert");
-    return parseComptimeAssertStmtBody(startCursor, stmtIndent, kwLoc);
-  }
   case Token::kw_continue:
     rejectDecorator(); // Decorators not allowed.
     return parseBreakOrContinueStmt(Token::kw_continue, "continue",

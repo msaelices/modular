@@ -17,10 +17,6 @@
 def _():
     pass
 
-# expected-error @+1 {{'alias' cannot be used as a function name in this context}}
-def alias():
-    pass
-
 # expected-error @+1 {{'and' cannot be used as a function name in this context}}
 def and():
     pass
@@ -55,10 +51,6 @@ def class():
 
 # expected-error @+1 {{'comptime' cannot be used as a function name in this context}}
 def comptime():
-    pass
-
-# expected-error @+1 {{'__comptime_assert' cannot be used as a function name in this context}}
-def __comptime_assert():
     pass
 
 # expected-error @+1 {{'continue' cannot be used as a function name in this context}}
