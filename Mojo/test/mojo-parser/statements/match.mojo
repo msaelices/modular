@@ -11,46 +11,136 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-# RUN: %parse-mojo-isolated -verify-diagnostics %s
+# RUN: %parse-mojo-isolated %s | FileCheck %s
 
-# Basic recognition of `__match` / `case`. IR lowering is not implemented yet,
-# so well-formed matches diagnose as unimplemented after parsing.
+# A function we can call with minimal IR gruff but still verify the right
+# code is put out in the right place.
+def case_callee[p: Int](): pass
 
+
+# CHECK-LABEL: lit.fn @"match_same_indent
+# CHECK-NEXT:    hlcf.elif {
+# CHECK-NEXT:      %[[F0:.*]] = kgen.param.constant: scalar<bool> = <false>
+# CHECK-NEXT:      hlcf.elif.yield %[[F0]]
+# CHECK-NEXT:    } then {
+# CHECK-NEXT:      lit.call {{.*}}@"case_callee{{.*}}<index> 0
+# CHECK-NEXT:      hlcf.yield
+# CHECK-NEXT:    } {
+# CHECK-NEXT:      %[[F1:.*]] = kgen.param.constant: scalar<bool> = <false>
+# CHECK-NEXT:      hlcf.elif.yield %[[F1]]
+# CHECK-NEXT:    } then {
+# CHECK-NEXT:      lit.call {{.*}}@"case_callee{{.*}}<index> 1
+# CHECK-NEXT:      hlcf.yield
+# CHECK-NEXT:    } {
+# CHECK-NEXT:      %[[F2:.*]] = kgen.param.constant: scalar<bool> = <false>
+# CHECK-NEXT:      hlcf.elif.yield %[[F2]]
+# CHECK-NEXT:    } then {
+# CHECK-NEXT:      lit.call {{.*}}@"case_callee{{.*}}<index> 2
+# CHECK-NEXT:      hlcf.yield
+# CHECK-NEXT:    } else {
+# CHECK-NEXT:      hlcf.yield
+# CHECK-NEXT:    }
 def match_same_indent(x: Int):
-    # expected-error @+1 {{'__match' statement is not implemented yet}}
     __match x:
     case 0:
-        pass
+        case_callee[0]()
     case 1:
-        pass
+        case_callee[1]()
     case _:
-        pass
+        case_callee[2]()
 
 
+# CHECK-LABEL: lit.fn @"match_indented_cases
+# CHECK:       hlcf.elif {
+# CHECK:         kgen.param.constant: scalar<bool> = <false>
+# CHECK:         hlcf.elif.yield
+# CHECK:       } then {
+# CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 0
+# CHECK:         hlcf.yield
+# CHECK:       } {
+# CHECK:         kgen.param.constant: scalar<bool> = <false>
+# CHECK:         hlcf.elif.yield
+# CHECK:       } then {
+# CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 1
+# CHECK:         hlcf.yield
+# CHECK:       } else {
+# CHECK:         hlcf.yield
+# CHECK:       }
 def match_indented_cases(x: Int):
-    # expected-error @+1 {{'__match' statement is not implemented yet}}
     __match x:
         case 0:
-            pass
+            case_callee[0]()
         case _:
-            pass
+            case_callee[1]()
 
 
+# CHECK-LABEL: lit.fn @"match_tuple_subject
+# CHECK:       hlcf.elif {
+# CHECK:         kgen.param.constant: scalar<bool> = <false>
+# CHECK:         hlcf.elif.yield
+# CHECK:       } then {
+# CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 0
+# CHECK:         hlcf.yield
+# CHECK:       } {
+# CHECK:         kgen.param.constant: scalar<bool> = <false>
+# CHECK:         hlcf.elif.yield
+# CHECK:       } then {
+# CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 1
+# CHECK:         hlcf.yield
+# CHECK:       } else {
+# CHECK:         hlcf.yield
+# CHECK:       }
 def match_tuple_subject(point: Tuple[Int, Int]):
-    # expected-error @+1 {{'__match' statement is not implemented yet}}
     __match point:
     case (0, 0):
-        pass
+        case_callee[0]()
     case _:
-        pass
+        case_callee[1]()
 
 
-def match_missing_cases(x: Int):
-    # expected-error @+1 {{'__match' statement must have at least one 'case' block}}
+# CHECK-LABEL: lit.fn @"match_with_guard
+# CHECK-NEXT:    hlcf.elif {
+# CHECK-NEXT:      %[[G0:.*]] = kgen.param.constant: scalar<bool> = <false>
+# CHECK-NEXT:      hlcf.elif.yield %[[G0]]
+# CHECK-NEXT:    } then {
+# CHECK-NEXT:      lit.call {{.*}}@"case_callee{{.*}}<index> 0
+# CHECK-NEXT:      hlcf.yield
+# CHECK-NEXT:    } {
+# CHECK-NEXT:      %[[G1:.*]] = kgen.param.constant: scalar<bool> = <false>
+# CHECK-NEXT:      hlcf.elif.yield %[[G1]]
+# CHECK-NEXT:    } then {
+# CHECK-NEXT:      lit.call {{.*}}@"case_callee{{.*}}<index> 1
+# CHECK-NEXT:      hlcf.yield
+# CHECK-NEXT:    } else {
+# CHECK-NEXT:      hlcf.yield
+# CHECK-NEXT:    }
+def match_with_guard(x: Int, c: Int):
     __match x:
-
-
-# expected-error @+1 {{'__match' must be contained in a function}}
-__match 1:
+    case _ if c != 0:
+        case_callee[0]()
     case 0:
-        pass
+        case_callee[1]()
+
+
+# CHECK-LABEL: lit.fn @"match_case_body
+# CHECK:       hlcf.elif {
+# CHECK:         kgen.param.constant: scalar<bool> = <false>
+# CHECK:         hlcf.elif.yield
+# CHECK:       } then {
+# CHECK:         %inside_case = lit.var.decl "inside_case"
+# CHECK:         hlcf.yield
+# CHECK:       } {
+# CHECK:         kgen.param.constant: scalar<bool> = <false>
+# CHECK:         hlcf.elif.yield
+# CHECK:       } then {
+# CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 0
+# CHECK:         hlcf.yield
+# CHECK:       } else {
+# CHECK:         hlcf.yield
+# CHECK:       }
+def match_case_body(x: Int):
+    __match x:
+    case 0:
+        var inside_case: Int
+    case _:
+        case_callee[0]()

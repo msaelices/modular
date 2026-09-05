@@ -1534,12 +1534,13 @@ ParseResult StmtParser::parseWhileStmt(size_t curIndent) {
   return success();
 }
 
-/// match_stmt ::=  "__match" subject_expr ":" NEWLINE
+/// match_stmt ::=  "match" subject_expr ":" NEWLINE
 ///                 case_block+
-/// case_block  ::= "case" pattern ":" suite
+/// case_block  ::= "case" pattern ["if" expression] ":" suite
 ///
 ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
   SMLoc matchLoc = consumeToken(Token::kw___match).getLoc();
+  Location matchLocation = translateLocation(matchLoc);
 
   // Parse the match subject.
   ExprNode *subjectExpr = nullptr;
@@ -1547,40 +1548,116 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
       parseToken(Token::colon, "expected ':' after match subject"))
     return failure();
 
+  // Evaluate the subject once; match IR will consume this later.
+  CValue subject = getEmitter().emitExprCValue(subjectExpr, EC_MatchSubject);
+  if (!subject) {
+    // If we failed to emit the subject expression, skip over the body of the
+    // match statement entirely. We do this by skipping any same-indent `case`
+    // blocks that belong to this match, then stop at the next
+    // same-or-less-indented token (this also covers Python-style cases
+    // indented under the match).
+    while (isTokenInCurrentStatement(curIndent, /*allowSameIndent=*/true) &&
+           getToken().is(Token::kw_case)) {
+      size_t caseIndent = getToken().getIndentation().value_or(curIndent);
+      consumeToken(Token::kw_case);
+      skipUntilIndentation(caseIndent);
+    }
+    skipUntilIndentation(curIndent);
+    return success();
+  }
+
   // Parse one or more case blocks. Cases may share the match indent (Mojo
-  // style) or be indented beneath it (Python style).
-  bool sawCase = false;
+  // style) or be indented beneath it (Python style).  We parse each of the
+  // patterns before emitting the IR so we can optimize the pattern tests and
+  // allocate the ElIf statement once.
+  struct CaseEntry {
+    ExprNode *patternExpr;
+    ExprNode *guardExpr;
+    LexerCursor caseCursor;
+  };
+  SmallVector<CaseEntry, 4> caseEntries;
+
   while (isTokenInCurrentStatement(curIndent, /*allowSameIndent=*/true) &&
          getToken().is(Token::kw_case)) {
-    sawCase = true;
     size_t caseIndent = getToken().getIndentation().value_or(curIndent);
     consumeToken(Token::kw_case);
 
-    // Parse the case pattern as an expression.
+    // Parse the case pattern as an expression. Stop before `if` so a trailing
+    // match guard is not absorbed as a ternary `x if y else z`.
     ExprNode *patternExpr = nullptr;
-    if (parseExpression(patternExpr, caseIndent) ||
-        parseToken(Token::colon, "expected ':' after case pattern")) {
+    if (parseExpression(patternExpr, caseIndent,
+                        Precedence(int(Precedence::kIfElse) + 1))) {
       skipUntilIndentation(caseIndent);
       continue;
     }
 
-    // TODO: Support trailing case predicates, "case _ if c != 0:".
+    // Optional match guard: `case <pattern> if <cond>:`.
+    ExprNode *guardExpr = nullptr;
+    if (consumeIf(Token::kw_if)) {
+      if (parseExpression(guardExpr, caseIndent, Precedence::kAssignExpr)) {
+        skipUntilIndentation(caseIndent);
+        continue;
+      }
+    }
+    if (parseToken(Token::colon, "expected ':' after case pattern")) {
+      skipUntilIndentation(caseIndent);
+      continue;
+    }
 
-    // Skip the case body without lowering it: match IR is not implemented.
+    // Okay, we successfully parsed a case block. Remember it for later.
+    caseEntries.push_back({patternExpr, guardExpr, getLexer().getCursor()});
     skipUntilIndentation(caseIndent);
-    // Subject/pattern expressions are currently unused — match lowering is TBD.
-    (void)patternExpr;
   }
 
-  if (!sawCase) {
+  if (caseEntries.empty()) {
     emitError(matchLoc) << "'__match' statement must have at least one 'case' "
                            "block";
     return success();
   }
 
-  // Subject expression is currently unused — match lowering is TBD.
-  (void)subjectExpr;
-  emitError(matchLoc) << "'__match' statement is not implemented yet";
+  auto afterCaseCursor = getLexer().getCursor();
+
+  // Given we have the pile of pattern collected together in a list, we can add
+  // emission optimizations to improve the order various sub-patterns are
+  // emitted.  For now, we simply emit each linearly.
+  HLCF::ElifOp elifOp = HLCF::ElifOp::create(
+      builder, matchLocation, TypeRange(), caseEntries.size() * 2);
+
+  // Emit each case: we emit the condition and match logic into the predicate
+  // block, then emit the body into its corresponding block.
+  for (auto [idx, caseEntry] : llvm::enumerate(caseEntries)) {
+    auto &condBlock = elifOp.getElifRegions()[idx * 2].emplaceBlock();
+    builder.setInsertionPointToStart(&condBlock);
+
+    // TODO: Emit the match condition; then the bind, then the guard.
+    // For now, we just emit a "false" condition.
+    // Create a 0 value of type !kgen.scalar<bool>.
+    auto caseLoc = translateLocation(caseEntry.patternExpr->getLoc());
+    auto boolAttr = SIMDAttr::getScalarBool(getContext(), false);
+    SRValue condRVal = getEmitter().emitSRValue(
+        {PValue(boolAttr), caseEntry.patternExpr}, EC_BoolCondition);
+    if (!condRVal)
+      return failure();
+    HLCF::ElifYieldOp::create(builder, caseLoc, condRVal,
+                              /*no extra values*/ ValueRange());
+
+    // Now we parse the body of the case into the "then" block for this case.
+    auto &bodyBlock = elifOp.getElifRegions()[idx * 2 + 1].emplaceBlock();
+    builder.setInsertionPointToStart(&bodyBlock);
+
+    // Change the parser cursor to the start of the case body so we can parse
+    // the right text.
+    caseEntry.caseCursor.restore(getLexer());
+    if (failed(parseLocalScopeSuite(curIndent)))
+      return failure();
+    HLCF::YieldOp::create(builder, caseLoc);
+  }
+
+  // The "else" of the elif is a noop.  TODO: We should mark this as unreachable
+  // if there is an irrefutable pattern so we don't get dead code errors.
+  builder.createBlock(&elifOp.getElseRegion());
+  HLCF::YieldOp::create(builder, matchLocation);
+  afterCaseCursor.restore(getLexer());
   return success();
 }
 
