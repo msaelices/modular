@@ -1491,6 +1491,45 @@ RValue IREmitter::emitExprScalarBool(const ExprNode *condExpr,
   return emitScalarBool({emitExprCValue(condExpr, context), condExpr}, context);
 }
 
+Operation *
+IREmitter::emitIfThen(Location loc, TypeRange resultTypes,
+                      llvm::function_ref<FailureOr<Value>()> emitCond,
+                      llvm::function_ref<LogicalResult()> emitThen,
+                      llvm::function_ref<LogicalResult()> emitElse) {
+  assert(builder && "emitIfThen requires a dynamic builder");
+  OpBuilder &b = *builder;
+  HLCF::ElifOp elifOp = HLCF::ElifOp::create(b, loc, resultTypes, 2);
+
+  auto &condBlock = elifOp.getElifRegions()[0].emplaceBlock();
+  b.setInsertionPointToStart(&condBlock);
+  FailureOr<Value> cond = emitCond();
+  if (failed(cond))
+    return nullptr;
+  HLCF::ElifYieldOp::create(b, loc, *cond, /*no extra values*/ ValueRange());
+
+  auto &thenBlock = elifOp.getElifRegions()[1].emplaceBlock();
+  b.setInsertionPointToStart(&thenBlock);
+  if (failed(emitThen()))
+    return nullptr;
+
+  auto &elseBlock = elifOp.getElseRegion().emplaceBlock();
+  b.setInsertionPointToStart(&elseBlock);
+  if (failed(emitElse()))
+    return nullptr;
+
+  b.setInsertionPointAfter(elifOp);
+  return elifOp;
+}
+
+Operation *IREmitter::emitIfThen(Location loc, Value cond,
+                                 TypeRange resultTypes,
+                                 llvm::function_ref<LogicalResult()> emitThen,
+                                 llvm::function_ref<LogicalResult()> emitElse) {
+  return emitIfThen(
+      loc, resultTypes, [&]() -> FailureOr<Value> { return cond; }, emitThen,
+      emitElse);
+}
+
 CValue IREmitter::emitAndMatchPredicates(
     ASTExprAnd<CValue> lhs, llvm::function_ref<ASTExprAnd<CValue>()> emitRhs,
     bool evaluateRhsEvenIfLhsFalse) {
@@ -1508,43 +1547,33 @@ CValue IREmitter::emitAndMatchPredicates(
   if (!builder)
     return emitErrorForDynamicValueInParameter(lhs.expr);
 
-  OpBuilder &b = *builder;
   Location loc = lhs.expr->getLocation(*this);
   SRValue lhsSR = emitSRValue(lhs, EC_BoolCondition);
   if (!lhsSR)
     return {};
 
-  auto boolType = SIMDType::getScalarBoolType(b.getContext());
-  HLCF::ElifOp andElif = HLCF::ElifOp::create(b, loc, TypeRange{boolType}, 2);
-
-  // Condition: lhs predicate.
-  auto &condBlock = andElif.getElifRegions()[0].emplaceBlock();
-  b.setInsertionPointToStart(&condBlock);
-  HLCF::ElifYieldOp::create(b, loc, lhsSR,
-                            /*no extra values*/ ValueRange());
-
-  // Then: evaluate and yield the rhs predicate.
-  auto &thenBlock = andElif.getElifRegions()[1].emplaceBlock();
-  b.setInsertionPointToStart(&thenBlock);
-  builder = b;
-  ASTExprAnd<CValue> rhs = emitRhs();
-  if (!rhs.ir)
+  auto boolType = SIMDType::getScalarBoolType(getContext());
+  Operation *elifOp = emitIfThen(
+      loc, lhsSR, TypeRange{boolType},
+      [&]() -> LogicalResult {
+        ASTExprAnd<CValue> rhs = emitRhs();
+        if (!rhs.ir)
+          return failure();
+        SRValue rhsSR = emitSRValue(rhs, EC_BoolCondition);
+        if (!rhsSR)
+          return failure();
+        HLCF::YieldOp::create(*builder, loc, rhsSR);
+        return success();
+      },
+      [&]() -> LogicalResult {
+        Value falseVal = ParamConstantOp::create(
+            *builder, loc, SIMDAttr::getScalarBool(getContext(), false));
+        HLCF::YieldOp::create(*builder, loc, falseVal);
+        return success();
+      });
+  if (!elifOp)
     return {};
-  SRValue rhsSR = emitSRValue(rhs, EC_BoolCondition);
-  if (!rhsSR)
-    return {};
-  HLCF::YieldOp::create(b, loc, rhsSR);
-
-  // Else: lhs failed, so the conjunction is false.
-  auto &elseBlock = andElif.getElseRegion().emplaceBlock();
-  b.setInsertionPointToStart(&elseBlock);
-  Value falseVal = ParamConstantOp::create(
-      b, loc, SIMDAttr::getScalarBool(b.getContext(), false));
-  HLCF::YieldOp::create(b, loc, falseVal);
-
-  b.setInsertionPointAfter(andElif);
-  builder = b;
-  return SRValue(andElif.getResult(0));
+  return SRValue(elifOp->getResult(0));
 }
 
 CValue IREmitter::emitOrMatchPredicates(
@@ -1558,43 +1587,33 @@ CValue IREmitter::emitOrMatchPredicates(
   if (!builder)
     return emitErrorForDynamicValueInParameter(lhs.expr);
 
-  OpBuilder &b = *builder;
   Location loc = lhs.expr->getLocation(*this);
   SRValue lhsSR = emitSRValue(lhs, EC_BoolCondition);
   if (!lhsSR)
     return {};
 
-  auto boolType = SIMDType::getScalarBoolType(b.getContext());
-  HLCF::ElifOp orElif = HLCF::ElifOp::create(b, loc, TypeRange{boolType}, 2);
-
-  // Condition: lhs predicate.
-  auto &condBlock = orElif.getElifRegions()[0].emplaceBlock();
-  b.setInsertionPointToStart(&condBlock);
-  HLCF::ElifYieldOp::create(b, loc, lhsSR,
-                            /*no extra values*/ ValueRange());
-
-  // Then: lhs matched, so the disjunction is true.
-  auto &thenBlock = orElif.getElifRegions()[1].emplaceBlock();
-  b.setInsertionPointToStart(&thenBlock);
-  Value trueVal = ParamConstantOp::create(
-      b, loc, SIMDAttr::getScalarBool(b.getContext(), true));
-  HLCF::YieldOp::create(b, loc, trueVal);
-
-  // Else: evaluate and yield the rhs predicate.
-  auto &elseBlock = orElif.getElseRegion().emplaceBlock();
-  b.setInsertionPointToStart(&elseBlock);
-  builder = b;
-  ASTExprAnd<CValue> rhs = emitRhs();
-  if (!rhs.ir)
+  auto boolType = SIMDType::getScalarBoolType(getContext());
+  Operation *elifOp = emitIfThen(
+      loc, lhsSR, TypeRange{boolType},
+      [&]() -> LogicalResult {
+        Value trueVal = ParamConstantOp::create(
+            *builder, loc, SIMDAttr::getScalarBool(getContext(), true));
+        HLCF::YieldOp::create(*builder, loc, trueVal);
+        return success();
+      },
+      [&]() -> LogicalResult {
+        ASTExprAnd<CValue> rhs = emitRhs();
+        if (!rhs.ir)
+          return failure();
+        SRValue rhsSR = emitSRValue(rhs, EC_BoolCondition);
+        if (!rhsSR)
+          return failure();
+        HLCF::YieldOp::create(*builder, loc, rhsSR);
+        return success();
+      });
+  if (!elifOp)
     return {};
-  SRValue rhsSR = emitSRValue(rhs, EC_BoolCondition);
-  if (!rhsSR)
-    return {};
-  HLCF::YieldOp::create(b, loc, rhsSR);
-
-  b.setInsertionPointAfter(orElif);
-  builder = b;
-  return SRValue(orElif.getResult(0));
+  return SRValue(elifOp->getResult(0));
 }
 
 CValue IREmitter::emitIndex(ASTExprAnd<AnyValue> value, ExprContext context) {

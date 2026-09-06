@@ -4233,40 +4233,32 @@ static LogicalResult emitIfClause(StmtParser &stmtEmitter,
   auto location = stmtEmitter.translateLocation(clause.kwLoc);
   auto emitter = stmtEmitter.getEmitter();
 
-  // Create a new elifOp state and initialize it with 2 blocks.
-  HLCF::ElifOp elifOp =
-      HLCF::ElifOp::create(*emitter.builder, location, TypeRange(), 2);
-  auto &condBlock = elifOp.getElifRegions()[0].emplaceBlock();
-  emitter.builder->setInsertionPointToStart(&condBlock);
-
-  // Emit the condition expression.
-  RValue condI1RVal = emitter.emitExprScalarBool(clause.expr, EC_BoolCondition);
-  if (!condI1RVal)
-    return failure();
-  SRValue condRVal =
-      emitter.emitSRValue({condI1RVal, clause.expr}, EC_BoolCondition);
-  if (!condRVal)
-    return failure();
-  HLCF::ElifYieldOp::create(*emitter.builder, location, condRVal,
-                            /*no extra values*/ ValueRange());
-
-  // Emit the body of the 'then' clause.
-  auto &thenBlock = elifOp.getElifRegions()[1].emplaceBlock();
-  emitter.builder->setInsertionPointToStart(&thenBlock);
-
-  {
-    llvm::SaveAndRestore builderSaver(stmtEmitter.getBuilder());
-    stmtEmitter.getBuilder().setInsertionPointToStart(&thenBlock);
-    if (failed(callback()))
-      return failure();
-  }
-  HLCF::YieldOp::create(*emitter.builder, location);
-
-  // Leave the else block empty.
-  auto &elseBlock = elifOp.getElseRegion().emplaceBlock();
-  emitter.builder->setInsertionPointToStart(&elseBlock);
-  HLCF::YieldOp::create(*emitter.builder, location);
-  return success();
+  return success((bool)emitter.emitIfThen(
+      location, TypeRange(),
+      [&]() -> FailureOr<Value> {
+        RValue condI1RVal =
+            emitter.emitExprScalarBool(clause.expr, EC_BoolCondition);
+        if (!condI1RVal)
+          return failure();
+        SRValue condRVal =
+            emitter.emitSRValue({condI1RVal, clause.expr}, EC_BoolCondition);
+        if (!condRVal)
+          return failure();
+        return Value(condRVal);
+      },
+      [&]() -> LogicalResult {
+        llvm::SaveAndRestore builderSaver(stmtEmitter.getBuilder());
+        stmtEmitter.getBuilder().setInsertionPointToStart(
+            emitter.builder->getInsertionBlock());
+        if (failed(callback()))
+          return failure();
+        HLCF::YieldOp::create(*emitter.builder, location);
+        return success();
+      },
+      [&]() -> LogicalResult {
+        HLCF::YieldOp::create(*emitter.builder, location);
+        return success();
+      }));
 }
 
 /// Emit the clauses for a comprehension expression, then call the callback.
