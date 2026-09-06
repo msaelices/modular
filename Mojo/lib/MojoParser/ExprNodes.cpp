@@ -80,7 +80,8 @@ LogicalResult ExprNode::emitDestructuringPValue(PValue value,
   return failure();
 }
 
-CValue ExprNode::emitMatch(IREmitter &emitter, CValue subject) const {
+CValue ExprNode::emitMatch(IREmitter &emitter, CValue subject,
+                           PatternDeclKind patternKind) const {
   emitter.emitError(getLoc(), "expression is not a valid match pattern");
   return {};
 }
@@ -573,12 +574,13 @@ SimpleLiteralNode::emitDestructuringPValue(PValue value,
   return ExprNode::emitDestructuringPValue(value, emitter);
 }
 
-CValue SimpleLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
+CValue SimpleLiteralNode::emitMatch(IREmitter &emitter, CValue subject,
+                                    PatternDeclKind patternKind) const {
   // `_` always succeeds and introduces no bindings.
   if (kind == kDiscardLiteral)
     return PValue(SIMDAttr::getScalarBool(emitter.getContext(), true));
 
-  return ExprNode::emitMatch(emitter, subject);
+  return ExprNode::emitMatch(emitter, subject, patternKind);
 }
 
 AnyValue SimpleLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
@@ -695,11 +697,13 @@ static CValue emitMatchAgainstValue(const ExprNode *expr, IREmitter &emitter,
   return emitter.emitScalarBool({eqResult, expr}, EC_BoolCondition);
 }
 
-CValue BoolLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
+CValue BoolLiteralNode::emitMatch(IREmitter &emitter, CValue subject,
+                                  PatternDeclKind patternKind) const {
   return emitMatchAgainstValue(this, emitter, subject);
 }
 
-CValue IntLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
+CValue IntLiteralNode::emitMatch(IREmitter &emitter, CValue subject,
+                                 PatternDeclKind patternKind) const {
   return emitMatchAgainstValue(this, emitter, subject);
 }
 
@@ -711,7 +715,8 @@ AnyValue FloatLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   return handleIntFPStringLiteral(attr, type, this, dest, emitter);
 }
 
-CValue FloatLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
+CValue FloatLiteralNode::emitMatch(IREmitter &emitter, CValue subject,
+                                   PatternDeclKind patternKind) const {
   return emitMatchAgainstValue(this, emitter, subject);
 }
 
@@ -741,7 +746,8 @@ AnyValue StringLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   return emitCtorCall(value, this, dest, emitter);
 }
 
-CValue StringLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
+CValue StringLiteralNode::emitMatch(IREmitter &emitter, CValue subject,
+                                    PatternDeclKind patternKind) const {
   return emitMatchAgainstValue(this, emitter, subject);
 }
 
@@ -833,6 +839,50 @@ ExprNode::ELVIITResult DeclRefNode::emitLCVIR(ExprDest &dest,
                                               bool isSpeculative) const {
   return emitUnqualLookup(spelling, this, emitter.declScope, dest, emitter,
                           isSpeculative);
+}
+
+CValue DeclRefNode::emitMatch(IREmitter &emitter, CValue subject,
+                              PatternDeclKind patternKind) const {
+  // Bare identifiers are only valid match patterns when nested under a `var`
+  // or `ref` binding. Do not treat them as "match this existing value" — that
+  // would create Python's capture-vs-value ambiguity and consume the syntax
+  // reserved for a future implicit-binding form (like `for x in ...`).
+  // See Mojo/proposals/pattern-matching.md "Future Direction: Implicit
+  // Bindings".
+  if (patternKind == PatternDeclKind::kNone) {
+    emitter.emitError(getLoc(), "bare identifier '")
+        << spelling << "' is not a valid match pattern; use 'var " << spelling
+        << "' or 'ref " << spelling << "' to bind a name";
+    return {};
+  }
+
+  // Binding patterns are irrefutable: declare `spelling` under the requested
+  // mode and initialize it from the subject. Match subjects are borrowed
+  // (BValues), so `var` bindings copy and `ref` bindings borrow — same
+  // machinery as `var x = ...` / `ref x = ...` assignment.
+  //
+  // Elif condition and then regions are siblings, so a VarDecl emitted into
+  // the condition would not dominate uses in the body (or in a guard that
+  // shares this scope). Emit the declaration in the parent block before the
+  // enclosing elif, then initialize it from the condition region.
+  OpBuilder &b = *emitter.builder;
+  OpBuilder::InsertPoint condIP = b.saveInsertionPoint();
+  if (Operation *parentOp = condIP.getBlock()->getParentOp())
+    b.setInsertionPoint(parentOp);
+
+  ExprDest declDest(LValueInitializerType{subject.getRValueType()}, EC_VarInit);
+  declDest.setPatternDeclKind(patternKind);
+  LValue bindingLV = emitter.emitExprLValue(this, declDest);
+
+  b.restoreInsertionPoint(condIP);
+  if (!bindingLV)
+    return {};
+
+  ExprDest storeDest(bindingLV, EC_VarInit);
+  if (!emitter.emitCResult(subject, this, storeDest))
+    return {};
+
+  return PValue(SIMDAttr::getScalarBool(emitter.getContext(), true));
 }
 
 /// For a given ASTDecl, return the struct ASTDecl that it's about:
@@ -2515,12 +2565,13 @@ auto InferredAttributeRefNode::emitLCVIR(ExprDest &dest, IREmitter &emitter,
   return emitter.emitResult(InferredBaseAttrRefUValue(this), this, dest);
 }
 
-CValue AttributeRefNode::emitMatch(IREmitter &emitter, CValue subject) const {
+CValue AttributeRefNode::emitMatch(IREmitter &emitter, CValue subject,
+                                   PatternDeclKind patternKind) const {
   return emitMatchAgainstValue(this, emitter, subject);
 }
 
-CValue InferredAttributeRefNode::emitMatch(IREmitter &emitter,
-                                           CValue subject) const {
+CValue InferredAttributeRefNode::emitMatch(IREmitter &emitter, CValue subject,
+                                           PatternDeclKind patternKind) const {
   // Resolve `.member` against the subject's type (e.g. `.red` → `Color.red`),
   // then compare for equality like other literal patterns.
   return emitMatchAgainstValue(this, emitter, subject);
@@ -3541,8 +3592,9 @@ AnyValue ParenNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   return emitter.emitExpr(subExpr, dest);
 }
 
-CValue ParenNode::emitMatch(IREmitter &emitter, CValue subject) const {
-  return subExpr->emitMatch(emitter, subject);
+CValue ParenNode::emitMatch(IREmitter &emitter, CValue subject,
+                            PatternDeclKind patternKind) const {
+  return subExpr->emitMatch(emitter, subject, patternKind);
 }
 
 static AnyValue emitListLiteral(const ExprNode *expr,
@@ -4356,6 +4408,26 @@ AnyValue UnaryOpNode::emitComptime(ExprDest &dest, IREmitter &emitter) const {
 
   PValue subPVal = emitter.emitExprPValue(subExpr, dest.getContext());
   return emitter.emitResult(subPVal, this, dest);
+}
+
+CValue UnaryOpNode::emitMatch(IREmitter &emitter, CValue subject,
+                              PatternDeclKind patternKind) const {
+  // `var`/`ref` patterns are unary wrappers that set the binding mode for
+  // their subpattern (e.g. `case var x:` / `case ref (a, b):`).
+  if (kind != kVarPat && kind != kRefPat)
+    return ExprNode::emitMatch(emitter, subject, patternKind);
+
+  // Nested specifiers like `var ref x` are redundant; keep going with the
+  // innermost kind after warning, matching assignment-pattern behavior.
+  if (patternKind != PatternDeclKind::kNone &&
+      patternKind != PatternDeclKind::kBind) {
+    emitter.emitWarning(getLoc()) << "nested 'var' or 'ref' patterns are "
+                                     "redundant, remove the outer pattern";
+  }
+
+  PatternDeclKind subKind =
+      kind == kVarPat ? PatternDeclKind::kVar : PatternDeclKind::kRef;
+  return subExpr->emitMatch(emitter, subject, subKind);
 }
 
 AnyValue UnaryOpNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
@@ -5654,7 +5726,8 @@ LogicalResult TupleNode::emitDestructuringPValue(PValue toUnpack,
   return success();
 }
 
-CValue TupleNode::emitMatch(IREmitter &emitter, CValue subject) const {
+CValue TupleNode::emitMatch(IREmitter &emitter, CValue subject,
+                            PatternDeclKind patternKind) const {
   ASTType subjectType = subject.getRValueType();
   ASTType tupleType = emitter.shared.lookupBuiltinType(
       "Tuple", emitter.getDeclScope(), getLoc());
@@ -5712,11 +5785,11 @@ CValue TupleNode::emitMatch(IREmitter &emitter, CValue subject) const {
     return emitter.emitCValue({elem, this}, EC_TupleElement);
   };
 
-  auto matchElement = [&](unsigned index) -> ASTExprAnd<CValue> {
+  auto matchElement = [&, patternKind](unsigned index) -> ASTExprAnd<CValue> {
     CValue eltVal = getTupleItem(ASTType(vaAttr.getValues()[index]), index);
     if (!eltVal)
       return {};
-    CValue eltMatch = exprs[index]->emitMatch(emitter, eltVal);
+    CValue eltMatch = exprs[index]->emitMatch(emitter, eltVal, patternKind);
     return {eltMatch, exprs[index]};
   };
 

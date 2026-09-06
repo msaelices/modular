@@ -83,7 +83,8 @@ struct IntLiteralNode final : public ExprNode {
   SourceRange getRange() const override { return {getLoc(), getLoc()}; }
 
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
-  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject,
+                   PatternDeclKind patternKind) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 
@@ -99,7 +100,8 @@ struct FloatLiteralNode final : public ExprNode {
   SMLoc getLoc() const override { return getSMLocFromStringRef(spelling); }
   SourceRange getRange() const override { return {getLoc(), getLoc()}; }
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
-  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject,
+                   PatternDeclKind patternKind) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 
@@ -117,7 +119,8 @@ struct BoolLiteralNode final : public ExprNode {
   SMLoc getLoc() const override { return loc; }
   SourceRange getRange() const override { return {getLoc(), getLoc()}; }
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
-  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject,
+                   PatternDeclKind patternKind) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 
@@ -141,7 +144,8 @@ struct SimpleLiteralNode final : public ExprNode {
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
   LogicalResult emitDestructuringPValue(PValue value,
                                         IREmitter &emitter) const override;
-  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject,
+                   PatternDeclKind patternKind) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 
@@ -173,7 +177,8 @@ struct StringLiteralNode final : public ExprNode {
     return {getLoc(), getSMLocFromStringRef(spellings.back())};
   }
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
-  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject,
+                   PatternDeclKind patternKind) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 
@@ -252,6 +257,8 @@ struct DeclRefNode final : public LValueCapableExprNode, Identifier {
                                         IREmitter &emitter) const override;
   ELVIITResult emitLCVIR(ExprDest &dest, IREmitter &emitter,
                          bool isSpeculative) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject,
+                   PatternDeclKind patternKind) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 
@@ -274,7 +281,8 @@ struct AttributeRefNode final : public LValueCapableExprNode, Identifier {
   }
   ELVIITResult emitLCVIR(ExprDest &dest, IREmitter &emitter,
                          bool isSpeculative) const override;
-  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject,
+                   PatternDeclKind patternKind) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 
   /// Emit a reference to a stored field with a base that is known not to be a
@@ -303,7 +311,8 @@ struct InferredAttributeRefNode final : public LValueCapableExprNode,
   SourceRange getRange() const override { return {dotLoc, getIdentifierLoc()}; }
   ELVIITResult emitLCVIR(ExprDest &dest, IREmitter &emitter,
                          bool isSpeculative) const override;
-  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject,
+                   PatternDeclKind patternKind) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 
@@ -448,7 +457,8 @@ struct ParenNode final : public ExprNode {
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
   LogicalResult emitDestructuringPValue(PValue value,
                                         IREmitter &emitter) const override;
-  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject,
+                   PatternDeclKind patternKind) const override;
   ELVIITResult
   emitLValueIfImplicitlyTyped(IREmitter &emitter, PatternDeclKind kind,
                               bool hasInferrableRHS) const override {
@@ -483,7 +493,8 @@ struct TupleNode final : public LValueCapableExprNode {
                          bool isSpeculative) const override;
   LogicalResult emitDestructuringPValue(PValue value,
                                         IREmitter &emitter) const override;
-  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject,
+                   PatternDeclKind patternKind) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 
@@ -673,6 +684,8 @@ struct UnaryOpNode final : public ExprNode {
                        : SourceRange(opLoc, subExpr->getRangeEnd());
   }
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject,
+                   PatternDeclKind patternKind) const override;
   ELVIITResult
   emitLValueIfImplicitlyTyped(IREmitter &emitter, PatternDeclKind kind,
                               bool hasInferrableRHS) const override;

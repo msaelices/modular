@@ -45,12 +45,23 @@ def match_missing_cases(x: Int):
         pass
 
 
+def match_bare_identifier(x: Int, y: Int):
+    __match x:
+    # Bare names are reserved for a future implicit-binding syntax; they are
+    # not "match against the existing value named y".
+    # expected-error @below {{bare identifier 'y' is not a valid match pattern; use 'var y' or 'ref y' to bind a name}}
+    case y:
+        pass
+    case _:
+        pass
+
+
 # expected-error @+1 {{'__match' must be contained in a function}}
 __match 1:
     case 0:
         pass
 
-def match_scoping(a: Int):
+def various_match_issues(a: Int, point: Tuple[Int, Int], value: String):
     __match a:
     case 0:
         var x = 42
@@ -58,11 +69,37 @@ def match_scoping(a: Int):
         # expected-error @+1 {{use of unknown declaration 'x'}}
         _ = x
 
-
-def match_tuple_arity_mismatch(point: Tuple[Int, Int, Int]):
     __match point:
-    # expected-error @+1 {{cannot match value of 'Tuple[Int, Int, Int]' of 3 elements against a pattern with 2 elements}}
-    case (0, 0):
+    # expected-error @+1 {{cannot match value of 'Tuple[Int, Int]' of 2 elements against a pattern with 3 elements}}
+    case (0, 0, 0):
+        pass
+    case _:
+        pass
+
+    __match point:
+    # `var` takes a starred list, so write the collision as `var (x, x)`.
+    # expected-error @+2 {{invalid redefinition of 'x'}}
+    # expected-note @+1 {{previous definition here}}
+    case var (x, x):
+        pass
+    case _:
+        pass
+
+    # Nested var/ref patterns should warn.
+    __match value:
+    # expected-warning @+1 {{nested 'var' or 'ref' patterns are redundant, remove the outer pattern}}
+    case var ref x:
+        _ = x.byte_length()
+    # expected-warning @+1 {{nested 'var' or 'ref' patterns are redundant, remove the outer pattern}}
+    case ref var y:
+        _ = y.byte_length()
+    case _:
+        pass
+
+    # Use of a name without var/ref should be an error (for now).
+    __match value:
+    # expected-error @+1 {{bare identifier 'x' is not a valid match pattern; use 'var x' or 'ref x' to bind a name}}
+    case x:
         pass
     case _:
         pass

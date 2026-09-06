@@ -211,7 +211,13 @@ public:
   /// matches this pattern (and any bindings introduced by the pattern have
   /// been declared in the current scope). The default implementation rejects
   /// the expression as an invalid pattern.
-  virtual CValue emitMatch(IREmitter &emitter, CValue subject) const;
+  ///
+  /// `patternKind` is the enclosing `var`/`ref` binding mode for this pattern
+  /// (or `kNone` when none applies). Unary `var`/`ref` patterns update it and
+  /// pass it down to their subpattern; binding sites such as identifiers
+  /// consume it to decide how to declare.
+  virtual CValue emitMatch(IREmitter &emitter, CValue subject,
+                           PatternDeclKind patternKind) const;
 
   /// Emit this expression to MLIR, returning a (possibly null!) AnyValue.  The
   /// ExprDest indicates information about where to emit the expression result

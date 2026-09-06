@@ -1649,7 +1649,8 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
     // Emit the match condition and convert it to a bool we can test.
     auto caseLoc = translateLocation(caseEntry.patternExpr->getLoc());
     auto emitter = getEmitter();
-    CValue condCVal = caseEntry.patternExpr->emitMatch(emitter, subjectBVal);
+    CValue condCVal = caseEntry.patternExpr->emitMatch(emitter, subjectBVal,
+                                                       PatternDeclKind::kNone);
 
     // If a guard predicate is present, AND it with the pattern predicate.
     // Always evaluate the guard even when the pattern is known-false so
@@ -1687,6 +1688,7 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
   // if there is an irrefutable pattern so we don't get dead code errors.
   builder.createBlock(&elifOp.getElseRegion());
   HLCF::YieldOp::create(builder, matchLocation);
+  builder.setInsertionPointAfter(elifOp);
   afterCaseCursor.restore(getLexer());
   return success();
 }

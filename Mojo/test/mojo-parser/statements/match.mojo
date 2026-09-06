@@ -292,3 +292,40 @@ def match_color(c: Color):
         case_callee[2]()
     case _:
         case_callee[3]()
+
+
+# CHECK-LABEL: lit.fn @"match_var_and_ref_binding
+# `var x` copies the borrowed subject into an owned binding that can be mutated.
+# CHECK:       [[X:%.*]] = lit.var.decl "x" var
+# CHECK:       lit.call {{.*}}@"__init__(copy:::String)"{{.*}}(%value, [[X]])
+# CHECK:       lit.call {{.*}}@"__iadd__{{.*}}([[X]],
+# CHECK:       lit.call {{.*}}@"byte_length(
+# `ref y` stores a reference to the subject; no copy.
+# CHECK:       [[Y:%.*]] = lit.var.decl "y" ref
+# CHECK:       lit.ref.store %value, [[Y]]
+# CHECK:       lit.call {{.*}}@"byte_length(
+def match_var_and_ref_binding(value: String):
+    __match value:
+    case var x:
+        x += "x"
+        _ = x.byte_length()
+
+    __match value:
+    case ref y:
+        _ = y.byte_length()
+
+
+# Tuple patterns with nested var bindings (from the pattern-matching proposal).
+# NOTE: `var`/`ref` parse as unary ops that take a starred list, so
+# `(var x, var y)` is parsed as `var (x, var y)`. Prefer `var (x, y)` or
+# place `var` on a single element like `(0, var y)`.
+def match_inspect_point(point: Tuple[Int, Int]):
+    __match point:
+    case (0, 0):
+        case_callee[0]()
+    case (var x, 0):
+        case_callee[1]()
+    case (0, var y):
+        case_callee[2]()
+    case var (x, y):
+        case_callee[3]()
