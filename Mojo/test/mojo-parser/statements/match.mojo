@@ -20,24 +20,24 @@ def case_callee[p: Int](): pass
 
 # CHECK-LABEL: lit.fn @"match_same_indent
 # CHECK-NEXT:    hlcf.elif {
-# CHECK-NEXT:      %[[L0:.*]] = kgen.param.constant: !Int = <{:scalar<index> 0}>
-# CHECK-NEXT:      %[[EQ0:.*]] = lit.call {{.*}}@"__eq__({{.*}}(%x, %[[L0]])
-# CHECK-NEXT:      %[[B0:.*]] = lit.call {{.*}}@"__mlir_bool__(::Bool)"(%[[EQ0]])
-# CHECK-NEXT:      hlcf.elif.yield %[[B0]]
+# CHECK-NEXT:      [[L0:%.*]] = kgen.param.constant: !Int = <{:scalar<index> 0}>
+# CHECK-NEXT:      [[EQ0:%.*]] = lit.call {{.*}}@"__eq__({{.*}}(%x, [[L0]])
+# CHECK-NEXT:      [[B0:%.*]] = lit.call {{.*}}@"__mlir_bool__(::Bool)"([[EQ0]])
+# CHECK-NEXT:      hlcf.elif.yield [[B0]]
 # CHECK-NEXT:    } then {
 # CHECK-NEXT:      lit.call {{.*}}@"case_callee{{.*}}<index> 0
 # CHECK-NEXT:      hlcf.yield
 # CHECK-NEXT:    } {
-# CHECK-NEXT:      %[[L1:.*]] = kgen.param.constant: !Int = <{:scalar<index> 1}>
-# CHECK-NEXT:      %[[EQ1:.*]] = lit.call {{.*}}@"__eq__({{.*}}(%x, %[[L1]])
-# CHECK-NEXT:      %[[B1:.*]] = lit.call {{.*}}@"__mlir_bool__(::Bool)"(%[[EQ1]])
-# CHECK-NEXT:      hlcf.elif.yield %[[B1]]
+# CHECK-NEXT:      [[L1:%.*]] = kgen.param.constant: !Int = <{:scalar<index> 1}>
+# CHECK-NEXT:      [[EQ1:%.*]] = lit.call {{.*}}@"__eq__({{.*}}(%x, [[L1]])
+# CHECK-NEXT:      [[B1:%.*]] = lit.call {{.*}}@"__mlir_bool__(::Bool)"([[EQ1]])
+# CHECK-NEXT:      hlcf.elif.yield [[B1]]
 # CHECK-NEXT:    } then {
 # CHECK-NEXT:      lit.call {{.*}}@"case_callee{{.*}}<index> 1
 # CHECK-NEXT:      hlcf.yield
 # CHECK-NEXT:    } {
-# CHECK-NEXT:      %[[T2:.*]] = kgen.param.constant: scalar<bool> = <true>
-# CHECK-NEXT:      hlcf.elif.yield %[[T2]]
+# CHECK-NEXT:      [[T2:%.*]] = kgen.param.constant: scalar<bool> = <true>
+# CHECK-NEXT:      hlcf.elif.yield [[T2]]
 # CHECK-NEXT:    } then {
 # CHECK-NEXT:      lit.call {{.*}}@"case_callee{{.*}}<index> 2
 # CHECK-NEXT:      hlcf.yield
@@ -106,16 +106,29 @@ def match_tuple_subject(point: Tuple[Int, Int]):
 
 # CHECK-LABEL: lit.fn @"match_with_guard
 # CHECK-NEXT:    hlcf.elif {
-# CHECK-NEXT:      %[[T0:.*]] = kgen.param.constant: scalar<bool> = <true>
-# CHECK-NEXT:      hlcf.elif.yield %[[T0]]
+# CHECK-NEXT:      [[Z0:%.*]] = kgen.param.constant: !Int = <{:scalar<index> 0}>
+# CHECK-NEXT:      [[NE0:%.*]] = lit.call {{.*}}@"__ne__({{.*}}(%c, [[Z0]])
+# CHECK-NEXT:      [[B0:%.*]] = lit.call {{.*}}@"__mlir_bool__(::Bool)"([[NE0]])
+# CHECK-NEXT:      hlcf.elif.yield [[B0]]
 # CHECK-NEXT:    } then {
 # CHECK-NEXT:      lit.call {{.*}}@"case_callee{{.*}}<index> 0
 # CHECK-NEXT:      hlcf.yield
 # CHECK-NEXT:    } {
-# CHECK-NEXT:      %[[L1:.*]] = kgen.param.constant: !Int = <{:scalar<index> 0}>
-# CHECK-NEXT:      %[[EQ1:.*]] = lit.call {{.*}}@"__eq__({{.*}}(%x, %[[L1]])
-# CHECK-NEXT:      %[[B1:.*]] = lit.call {{.*}}@"__mlir_bool__(::Bool)"(%[[EQ1]])
-# CHECK-NEXT:      hlcf.elif.yield %[[B1]]
+# CHECK-NEXT:      [[L1:%.*]] = kgen.param.constant: !Int = <{:scalar<index> 0}>
+# CHECK-NEXT:      [[EQ1:%.*]] = lit.call {{.*}}@"__eq__({{.*}}(%x, [[L1]])
+# CHECK-NEXT:      [[B1:%.*]] = lit.call {{.*}}@"__mlir_bool__(::Bool)"([[EQ1]])
+# CHECK-NEXT:      [[G1:%.*]] = hlcf.elif -> !kgen.scalar<bool> {
+# CHECK-NEXT:        hlcf.elif.yield [[B1]]
+# CHECK-NEXT:      } then {
+# CHECK-NEXT:        [[Z1:%.*]] = kgen.param.constant: !Int = <{:scalar<index> 0}>
+# CHECK-NEXT:        [[NE1:%.*]] = lit.call {{.*}}@"__ne__({{.*}}(%c, [[Z1]])
+# CHECK-NEXT:        [[GB1:%.*]] = lit.call {{.*}}@"__mlir_bool__(::Bool)"([[NE1]])
+# CHECK-NEXT:        hlcf.yield [[GB1]] : !kgen.scalar<bool>
+# CHECK-NEXT:      } else {
+# CHECK-NEXT:        [[F1:%.*]] = kgen.param.constant: scalar<bool> = <false>
+# CHECK-NEXT:        hlcf.yield [[F1]] : !kgen.scalar<bool>
+# CHECK-NEXT:      }
+# CHECK-NEXT:      hlcf.elif.yield [[G1]]
 # CHECK-NEXT:    } then {
 # CHECK-NEXT:      lit.call {{.*}}@"case_callee{{.*}}<index> 1
 # CHECK-NEXT:      hlcf.yield

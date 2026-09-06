@@ -1534,6 +1534,82 @@ ParseResult StmtParser::parseWhileStmt(size_t curIndent) {
   return success();
 }
 
+/// Combine logic to check a case guard after emitting the match pattern
+/// predicate.
+static CValue emitMatchCasePredicate(StmtParser &parser, IREmitter &emitter,
+                                     CValue patternCond,
+                                     const ExprNode *patternExpr,
+                                     const ExprNode *guardExpr,
+                                     Location caseLoc) {
+  assert(guardExpr && "guardExpr cannot be null");
+
+  // If the pattern is a true constant PValue (e.g. `case _ if cond:`), just
+  // emit the guard without the logic below.
+  if (auto asBoolAttr =
+          sugarDynCastIfPresent<SIMDAttr>(patternCond.getIfPValue())) {
+    // Always emit the guard condition, even if it can never succeed.
+    auto guardVal = emitter.emitExprScalarBool(guardExpr, EC_BoolCondition);
+    if (!guardVal)
+      return {};
+
+    // If the incoming condition was false, propagate it to the caller.
+    // Otherwise, if it was always true then it is the result of the guard
+    // condition.
+    return asBoolAttr.getAsBool() ? guardVal : patternCond;
+  }
+
+  /// Otherwise we have to emit more complex logic - we should only check the
+  /// case guard if the match predicate is true, therefore we emit an if:
+  ///
+  ///   %final = hlcf.elif -> !kgen.scalar<bool> {
+  ///     hlcf.elif.yield %patternCond
+  ///   } then {
+  ///     // evaluate guard
+  ///     hlcf.yield %guard
+  ///   } else {
+  ///     hlcf.yield false
+  ///   }
+  OpBuilder &builder = parser.getBuilder();
+  SRValue predSoFar =
+      emitter.emitSRValue({patternCond, patternExpr}, EC_BoolCondition);
+  if (!predSoFar)
+    return {};
+
+  auto boolType = SIMDType::getScalarBoolType(builder.getContext());
+  Location guardLoc = parser.translateLocation(guardExpr->getLoc());
+  HLCF::ElifOp guardElif =
+      HLCF::ElifOp::create(builder, guardLoc, TypeRange{boolType}, 2);
+
+  // Condition: the pattern match result.
+  auto &guardCondBlock = guardElif.getElifRegions()[0].emplaceBlock();
+  builder.setInsertionPointToStart(&guardCondBlock);
+  HLCF::ElifYieldOp::create(builder, caseLoc, predSoFar,
+                            /*no extra values*/ ValueRange());
+
+  // Then: evaluate the guard and yield it as the combined predicate.
+  auto &guardThenBlock = guardElif.getElifRegions()[1].emplaceBlock();
+  builder.setInsertionPointToStart(&guardThenBlock);
+  emitter.builder = builder;
+  RValue guardI1 = emitter.emitExprScalarBool(guardExpr, EC_BoolCondition);
+  if (!guardI1)
+    return {};
+  SRValue guardSR = emitter.emitSRValue({guardI1, guardExpr}, EC_BoolCondition);
+  if (!guardSR)
+    return {};
+  HLCF::YieldOp::create(builder, guardLoc, guardSR);
+
+  // Else: pattern failed, so the case does not match.
+  auto &guardElseBlock = guardElif.getElseRegion().emplaceBlock();
+  builder.setInsertionPointToStart(&guardElseBlock);
+  Value falseVal = ParamConstantOp::create(
+      builder, guardLoc, SIMDAttr::getScalarBool(builder.getContext(), false));
+  HLCF::YieldOp::create(builder, guardLoc, falseVal);
+
+  builder.setInsertionPointAfter(guardElif);
+  emitter.builder = builder;
+  return SRValue(guardElif.getResult(0));
+}
+
 /// match_stmt ::=  "match" subject_expr ":" NEWLINE
 ///                 case_block+
 /// case_block  ::= "case" pattern ["if" expression] ":" suite
@@ -1650,26 +1726,16 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
     auto caseLoc = translateLocation(caseEntry.patternExpr->getLoc());
     auto emitter = getEmitter();
     CValue condCVal = caseEntry.patternExpr->emitMatch(emitter, subjectBVal);
+
+    // If a guard predicate is present, emit it.
+    if (condCVal && caseEntry.guardExpr)
+      condCVal = emitMatchCasePredicate(*this, emitter, condCVal,
+                                        caseEntry.patternExpr,
+                                        caseEntry.guardExpr, caseLoc);
     SRValue condRVal = emitter.emitSRValue({condCVal, caseEntry.patternExpr},
                                            EC_BoolCondition);
     if (!condRVal)
       continue;
-
-    // Emit the guard if present.  We handle it with a nested if statement,
-    // since we only want to emit the body if the guard is true.
-    if (caseEntry.guardExpr) {
-      // TODO: If the existing predicate is a known true value, we don't have
-      // to emit a nested if.
-      // FIXME: implement this as:
-      // %final_pred = hlcf.elif {
-      //   yield %pred_so_far
-      // } cond {
-      //   the guard expression
-      //   yield it
-      // } else {
-      //   yield false
-      // }
-    }
     HLCF::ElifYieldOp::create(builder, caseLoc, condRVal,
                               /*no extra values*/ ValueRange());
 
