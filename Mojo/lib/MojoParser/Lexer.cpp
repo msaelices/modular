@@ -100,6 +100,7 @@ bool Token::isDeclKeyword() const {
   // Declaration keywords
   case kw_class:
   case kw_def:
+  case kw_fn:
   case kw_struct:
   case kw_trait:
   case kw_var:

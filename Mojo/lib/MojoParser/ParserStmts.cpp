@@ -111,6 +111,7 @@ static bool isStatementThatMightHaveDecorators(Token::Kind tokenKind) {
   case Token::kw___match:
   case Token::kw_async:
   case Token::kw_def:
+  case Token::kw_fn:
   case Token::kw_struct:
   case Token::kw_class:
   case Token::kw_from:
@@ -346,7 +347,7 @@ struct StmtParser : public ParserBase {
   ParseResult checkImportScope(SMLoc kwLoc);
   ParseResult parseImportModuleName(SharedState::ImportPath &parsedName,
                                     bool allowRelativeImport);
-  ParseResult parseDefStmt(LexerCursor startCursor, size_t curIndent);
+  ParseResult parseDefFnStmt(LexerCursor startCursor, size_t curIndent);
   ParseResult parseStructStmt(LexerCursor startCursor, size_t curIndent);
   ParseResult parseTraitStmt(LexerCursor startCursor, size_t curIndent);
   ParseResult parseExtensionStmt(LexerCursor startCursor, size_t curIndent);
@@ -358,7 +359,7 @@ struct StmtParser : public ParserBase {
                                      SMLoc kwLoc);
   ParseResult parseMLIRRegionStmt(LexerCursor startCursor, size_t curIndent);
 
-  // Helper invoked during parseDefStmt, meant to mark defaulted trait method
+  // Helper invoked during parseDefFnStmt, meant to mark defaulted trait method
   // (first token in the function body is not '...').
   void maybeMarkDefaultedTraitMethod(FnOp fnOp);
 
@@ -752,8 +753,9 @@ ParseResult StmtParser::parseStmt(bool onlySimpleStmt, bool &parsedCompound,
     return parseWithStmt(stmtIndent);
   case Token::kw_async:
   case Token::kw_def:
+  case Token::kw_fn:
     rejectSimpleStmt(); // Not a simple_stmt.
-    return parseDefStmt(startCursor, stmtIndent);
+    return parseDefFnStmt(startCursor, stmtIndent);
   case Token::kw_struct:
     rejectSimpleStmt(); // Not a simple_stmt.
     return parseStructStmt(startCursor, stmtIndent);
@@ -3567,8 +3569,8 @@ StmtParser::parseImportModuleName(SharedState::ImportPath &parsedName,
 // Definition statements
 //===----------------------------------------------------------------------===//
 
-ParseResult StmtParser::parseDefStmt(LexerCursor startCursor,
-                                     size_t curIndent) {
+ParseResult StmtParser::parseDefFnStmt(LexerCursor startCursor,
+                                       size_t curIndent) {
   if (consumeIf(Token::kw_async) && rejectTokenAtStartOfLine("'def' keyword"))
     return failure();
   consumeToken(); // Consume either 'def' or 'fn'.
