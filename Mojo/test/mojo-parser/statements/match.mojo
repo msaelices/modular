@@ -221,3 +221,59 @@ def match_bool(x: Bool):
         case_callee[1]()
     case _:
         case_callee[2]()
+
+
+# Enum-like Color with inferred-member patterns (e.g. `case .red`).
+struct Color(ImplicitlyCopyable):
+    comptime red = Color()
+    comptime green = Color()
+    comptime blue = Color()
+
+    def __init__(out self):
+        pass
+
+    def __eq__(self, other: Self) -> Bool:
+        return True
+
+
+# CHECK-LABEL: lit.fn @"match_color
+# CHECK:       hlcf.elif {
+# CHECK:         lit.call {{.*}}@"__eq__(
+# CHECK:         lit.call {{.*}}@"__mlir_bool__(::Bool)"
+# CHECK:         hlcf.elif.yield
+# CHECK:       } then {
+# CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 0
+# CHECK:         hlcf.yield
+# CHECK:       } {
+# CHECK:         lit.call {{.*}}@"__eq__(
+# CHECK:         lit.call {{.*}}@"__mlir_bool__(::Bool)"
+# CHECK:         hlcf.elif.yield
+# CHECK:       } then {
+# CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 1
+# CHECK:         hlcf.yield
+# CHECK:       } {
+# CHECK:         lit.call {{.*}}@"__eq__(
+# CHECK:         lit.call {{.*}}@"__mlir_bool__(::Bool)"
+# CHECK:         hlcf.elif.yield
+# CHECK:       } then {
+# CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 2
+# CHECK:         hlcf.yield
+# CHECK:       } {
+# CHECK:         kgen.param.constant: scalar<bool> = <true>
+# CHECK:         hlcf.elif.yield
+# CHECK:       } then {
+# CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 3
+# CHECK:         hlcf.yield
+# CHECK:       } else {
+# CHECK:         hlcf.yield
+# CHECK:       }
+def match_color(c: Color):
+    __match c:
+    case Color.red:  # explicit enum case.
+        case_callee[0]()
+    case .green:     # inferred case.
+        case_callee[1]()
+    case .blue:     # inferred case.
+        case_callee[2]()
+    case _:
+        case_callee[3]()

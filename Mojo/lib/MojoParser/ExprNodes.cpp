@@ -674,10 +674,10 @@ AnyValue IntLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   return handleIntFPStringLiteral(attr, type, this, dest, emitter);
 }
 
-/// Match an Int/Float/String/Bool literal pattern by emitting the literal as
-/// the subject's type and comparing with `__eq__`, then converting to i1.
-static CValue matchLiteral(const ExprNode *expr, IREmitter &emitter,
-                           CValue subject) {
+/// Match a literal / attribute pattern by emitting it as the subject's type
+/// and comparing with `__eq__`, then converting to i1.
+static CValue emitMatchAgainstValue(const ExprNode *expr, IREmitter &emitter,
+                                    CValue subject) {
   // Emit this literal as a value of the subject's type, then compare.
   ExprDest litDest(subject.getRValueType(), EC_MatchSubject);
   AnyValue litValue = emitter.emitExpr(expr, litDest);
@@ -696,11 +696,11 @@ static CValue matchLiteral(const ExprNode *expr, IREmitter &emitter,
 }
 
 CValue BoolLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
-  return matchLiteral(this, emitter, subject);
+  return emitMatchAgainstValue(this, emitter, subject);
 }
 
 CValue IntLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
-  return matchLiteral(this, emitter, subject);
+  return emitMatchAgainstValue(this, emitter, subject);
 }
 
 AnyValue FloatLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
@@ -712,7 +712,7 @@ AnyValue FloatLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
 }
 
 CValue FloatLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
-  return matchLiteral(this, emitter, subject);
+  return emitMatchAgainstValue(this, emitter, subject);
 }
 
 /// The value of a string is the concatenated value with escapes and quotes
@@ -742,7 +742,7 @@ AnyValue StringLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
 }
 
 CValue StringLiteralNode::emitMatch(IREmitter &emitter, CValue subject) const {
-  return matchLiteral(this, emitter, subject);
+  return emitMatchAgainstValue(this, emitter, subject);
 }
 
 /// Get the source range for a t-string, from start to the closing quote.
@@ -2513,6 +2513,17 @@ auto InferredAttributeRefNode::emitLCVIR(ExprDest &dest, IREmitter &emitter,
   // Emission is trivial: we just wrap it in a UValue so type checking is
   // deferred until we resolve the contextual type (or not).
   return emitter.emitResult(InferredBaseAttrRefUValue(this), this, dest);
+}
+
+CValue AttributeRefNode::emitMatch(IREmitter &emitter, CValue subject) const {
+  return emitMatchAgainstValue(this, emitter, subject);
+}
+
+CValue InferredAttributeRefNode::emitMatch(IREmitter &emitter,
+                                           CValue subject) const {
+  // Resolve `.member` against the subject's type (e.g. `.red` → `Color.red`),
+  // then compare for equality like other literal patterns.
+  return emitMatchAgainstValue(this, emitter, subject);
 }
 
 /// Decode a canonical `_type=` value (shared by the dot-syntax and f-string

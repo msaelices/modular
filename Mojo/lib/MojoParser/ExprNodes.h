@@ -274,6 +274,7 @@ struct AttributeRefNode final : public LValueCapableExprNode, Identifier {
   }
   ELVIITResult emitLCVIR(ExprDest &dest, IREmitter &emitter,
                          bool isSpeculative) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 
   /// Emit a reference to a stored field with a base that is known not to be a
@@ -302,6 +303,7 @@ struct InferredAttributeRefNode final : public LValueCapableExprNode,
   SourceRange getRange() const override { return {dotLoc, getIdentifierLoc()}; }
   ELVIITResult emitLCVIR(ExprDest &dest, IREmitter &emitter,
                          bool isSpeculative) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 
