@@ -375,6 +375,8 @@ struct CallNode final : public ExprNode {
   }
   SourceRange getParenRange() const { return {lparenLoc, rparenLoc}; }
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject,
+                   PatternDeclKind patternKind) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 };
 

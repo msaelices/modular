@@ -18,11 +18,14 @@
 
 #include "ExprNodes.h"
 #include "IREmitter.h"
+#include "Mojo/MojoParser/ASTDecl.h"
 #include "Mojo/MojoParser/CallOperands.h"
 #include "MojoUtils.h"
+#include "ParserEvaluationContext.h"
 
 #include "mlir/Dialect/Index/IR/IndexAttrs.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 using namespace M;
 using namespace M::KGEN;
@@ -156,8 +159,8 @@ CValue BinOpNode::emitMatch(IREmitter &emitter, CValue subject,
     return ExprNode::emitMatch(emitter, subject, patternKind);
 
   // `pattern as name` applies `pattern` and binds `name` to the whole
-  // subject. The binding is always a `ref` (never a copy) so it aliases the
-  // matched value.
+  // subject without copying. Memory values use `ref`; register-passable
+  // (trivial) values have no address, so they use `bind` instead.
   auto *name = dyn_cast<DeclRefNode>(rhs);
   if (!name) {
     emitter.emitError(rhs->getLoc(), "expected a name after 'as'");
@@ -166,7 +169,9 @@ CValue BinOpNode::emitMatch(IREmitter &emitter, CValue subject,
 
   // Bind first, while still in the case condition, so the VarDecl is hoisted
   // before the enclosing elif and dominates the case body.
-  if (!name->emitMatch(emitter, subject, PatternDeclKind::kRef))
+  PatternDeclKind bindKind =
+      subject.isMValue() ? PatternDeclKind::kRef : PatternDeclKind::kBind;
+  if (!name->emitMatch(emitter, subject, bindKind))
     return {};
   return lhs->emitMatch(emitter, subject, patternKind);
 }
@@ -265,11 +270,146 @@ CValue TupleNode::emitMatch(IREmitter &emitter, CValue subject,
   if (!combined.ir)
     return {};
   for (unsigned i = 1, e = exprs.size(); i != e; ++i) {
-    combined = {emitter.emitAndMatchPredicates(combined,
-                                               [&] { return matchElement(i); }),
-                exprs[i]};
+    combined.ir = emitter.emitAndMatchPredicates(
+        combined, [&] { return matchElement(i); });
     if (!combined.ir)
       return {};
+    combined.expr = exprs[i];
+  }
+  return combined.ir;
+}
+
+CValue CallNode::emitMatch(IREmitter &emitter, CValue subject,
+                           PatternDeclKind patternKind) const {
+  // `Type(field=pat, ...)` is a struct pattern: the callee names the expected
+  // type, and each operand is a subpattern for a stored field. Positional
+  // operands bind in field-declaration order; keywords select by name.
+  ASTType patternType = emitter.emitExprType(callee);
+  if (!patternType)
+    return {};
+
+  ASTType subjectType = subject.getRValueType();
+  if (!patternType.isEqualCanon(subjectType)) {
+    emitter.emitError(getLoc(), "cannot match value of type ")
+        << subjectType << " against pattern type " << patternType << getRange();
+    return {};
+  }
+
+  auto structType =
+      dyn_cast<StructType>(SugarAttr::strip(subjectType.mlirType));
+  if (!structType) {
+    emitter.emitError(getLoc(), "expected a struct type to match against, got ")
+        << subjectType << getRange();
+    return {};
+  }
+
+  ASTDecl *typeDecl = subjectType.getDecl(emitter.shared);
+  if (!typeDecl) {
+    emitter.emitError(getLoc(), "cannot match fields of ")
+        << subjectType << getRange();
+    return {};
+  }
+
+  SmallVector<StructFieldOp, 8> storedFields;
+  if (auto structDecl =
+          dyn_cast_or_null<StructDeclOp>(typeDecl->getIfOperation())) {
+    for (auto field : structDecl.getFieldDecls())
+      storedFields.push_back(field);
+  }
+
+  // Resolve every operand to a field first so unknown/duplicate names are
+  // diagnosed even when an earlier subpattern is statically false.
+  struct FieldPattern {
+    const Operand *operand;
+    StructFieldOp fieldOp;
+  };
+  SmallVector<FieldPattern, 8> fieldPatterns;
+  llvm::SmallPtrSet<Attribute, 8> seenFields;
+  unsigned nextPositional = 0;
+
+  for (const Operand &operand : operands) {
+    if (operand.unpackStyle != ArgUnpackStyle::kPositional &&
+        operand.unpackStyle != ArgUnpackStyle::kKeyword) {
+      emitter.emitError(operand.getLoc(),
+                        "struct patterns do not support unpacked arguments")
+          << operand.expr->getRange();
+      return {};
+    }
+
+    StructFieldOp fieldOp;
+    StringAttr fieldName;
+    if (operand.isKeyword()) {
+      fieldName = operand.name;
+      LookupResult lookup = emitter.shared.lookupAndResolveDecl(
+          fieldName.getValue(), operand.getLoc(), *typeDecl,
+          /*searchParentScopes=*/false);
+      if (lookup.isErroneous())
+        return {};
+      if (!lookup.isSuccess() || lookup.getIfSuccess().size() != 1) {
+        emitter.emitError(operand.getLoc(), "'")
+            << fieldName.getValue() << "' is not a field of " << subjectType
+            << operand.expr->getRange();
+        return {};
+      }
+      fieldOp = dyn_cast_or_null<StructFieldOp>(
+          lookup.getIfSuccess().front()->getIfOperation());
+      if (!fieldOp) {
+        emitter.emitError(operand.getLoc(), "'")
+            << fieldName.getValue() << "' is not a stored field of "
+            << subjectType << operand.expr->getRange();
+        return {};
+      }
+    } else {
+      if (nextPositional >= storedFields.size()) {
+        emitter.emitError(operand.getLoc(),
+                          "too many positional subpatterns for ")
+            << subjectType << " which has " << storedFields.size() << " field"
+            << plural(storedFields.size()) << operand.expr->getRange();
+        return {};
+      }
+      fieldOp = storedFields[nextPositional++];
+      fieldName = fieldOp.getNameAttr();
+    }
+
+    if (!seenFields.insert(fieldName).second) {
+      emitter.emitError(operand.getLoc(), "duplicate field '")
+          << fieldName.getValue() << "' in struct pattern"
+          << operand.expr->getRange();
+      return {};
+    }
+    fieldPatterns.push_back({&operand, fieldOp});
+  }
+
+  if (fieldPatterns.empty())
+    return PValue(SIMDAttr::getScalarBool(emitter.getContext(), true));
+
+  BValue subjectBVal = emitter.emitBValue({subject, this}, EC_MatchSubject);
+  if (!subjectBVal)
+    return {};
+
+  auto matchField = [&](const FieldPattern &fp) -> ASTExprAnd<CValue> {
+    StructFieldOp fieldOp = fp.fieldOp;
+    ASTType fieldType = fieldOp.getReboundType(
+        structType, &emitter.shared.getEvaluationContext());
+    ExprDest fieldDest(fieldType, EC_AttributeRefBase);
+    CValue fieldVal = AttributeRefNode::emitStoredFieldRef(
+        {subjectBVal, this}, fieldOp, fp.operand->expr, fieldDest, emitter);
+    if (!fieldVal)
+      return {};
+    CValue fieldMatch =
+        fp.operand->expr->emitMatch(emitter, fieldVal, patternKind);
+    return {fieldMatch, fp.operand->expr};
+  };
+
+  ASTExprAnd<CValue> combined = matchField(fieldPatterns[0]);
+  if (!combined.ir)
+    return {};
+  for (unsigned i = 1, e = fieldPatterns.size(); i != e; ++i) {
+    combined.ir = emitter.emitAndMatchPredicates(
+        combined, [&] { return matchField(fieldPatterns[i]); });
+    if (!combined.ir)
+      return {};
+    combined.expr = fieldPatterns[i].operand->expr;
   }
   return combined.ir;
 }

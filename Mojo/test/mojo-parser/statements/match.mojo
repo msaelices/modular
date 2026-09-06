@@ -64,14 +64,6 @@ def match_same_indent(x: Int):
 # CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 0
 # CHECK:         hlcf.yield
 # CHECK:       } {
-# CHECK:         kgen.param.constant: scalar<bool> = <true>
-# CHECK:         hlcf.elif.yield
-# CHECK:       } then {
-# CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 1
-# CHECK:         hlcf.yield
-# CHECK:       } else {
-# CHECK:         hlcf.yield
-# CHECK:       }
 def match_indented_cases(x: Int):
     __match x:
         case 0:
@@ -101,16 +93,6 @@ def match_indented_cases(x: Int):
 # CHECK:         hlcf.elif.yield
 # CHECK:       } then {
 # CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 0
-# CHECK:         hlcf.yield
-# CHECK:       } {
-# CHECK:         kgen.param.constant: scalar<bool> = <true>
-# CHECK:         hlcf.elif.yield
-# CHECK:       } then {
-# CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 1
-# CHECK:         hlcf.yield
-# CHECK:       } else {
-# CHECK:         hlcf.yield
-# CHECK:       }
 def match_tuple_subject(point: Tuple[Int, Int]):
     __match point:
     case (0, 0):
@@ -295,30 +277,35 @@ def match_color(c: Color):
 
 
 # CHECK-LABEL: lit.fn @"match_var_and_ref_binding
-# `var x` copies the borrowed subject into an owned binding that can be mutated.
-# CHECK:       [[X:%.*]] = lit.var.decl "x" var
-# CHECK:       lit.call {{.*}}@"__init__(copy:::String)"{{.*}}(%value, [[X]])
-# CHECK:       lit.call {{.*}}@"__iadd__{{.*}}([[X]],
-# CHECK:       lit.call {{.*}}@"byte_length(
-# `ref y` stores a reference to the subject; no copy.
-# CHECK:       [[Y:%.*]] = lit.var.decl "y" ref
-# CHECK:       lit.ref.store %value, [[Y]]
-# CHECK:       lit.call {{.*}}@"byte_length(
-def match_var_and_ref_binding(value: String):
+def match_var_and_ref_binding(value: String, mut mutString: String):
+    # `var x` copies the borrowed subject into an owned binding that can be mutated.
+    # CHECK:       [[X:%.*]] = lit.var.decl "x" var
+    # CHECK:       lit.call {{.*}}@"__init__(copy:::String)"{{.*}}(%value, [[X]])
+    # CHECK:       lit.call {{.*}}@"__iadd__{{.*}}([[X]],
+    # CHECK:       lit.call {{.*}}@"byte_length(
     __match value:
     case var x:
         x += "x"
         _ = x.byte_length()
 
+    # `ref y` stores a reference to the subject; no copy.
+    # CHECK:       [[Y:%.*]] = lit.var.decl "y" ref
+    # CHECK:       lit.ref.store %value, [[Y]]
+    # CHECK:       lit.call {{.*}}@"byte_length(
     __match value:
     case ref y:
         _ = y.byte_length()
 
+    # `ref z` maintains the mutability of the subject.
+    # CHECK:       [[Z:%.*]] = lit.var.decl "z" ref
+    # CHECK:       lit.ref.store %mutString, [[Z]]
+    # CHECK:       lit.call {{.*}}@"__iadd__{{.*}}(
+    __match mutString:
+    case ref z:
+        z += "x"
+
 
 # Tuple patterns with nested var bindings (from the pattern-matching proposal).
-# NOTE: `var`/`ref` parse as unary ops that take a starred list, so
-# `(var x, var y)` is parsed as `var (x, var y)`. Prefer `var (x, y)` or
-# place `var` on a single element like `(0, var y)`.
 def match_inspect_point(point: Tuple[Int, Int]):
     __match point:
     case (0, 0):
@@ -327,37 +314,46 @@ def match_inspect_point(point: Tuple[Int, Int]):
         case_callee[1]()
     case (0, var y):
         case_callee[2]()
+    # NOTE: `var`/`ref` parse as unary ops that take a starred list, so
+    # `(var x, var y)` is parsed as `var (x, var y)`. Prefer `var (x, y)` or
+    # place `var` on a single element like `(0, var y)`.
     case var (x, y):
         case_callee[3]()
 
 
 # CHECK-LABEL: lit.fn @"match_as_pattern
-# `as` binds a ref to the whole subject, never a copy.
-# CHECK:       [[S:%.*]] = lit.var.decl "s" ref
-# CHECK:       lit.ref.store %value, [[S]]
-# CHECK-NOT:   lit.call {{.*}}@"__init__(copy:::String)"
-# CHECK:       lit.call {{.*}}@"byte_length(
-# Combined with a value pattern: still a ref, plus an equality test.
-# CHECK:       [[T:%.*]] = lit.var.decl "t" ref
-# CHECK:       lit.ref.store %value, [[T]]
-# CHECK:       lit.call {{.*}}@"__eq__(
 def match_as_pattern(value: String):
+    # `as` binds a ref to the whole subject, never a copy.
+    # CHECK:       [[S:%.*]] = lit.var.decl "s" ref
+    # CHECK:       lit.ref.store %value, [[S]]
+    # CHECK-NOT:   lit.call {{.*}}@"__init__(copy:::String)"
+    # CHECK:       lit.call {{.*}}@"byte_length(
     __match value:
     case _ as s:
         _ = s.byte_length()
 
+    # Combined with a value pattern: still a ref, plus an equality test.
+    # CHECK:       [[T:%.*]] = lit.var.decl "t" ref
+    # CHECK:       lit.ref.store %value, [[T]]
+    # CHECK:       lit.call {{.*}}@"__eq__(
     __match value:
     case "hello" as t:
         _ = t.byte_length()
 
+    # Register-passable subjects cannot be `ref`; `as` uses `bind` instead.
+    # CHECK:       [[X:%.*]] = lit.var.decl "x" bound
+    # CHECK:       lit.ref.store {{.*}}, [[X]]
+    # CHECK:       lit.call {{.*}}@"__add__(
+    __match 42:
+    case _ as x:
+        _ = x + 1
 
-# CHECK-LABEL: lit.fn @"match_as_tuple
-# CHECK:       [[ORIGIN:%.*]] = lit.var.decl "origin" ref
-# CHECK:       [[P:%.*]] = lit.var.decl "p" ref
-# CHECK:       lit.var.decl "x" var
-# CHECK:       lit.ref.store %point, [[ORIGIN]]
-# CHECK:       lit.ref.store %point, [[P]]
-def match_as_tuple(point: Tuple[Int, Int]):
+    # CHECK:       [[ORIGIN:%.*]] = lit.var.decl "origin" ref
+    # CHECK:       [[P:%.*]] = lit.var.decl "p" ref
+    # CHECK:       lit.var.decl "x" var
+    # CHECK:       lit.ref.store %point, [[ORIGIN]]
+    # CHECK:       lit.ref.store %point, [[P]]
+    var point: Tuple[Int, Int] = (0, 0)
     __match point:
     case (0, 0) as origin:
         _ = origin
@@ -366,5 +362,44 @@ def match_as_tuple(point: Tuple[Int, Int]):
         _ = x
         _ = p
         case_callee[1]()
-    case _:
+
+
+@fieldwise_init
+struct Vec3:
+    var x: Int
+    var y: Int
+    var z: Int
+
+
+# CHECK-LABEL: lit.fn @"match_vec3
+def match_vec3(v: Vec3):
+    # Keyword field patterns: project each named field and match it.
+    # CHECK:       lit.ref.struct.ger {{.*}}[x]
+    # CHECK:       lit.call {{.*}}@"__eq__(
+    # CHECK:       lit.ref.struct.ger {{.*}}[y]
+    # CHECK:       lit.call {{.*}}@"__eq__(
+    # CHECK:       lit.ref.struct.ger {{.*}}[z]
+    # CHECK:       lit.call {{.*}}@"__eq__(
+    __match v:
+    case Vec3(x=0, y=0, z=0):
+        case_callee[0]()
+
+    # Bind one field, test another, ignore the third.
+    # CHECK:       [[X:%.*]] = lit.var.decl "x" var
+    # CHECK:       lit.ref.struct.ger {{.*}}[x]
+    # CHECK:       lit.ref.store {{.*}}, [[X]]
+    # CHECK:       lit.ref.struct.ger {{.*}}[y]
+    # CHECK:       lit.call {{.*}}@"__eq__(
+    __match v:
+    case Vec3(x=(var x), y=0, z=_):
+        _ = x
+        case_callee[1]()
+
+    # Positional subpatterns bind stored fields in declaration order.
+    # CHECK:       lit.var.decl "x" var
+    # CHECK:       lit.var.decl "y" var
+    # CHECK:       lit.var.decl "z" var
+    __match v:
+    case var Vec3(x, y, z):
+        _ = x + y + z
         case_callee[2]()

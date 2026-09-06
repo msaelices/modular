@@ -41,7 +41,7 @@ def match_missing_cases(x: Int):
     __match x:
 
     __match x:
-    case foo(): # expected-error {{expression is not a valid match pattern}}
+    case foo(): # expected-error {{use of unknown declaration 'foo'}}
         pass
 
 
@@ -114,6 +114,56 @@ def various_match_issues(a: Int, point: Tuple[Int, Int], value: String):
     __match point:
     # expected-error @+1 {{expected a name after 'as'}}
     case (0 as 1, 2):
+        pass
+    case _:
+        pass
+
+    __match Int():
+    # expected-error @+1 {{value of type 'Int' doesn't have a memory origin in 'ref' binding}}
+    case ref z:
+        pass
+
+
+@fieldwise_init
+struct Vec3:
+    var x: Int
+    var y: Int
+    var z: Int
+
+
+def match_struct_pattern_diags(v: Vec3):
+    __match v:
+    # expected-error @+1 {{cannot match value of type 'Vec3' against pattern type 'Int'}}
+    case Int(x=0):
+        pass
+    case _:
+        pass
+
+    __match v:
+    # expected-error @+1 {{'w' is not a field of 'Vec3'}}
+    case Vec3(w=0):
+        pass
+    case _:
+        pass
+
+    __match v:
+    # expected-error @+2 {{keyword argument 'x' was already used; remove the duplicate}}
+    # expected-note @+1 {{previously specified here}}
+    case Vec3(x=0, x=1):
+        pass
+    case _:
+        pass
+
+    __match v:
+    # expected-error @+1 {{duplicate field 'x' in struct pattern}}
+    case Vec3(0, x=1):
+        pass
+    case _:
+        pass
+
+    __match v:
+    # expected-error @+1 {{too many positional subpatterns for 'Vec3' which has 3 fields}}
+    case Vec3(0, 0, 0, 0):
         pass
     case _:
         pass
