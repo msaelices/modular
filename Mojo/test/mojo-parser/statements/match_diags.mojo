@@ -103,3 +103,17 @@ def various_match_issues(a: Int, point: Tuple[Int, Int], value: String):
         pass
     case _:
         pass
+
+    __match a:
+    # expected-error @+1 {{expected a name after 'as'}}
+    case 0 as 1:
+        pass
+    case _:
+        pass
+
+    __match point:
+    # expected-error @+1 {{expected a name after 'as'}}
+    case (0 as 1, 2):
+        pass
+    case _:
+        pass

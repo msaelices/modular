@@ -136,6 +136,7 @@ public:
     kPow,
     kWalrus,      // x := y aka walrus
     kTypePattern, // x: Int   (Used in assignment statements).
+    kAsPat,       // x as y   (match patterns)
 
     // Assignment and Inplace operators.
     kAssign, // x = y aka assignment_expression

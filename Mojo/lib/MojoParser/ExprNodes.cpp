@@ -3998,7 +3998,34 @@ ExprNode::ELVIITResult BinOpNode::emitLValueIfImplicitlyTyped(
   return {}; // Failure emitting the LValue.
 }
 
+CValue BinOpNode::emitMatch(IREmitter &emitter, CValue subject,
+                            PatternDeclKind patternKind) const {
+  if (kind != kAsPat)
+    return ExprNode::emitMatch(emitter, subject, patternKind);
+
+  // `pattern as name` applies `pattern` and binds `name` to the whole
+  // subject. The binding is always a `ref` (never a copy) so it aliases the
+  // matched value.
+  auto *name = dyn_cast<DeclRefNode>(rhs);
+  if (!name) {
+    emitter.emitError(rhs->getLoc(), "expected a name after 'as'");
+    return {};
+  }
+
+  // Bind first, while still in the case condition, so the VarDecl is hoisted
+  // before the enclosing elif and dominates the case body.
+  if (!name->emitMatch(emitter, subject, PatternDeclKind::kRef))
+    return {};
+  return lhs->emitMatch(emitter, subject, patternKind);
+}
+
 AnyValue BinOpNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
+  if (kind == kAsPat) {
+    emitter.emitError(getLoc(), "'as' patterns are only valid in a 'case' "
+                                "clause");
+    return {};
+  }
+
   // Handle weird binary operators specially if we have them.
   if (kind == kBoolAnd || kind == kBoolOr) // `x and y`, `x or y`
     return emitAndOr(dest, emitter);

@@ -261,6 +261,8 @@ struct InfixInfo {
                  /*isRightAssociative=*/true);
     case Token::colon_equal:
       return get(Precedence::kAssignExpr, ExprNode::kWalrus);
+    case Token::kw_as:
+      return get(Precedence::kAsPat, ExprNode::kAsPat);
     }
   }
 };

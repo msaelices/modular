@@ -1583,12 +1583,28 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
     consumeToken(Token::kw_case);
 
     // Parse the case pattern as an expression. Stop before `if` so a trailing
-    // match guard is not absorbed as a ternary `x if y else z`.
+    // match guard is not absorbed as a ternary `x if y else z`. `as` is looser
+    // than `if`, so a top-level `case <pattern> as name` is attached here.
     ExprNode *patternExpr = nullptr;
     if (parseExpression(patternExpr, caseIndent,
                         Precedence(int(Precedence::kIfElse) + 1))) {
       skipUntilIndentation(caseIndent);
       continue;
+    }
+
+    // Optional `as` binding: `case <pattern> as name`. Nested `as` inside
+    // parentheses is handled by the expression parser.
+    SMLoc asLoc;
+    if (consumeIf(Token::kw_as, &asLoc)) {
+      Token nameTok = getToken();
+      if (parseIdentifier("expected a name after 'as'")) {
+        skipUntilIndentation(caseIndent);
+        continue;
+      }
+      auto *name = shared.allocPersistent<DeclRefNode>(
+          nameTok.getSpelling(), nameTok.is(Token::escaped_identifier));
+      patternExpr = shared.allocPersistent<BinOpNode>(ExprNode::kAsPat,
+                                                      patternExpr, asLoc, name);
     }
 
     // Optional match guard: `case <pattern> if <cond>:`.

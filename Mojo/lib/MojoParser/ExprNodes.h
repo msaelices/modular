@@ -658,6 +658,8 @@ struct BinOpNode final : public ExprNode {
   emitLValueIfImplicitlyTyped(IREmitter &emitter, PatternDeclKind kind,
                               bool hasInferrableRHS) const override;
   AnyValue emitIR(ExprDest &dest, IREmitter &emitter) const override;
+  CValue emitMatch(IREmitter &emitter, CValue subject,
+                   PatternDeclKind patternKind) const override;
   void print(mlir::raw_indented_ostream &os) const override;
 
 private:

@@ -329,3 +329,42 @@ def match_inspect_point(point: Tuple[Int, Int]):
         case_callee[2]()
     case var (x, y):
         case_callee[3]()
+
+
+# CHECK-LABEL: lit.fn @"match_as_pattern
+# `as` binds a ref to the whole subject, never a copy.
+# CHECK:       [[S:%.*]] = lit.var.decl "s" ref
+# CHECK:       lit.ref.store %value, [[S]]
+# CHECK-NOT:   lit.call {{.*}}@"__init__(copy:::String)"
+# CHECK:       lit.call {{.*}}@"byte_length(
+# Combined with a value pattern: still a ref, plus an equality test.
+# CHECK:       [[T:%.*]] = lit.var.decl "t" ref
+# CHECK:       lit.ref.store %value, [[T]]
+# CHECK:       lit.call {{.*}}@"__eq__(
+def match_as_pattern(value: String):
+    __match value:
+    case _ as s:
+        _ = s.byte_length()
+
+    __match value:
+    case "hello" as t:
+        _ = t.byte_length()
+
+
+# CHECK-LABEL: lit.fn @"match_as_tuple
+# CHECK:       [[ORIGIN:%.*]] = lit.var.decl "origin" ref
+# CHECK:       [[P:%.*]] = lit.var.decl "p" ref
+# CHECK:       lit.var.decl "x" var
+# CHECK:       lit.ref.store %point, [[ORIGIN]]
+# CHECK:       lit.ref.store %point, [[P]]
+def match_as_tuple(point: Tuple[Int, Int]):
+    __match point:
+    case (0, 0) as origin:
+        _ = origin
+        case_callee[0]()
+    case (var x, 0) as p:
+        _ = x
+        _ = p
+        case_callee[1]()
+    case _:
+        case_callee[2]()
