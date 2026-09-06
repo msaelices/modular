@@ -24,6 +24,7 @@
 #include "ParserEvaluationContext.h"
 #include "Traits.h"
 
+#include "Mojo/HLCFDialect/HLCFOps.h"
 #include "Mojo/KGENDialect/KGENOps.h"
 #include "Mojo/KGENDialect/KGENUtils.h"
 #include "Mojo/LITDialect/LITOps.h"
@@ -1488,6 +1489,62 @@ RValue IREmitter::emitScalarBool(ASTExprAnd<CValue> value,
 RValue IREmitter::emitExprScalarBool(const ExprNode *condExpr,
                                      ExprContext context) {
   return emitScalarBool({emitExprCValue(condExpr, context), condExpr}, context);
+}
+
+CValue IREmitter::emitAndMatchPredicates(
+    ASTExprAnd<CValue> lhs, llvm::function_ref<ASTExprAnd<CValue>()> emitRhs,
+    bool evaluateRhsEvenIfLhsFalse) {
+  auto asBoolAttr = sugarDynCastIfPresent<SIMDAttr>(lhs.ir.getIfPValue());
+  if (asBoolAttr && asBoolAttr.getAsBool())
+    return emitRhs().ir;
+  if (asBoolAttr && !asBoolAttr.getAsBool()) {
+    // Always emit the rhs when requested (e.g. case guards), even if the
+    // conjunction can never succeed, so diagnostics still fire.
+    if (evaluateRhsEvenIfLhsFalse && !emitRhs().ir)
+      return {};
+    return lhs.ir;
+  }
+
+  if (!builder)
+    return emitErrorForDynamicValueInParameter(lhs.expr);
+
+  OpBuilder &b = *builder;
+  Location loc = lhs.expr->getLocation(*this);
+  SRValue lhsSR = emitSRValue(lhs, EC_BoolCondition);
+  if (!lhsSR)
+    return {};
+
+  auto boolType = SIMDType::getScalarBoolType(b.getContext());
+  HLCF::ElifOp andElif = HLCF::ElifOp::create(b, loc, TypeRange{boolType}, 2);
+
+  // Condition: lhs predicate.
+  auto &condBlock = andElif.getElifRegions()[0].emplaceBlock();
+  b.setInsertionPointToStart(&condBlock);
+  HLCF::ElifYieldOp::create(b, loc, lhsSR,
+                            /*no extra values*/ ValueRange());
+
+  // Then: evaluate and yield the rhs predicate.
+  auto &thenBlock = andElif.getElifRegions()[1].emplaceBlock();
+  b.setInsertionPointToStart(&thenBlock);
+  builder = b;
+  ASTExprAnd<CValue> rhs = emitRhs();
+  if (!rhs.ir)
+    return {};
+  SRValue rhsSR = emitSRValue(rhs, EC_BoolCondition);
+  if (!rhsSR)
+    return {};
+  HLCF::YieldOp::create(b, loc, rhsSR);
+
+  // Else: lhs failed, so the conjunction is false.
+  auto &elseBlock = andElif.getElseRegion().emplaceBlock();
+  b.setInsertionPointToStart(&elseBlock);
+  Value falseVal = ParamConstantOp::create(
+      b, loc, SIMDAttr::getScalarBool(b.getContext(), false));
+  HLCF::YieldOp::create(b, loc, falseVal);
+
+  b.setInsertionPointAfter(andElif);
+  builder = b;
+  return SRValue(andElif.getResult(0));
 }
 
 CValue IREmitter::emitIndex(ASTExprAnd<AnyValue> value, ExprContext context) {

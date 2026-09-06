@@ -27,6 +27,7 @@
 #include "Mojo/MojoParser/SharedState.h"
 #include "Mojo/Support/TriBool.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/SMLoc.h"
 
@@ -521,6 +522,18 @@ public:
   /// scalar<bool> value that we can test directly.  This reports and error and
   /// returns null on error.
   RValue emitExprScalarBool(const ExprNode *condExpr, ExprContext context);
+
+  /// Short-circuiting conjunction of match predicates (`lhs && emitRhs()`).
+  ///
+  /// When `lhs` is a known-true constant the rhs is emitted directly; when it
+  /// is known-false the rhs is skipped unless `evaluateRhsEvenIfLhsFalse` is
+  /// set (used by `case` guards so a never-matching pattern still typechecks
+  /// its guard). Otherwise this lowers to a nested `hlcf.elif` that yields the
+  /// rhs only if `lhs` is true.
+  CValue
+  emitAndMatchPredicates(ASTExprAnd<CValue> lhs,
+                         llvm::function_ref<ASTExprAnd<CValue>()> emitRhs,
+                         bool evaluateRhsEvenIfLhsFalse = false);
 
   /// Given a value, emit it into an MLIR value by invoking its `__mlir_index__`
   /// method.

@@ -57,3 +57,12 @@ def match_scoping(a: Int):
     case _:
         # expected-error @+1 {{use of unknown declaration 'x'}}
         _ = x
+
+
+def match_tuple_arity_mismatch(point: Tuple[Int, Int, Int]):
+    __match point:
+    # expected-error @+1 {{cannot match value of 'Tuple[Int, Int, Int]' of 3 elements against a pattern with 2 elements}}
+    case (0, 0):
+        pass
+    case _:
+        pass

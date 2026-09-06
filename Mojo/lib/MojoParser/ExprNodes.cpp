@@ -5655,9 +5655,85 @@ LogicalResult TupleNode::emitDestructuringPValue(PValue toUnpack,
 }
 
 CValue TupleNode::emitMatch(IREmitter &emitter, CValue subject) const {
-  // FIXME: Decompose the subject and recursively match each element.
-  (void)subject;
-  return PValue(SIMDAttr::getScalarBool(emitter.getContext(), false));
+  ASTType subjectType = subject.getRValueType();
+  ASTType tupleType = emitter.shared.lookupBuiltinType(
+      "Tuple", emitter.getDeclScope(), getLoc());
+
+  if (!tupleType.isEqualCanon(
+          subjectType.getWithoutParameters(emitter.shared))) {
+    emitter.emitError(getLoc(), "expected a tuple type to match against, got ")
+        << subjectType << getRange();
+    return {};
+  }
+
+  assert(subjectType.getParamBindings().size() == 2 &&
+         "Tuple has two parameters");
+  auto vaAttr = sugarCast<ParamListAttr>(subjectType.getParamBindings()[0]);
+  if (vaAttr.getValues().size() != exprs.size()) {
+    emitter.emitError(getLoc(), "cannot match value of ")
+        << subjectType << " of " << vaAttr.getValues().size() << " element"
+        << plural(vaAttr.getValues().size()) << " against a pattern with "
+        << exprs.size() << " element" << plural(exprs.size()) << getRange();
+    return {};
+  }
+
+  // Empty tuple pattern `()` always matches an empty `Tuple[]`.
+  if (exprs.empty())
+    return PValue(SIMDAttr::getScalarBool(emitter.getContext(), true));
+
+  // Borrow the subject so each element access can reuse it.
+  BValue subjectBVal = emitter.emitBValue({subject, this}, EC_MatchSubject);
+  if (!subjectBVal)
+    return {};
+
+  // Extract `subject[i]` the same way comptime tuple destructuring does —
+  // via a synthesized subscript that prefers `__getitem_param__`.
+  auto getTupleItem = [&](ASTType eltType, unsigned index) -> CValue {
+    ExprDest eltDest(eltType, EC_TupleElement);
+    TypedAttr indexAttr =
+        IntegerAttr::get(IndexType::get(emitter.getContext()), index);
+    CValue intIndexCValue =
+        emitter.emitInt(ASTExprAnd<PValue>{PValue(indexAttr), this},
+                        ExprContext::EC_CallParamValue);
+    if (!intIndexCValue)
+      return {};
+    PValue intIndex = intIndexCValue.getIfPValue();
+    assert(intIndex && "Int must be PValue when constructed from int attr");
+
+    SyntheticNode indexExpr(getLoc(), intIndex);
+    Operand exprOperand(&indexExpr, getLoc(), ArgUnpackStyle::kPositional);
+    SubscriptNode subscript(this, this->getLoc(), {}, this->getLoc());
+    auto elem = emitGetterSetterAccess(&subscript, {subjectBVal, this},
+                                       exprOperand, eltDest, emitter);
+    if (!elem) {
+      eltDest.resetForError(emitter);
+      return {};
+    }
+    return emitter.emitCValue({elem, this}, EC_TupleElement);
+  };
+
+  auto matchElement = [&](unsigned index) -> ASTExprAnd<CValue> {
+    CValue eltVal = getTupleItem(ASTType(vaAttr.getValues()[index]), index);
+    if (!eltVal)
+      return {};
+    CValue eltMatch = exprs[index]->emitMatch(emitter, eltVal);
+    return {eltMatch, exprs[index]};
+  };
+
+  // Match the first element, then AND each subsequent element with
+  // short-circuiting so later patterns (and future bindings) are skipped on
+  // failure.
+  ASTExprAnd<CValue> combined = matchElement(0);
+  if (!combined.ir)
+    return {};
+  for (unsigned i = 1, e = exprs.size(); i != e; ++i) {
+    combined = {emitter.emitAndMatchPredicates(combined,
+                                               [&] { return matchElement(i); }),
+                exprs[i]};
+    if (!combined.ir)
+      return {};
+  }
+  return combined.ir;
 }
 
 // There are two options. We are emitting an instance of Tuple.

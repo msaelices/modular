@@ -24,7 +24,7 @@ Let's look at an example. Here we can see a pattern that simultaneously tests
 parts of a tuple and bind others:
 
 ```mojo
-def inspect(point: (Int, Int)):
+def inspect(point: Tuple[Int, Int]):
     match point:
     case (0, 0):
         print("origin")

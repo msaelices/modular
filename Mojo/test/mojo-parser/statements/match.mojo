@@ -82,7 +82,22 @@ def match_indented_cases(x: Int):
 
 # CHECK-LABEL: lit.fn @"match_tuple_subject
 # CHECK:       hlcf.elif {
-# CHECK:         kgen.param.constant: scalar<bool> = <false>
+# CHECK:         lit.call {{.*}}@"__getitem_param__
+# CHECK:         lit.ref.load
+# CHECK:         lit.call {{.*}}@"__eq__(
+# CHECK:         lit.call {{.*}}@"__mlir_bool__(::Bool)"
+# CHECK:         hlcf.elif -> !kgen.scalar<bool> {
+# CHECK:           hlcf.elif.yield
+# CHECK:         } then {
+# CHECK:           lit.call {{.*}}@"__getitem_param__
+# CHECK:           lit.ref.load
+# CHECK:           lit.call {{.*}}@"__eq__(
+# CHECK:           lit.call {{.*}}@"__mlir_bool__(::Bool)"
+# CHECK:           hlcf.yield {{.*}} : !kgen.scalar<bool>
+# CHECK:         } else {
+# CHECK:           kgen.param.constant: scalar<bool> = <false>
+# CHECK:           hlcf.yield {{.*}} : !kgen.scalar<bool>
+# CHECK:         }
 # CHECK:         hlcf.elif.yield
 # CHECK:       } then {
 # CHECK:         lit.call {{.*}}@"case_callee{{.*}}<index> 0
