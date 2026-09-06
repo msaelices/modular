@@ -314,10 +314,7 @@ def match_inspect_point(point: Tuple[Int, Int]):
         case_callee[1]()
     case (0, var y):
         case_callee[2]()
-    # NOTE: `var`/`ref` parse as unary ops that take a starred list, so
-    # `(var x, var y)` is parsed as `var (x, var y)`. Prefer `var (x, y)` or
-    # place `var` on a single element like `(0, var y)`.
-    case var (x, y):
+    case (var x, var y):
         case_callee[3]()
 
 
@@ -391,7 +388,7 @@ def match_vec3(v: Vec3):
     # CHECK:       lit.ref.struct.ger {{.*}}[y]
     # CHECK:       lit.call {{.*}}@"__eq__(
     __match v:
-    case Vec3(x=(var x), y=0, z=_):
+    case Vec3(x=var x, y=0, z=_):
         _ = x
         case_callee[1]()
 

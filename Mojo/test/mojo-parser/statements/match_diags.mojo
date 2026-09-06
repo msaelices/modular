@@ -77,10 +77,9 @@ def various_match_issues(a: Int, point: Tuple[Int, Int], value: String):
         pass
 
     __match point:
-    # `var` takes a starred list, so write the collision as `var (x, x)`.
     # expected-error @+2 {{invalid redefinition of 'x'}}
     # expected-note @+1 {{previous definition here}}
-    case var (x, x):
+    case (var x, var x):
         pass
     case _:
         pass

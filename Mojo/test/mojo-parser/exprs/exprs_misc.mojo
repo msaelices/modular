@@ -110,7 +110,7 @@ def test_var_decl_patterns(c: Bool) raises:
     # CHECK that the var pattern covers both tup1 and tup2
     # CHECK: lit.var.decl "tup1" var
     # CHECK-NEXT: lit.var.decl "tup2" var
-    (var tup1, tup2) = 1, 2
+    (var tup1, var tup2) = 1, 2
 
     # Check that trailing commas work.
     # https://github.com/modular/modular/issues/1649
