@@ -535,6 +535,15 @@ public:
                          llvm::function_ref<ASTExprAnd<CValue>()> emitRhs,
                          bool evaluateRhsEvenIfLhsFalse = false);
 
+  /// Short-circuiting disjunction of match predicates (`lhs || emitRhs()`).
+  ///
+  /// When `lhs` is a known-true constant the rhs is skipped; when it is
+  /// known-false the rhs is emitted directly. Otherwise this lowers to a
+  /// nested `hlcf.elif` that yields true if `lhs` matches, else the rhs.
+  CValue
+  emitOrMatchPredicates(ASTExprAnd<CValue> lhs,
+                        llvm::function_ref<ASTExprAnd<CValue>()> emitRhs);
+
   /// Given a value, emit it into an MLIR value by invoking its `__mlir_index__`
   /// method.
   CValue emitIndex(ASTExprAnd<AnyValue> value, ExprContext context);

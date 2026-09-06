@@ -155,9 +155,28 @@ CValue ParenNode::emitMatch(IREmitter &emitter, CValue subject,
 
 CValue BinOpNode::emitMatch(IREmitter &emitter, CValue subject,
                             PatternDeclKind patternKind) const {
-  if (kind != kAsPat)
-    return ExprNode::emitMatch(emitter, subject, patternKind);
+  if (kind == kOr)
+    return emitOrMatch(emitter, subject, patternKind);
+  if (kind == kAsPat)
+    return emitAsMatch(emitter, subject, patternKind);
+  return ExprNode::emitMatch(emitter, subject, patternKind);
+}
 
+CValue BinOpNode::emitOrMatch(IREmitter &emitter, CValue subject,
+                              PatternDeclKind patternKind) const {
+  // `pat1 | pat2` matches if either alternative matches. Bindings across
+  // alternatives are not supported yet.
+  CValue lhsMatch = lhs->emitMatch(emitter, subject, patternKind);
+  if (!lhsMatch)
+    return {};
+  return emitter.emitOrMatchPredicates({lhsMatch, lhs}, [&] {
+    return ASTExprAnd<CValue>{rhs->emitMatch(emitter, subject, patternKind),
+                              rhs};
+  });
+}
+
+CValue BinOpNode::emitAsMatch(IREmitter &emitter, CValue subject,
+                              PatternDeclKind patternKind) const {
   // `pattern as name` applies `pattern` and binds `name` to the whole
   // subject without copying. Memory values use `ref`; register-passable
   // (trivial) values have no address, so they use `bind` instead.

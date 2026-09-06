@@ -1547,6 +1547,56 @@ CValue IREmitter::emitAndMatchPredicates(
   return SRValue(andElif.getResult(0));
 }
 
+CValue IREmitter::emitOrMatchPredicates(
+    ASTExprAnd<CValue> lhs, llvm::function_ref<ASTExprAnd<CValue>()> emitRhs) {
+  auto asBoolAttr = sugarDynCastIfPresent<SIMDAttr>(lhs.ir.getIfPValue());
+  if (asBoolAttr && asBoolAttr.getAsBool())
+    return lhs.ir;
+  if (asBoolAttr && !asBoolAttr.getAsBool())
+    return emitRhs().ir;
+
+  if (!builder)
+    return emitErrorForDynamicValueInParameter(lhs.expr);
+
+  OpBuilder &b = *builder;
+  Location loc = lhs.expr->getLocation(*this);
+  SRValue lhsSR = emitSRValue(lhs, EC_BoolCondition);
+  if (!lhsSR)
+    return {};
+
+  auto boolType = SIMDType::getScalarBoolType(b.getContext());
+  HLCF::ElifOp orElif = HLCF::ElifOp::create(b, loc, TypeRange{boolType}, 2);
+
+  // Condition: lhs predicate.
+  auto &condBlock = orElif.getElifRegions()[0].emplaceBlock();
+  b.setInsertionPointToStart(&condBlock);
+  HLCF::ElifYieldOp::create(b, loc, lhsSR,
+                            /*no extra values*/ ValueRange());
+
+  // Then: lhs matched, so the disjunction is true.
+  auto &thenBlock = orElif.getElifRegions()[1].emplaceBlock();
+  b.setInsertionPointToStart(&thenBlock);
+  Value trueVal = ParamConstantOp::create(
+      b, loc, SIMDAttr::getScalarBool(b.getContext(), true));
+  HLCF::YieldOp::create(b, loc, trueVal);
+
+  // Else: evaluate and yield the rhs predicate.
+  auto &elseBlock = orElif.getElseRegion().emplaceBlock();
+  b.setInsertionPointToStart(&elseBlock);
+  builder = b;
+  ASTExprAnd<CValue> rhs = emitRhs();
+  if (!rhs.ir)
+    return {};
+  SRValue rhsSR = emitSRValue(rhs, EC_BoolCondition);
+  if (!rhsSR)
+    return {};
+  HLCF::YieldOp::create(b, loc, rhsSR);
+
+  b.setInsertionPointAfter(orElif);
+  builder = b;
+  return SRValue(orElif.getResult(0));
+}
+
 CValue IREmitter::emitIndex(ASTExprAnd<AnyValue> value, ExprContext context) {
   // If the value is already of index type, just use it.
   if (CValue cvalue = value.ir.getIfCValue())

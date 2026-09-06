@@ -669,6 +669,10 @@ private:
   AnyValue emitAssign(ExprDest &dest, IREmitter &emitter) const;
   AnyValue emitWalrus(ExprDest &dest, IREmitter &emitter) const;
   AnyValue emitInplace(ExprDest &dest, IREmitter &emitter) const;
+  CValue emitAsMatch(IREmitter &emitter, CValue subject,
+                     PatternDeclKind patternKind) const;
+  CValue emitOrMatch(IREmitter &emitter, CValue subject,
+                     PatternDeclKind patternKind) const;
 };
 
 struct UnaryOpNode final : public ExprNode {

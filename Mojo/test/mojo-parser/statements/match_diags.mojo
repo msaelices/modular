@@ -122,6 +122,13 @@ def various_match_issues(a: Int, point: Tuple[Int, Int], value: String):
     case ref z:
         pass
 
+    __match a:
+    # expected-error @+1 {{expected a tuple type to match against, got 'Int'}}
+    case 0 | (1, 2):
+        pass
+    case _:
+        pass
+
 
 @fieldwise_init
 struct Vec3:
