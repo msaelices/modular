@@ -80,12 +80,6 @@ LogicalResult ExprNode::emitDestructuringPValue(PValue value,
   return failure();
 }
 
-CValue ExprNode::emitMatch(IREmitter &emitter, CValue subject,
-                           PatternDeclKind patternKind) const {
-  emitter.emitError(getLoc(), "expression is not a valid match pattern");
-  return {};
-}
-
 ExprNode::ELVIITResult LValueCapableExprNode::emitLValueIfImplicitlyTyped(
     IREmitter &emitter, PatternDeclKind kind, bool /*hasInferrableRHS*/) const {
   ExprDest dest(EC_Assignment);
@@ -574,15 +568,6 @@ SimpleLiteralNode::emitDestructuringPValue(PValue value,
   return ExprNode::emitDestructuringPValue(value, emitter);
 }
 
-CValue SimpleLiteralNode::emitMatch(IREmitter &emitter, CValue subject,
-                                    PatternDeclKind patternKind) const {
-  // `_` always succeeds and introduces no bindings.
-  if (kind == kDiscardLiteral)
-    return PValue(SIMDAttr::getScalarBool(emitter.getContext(), true));
-
-  return ExprNode::emitMatch(emitter, subject, patternKind);
-}
-
 AnyValue SimpleLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   if (kind == kNoneLiteral)
     return emitter.emitResult(emitter.shared.getNoneAttr(), this, dest);
@@ -676,48 +661,12 @@ AnyValue IntLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   return handleIntFPStringLiteral(attr, type, this, dest, emitter);
 }
 
-/// Match a literal / attribute pattern by emitting it as the subject's type
-/// and comparing with `__eq__`, then converting to i1.
-static CValue emitMatchAgainstValue(const ExprNode *expr, IREmitter &emitter,
-                                    CValue subject) {
-  // Emit this literal as a value of the subject's type, then compare.
-  ExprDest litDest(subject.getRValueType(), EC_MatchSubject);
-  AnyValue litValue = emitter.emitExpr(expr, litDest);
-  if (!litValue)
-    return {};
-
-  CValue eqResult = emitter.emitNamedMethodCall(
-      "__eq__",
-      CallOperands(CallSyntax::kMethodCall, expr, ExprDest(EC_BoolCondition),
-                   {{AnyValue(subject), expr}, {litValue, expr}}));
-  if (!eqResult)
-    return {};
-
-  // Convert Bool (or other boolable) to scalar<bool> / i1 for hlcf.elif.
-  return emitter.emitScalarBool({eqResult, expr}, EC_BoolCondition);
-}
-
-CValue BoolLiteralNode::emitMatch(IREmitter &emitter, CValue subject,
-                                  PatternDeclKind patternKind) const {
-  return emitMatchAgainstValue(this, emitter, subject);
-}
-
-CValue IntLiteralNode::emitMatch(IREmitter &emitter, CValue subject,
-                                 PatternDeclKind patternKind) const {
-  return emitMatchAgainstValue(this, emitter, subject);
-}
-
 AnyValue FloatLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   IPRational value = Lexer::getFloatLiteralValue(spelling);
   auto attr = POP::FloatLiteralAttr::get(emitter.getContext(), value);
   ASTType type = emitter.shared.lookupBuiltinType("FloatLiteral",
                                                   emitter.declScope, getLoc());
   return handleIntFPStringLiteral(attr, type, this, dest, emitter);
-}
-
-CValue FloatLiteralNode::emitMatch(IREmitter &emitter, CValue subject,
-                                   PatternDeclKind patternKind) const {
-  return emitMatchAgainstValue(this, emitter, subject);
 }
 
 /// The value of a string is the concatenated value with escapes and quotes
@@ -744,11 +693,6 @@ AnyValue StringLiteralNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   // Flatten multiple concat'd strings, remove """'s and "'s etc.
   std::string value = getValue();
   return emitCtorCall(value, this, dest, emitter);
-}
-
-CValue StringLiteralNode::emitMatch(IREmitter &emitter, CValue subject,
-                                    PatternDeclKind patternKind) const {
-  return emitMatchAgainstValue(this, emitter, subject);
 }
 
 /// Get the source range for a t-string, from start to the closing quote.
@@ -839,50 +783,6 @@ ExprNode::ELVIITResult DeclRefNode::emitLCVIR(ExprDest &dest,
                                               bool isSpeculative) const {
   return emitUnqualLookup(spelling, this, emitter.declScope, dest, emitter,
                           isSpeculative);
-}
-
-CValue DeclRefNode::emitMatch(IREmitter &emitter, CValue subject,
-                              PatternDeclKind patternKind) const {
-  // Bare identifiers are only valid match patterns when nested under a `var`
-  // or `ref` binding. Do not treat them as "match this existing value" — that
-  // would create Python's capture-vs-value ambiguity and consume the syntax
-  // reserved for a future implicit-binding form (like `for x in ...`).
-  // See Mojo/proposals/pattern-matching.md "Future Direction: Implicit
-  // Bindings".
-  if (patternKind == PatternDeclKind::kNone) {
-    emitter.emitError(getLoc(), "bare identifier '")
-        << spelling << "' is not a valid match pattern; use 'var " << spelling
-        << "' or 'ref " << spelling << "' to bind a name";
-    return {};
-  }
-
-  // Binding patterns are irrefutable: declare `spelling` under the requested
-  // mode and initialize it from the subject. Match subjects are borrowed
-  // (BValues), so `var` bindings copy and `ref` bindings borrow — same
-  // machinery as `var x = ...` / `ref x = ...` assignment.
-  //
-  // Elif condition and then regions are siblings, so a VarDecl emitted into
-  // the condition would not dominate uses in the body (or in a guard that
-  // shares this scope). Emit the declaration in the parent block before the
-  // enclosing elif, then initialize it from the condition region.
-  OpBuilder &b = *emitter.builder;
-  OpBuilder::InsertPoint condIP = b.saveInsertionPoint();
-  if (Operation *parentOp = condIP.getBlock()->getParentOp())
-    b.setInsertionPoint(parentOp);
-
-  ExprDest declDest(LValueInitializerType{subject.getRValueType()}, EC_VarInit);
-  declDest.setPatternDeclKind(patternKind);
-  LValue bindingLV = emitter.emitExprLValue(this, declDest);
-
-  b.restoreInsertionPoint(condIP);
-  if (!bindingLV)
-    return {};
-
-  ExprDest storeDest(bindingLV, EC_VarInit);
-  if (!emitter.emitCResult(subject, this, storeDest))
-    return {};
-
-  return PValue(SIMDAttr::getScalarBool(emitter.getContext(), true));
 }
 
 /// For a given ASTDecl, return the struct ASTDecl that it's about:
@@ -2565,18 +2465,6 @@ auto InferredAttributeRefNode::emitLCVIR(ExprDest &dest, IREmitter &emitter,
   return emitter.emitResult(InferredBaseAttrRefUValue(this), this, dest);
 }
 
-CValue AttributeRefNode::emitMatch(IREmitter &emitter, CValue subject,
-                                   PatternDeclKind patternKind) const {
-  return emitMatchAgainstValue(this, emitter, subject);
-}
-
-CValue InferredAttributeRefNode::emitMatch(IREmitter &emitter, CValue subject,
-                                           PatternDeclKind patternKind) const {
-  // Resolve `.member` against the subject's type (e.g. `.red` → `Color.red`),
-  // then compare for equality like other literal patterns.
-  return emitMatchAgainstValue(this, emitter, subject);
-}
-
 /// Decode a canonical `_type=` value (shared by the dot-syntax and f-string
 /// `__mlir_op` paths). The bare `__mlir_deferred_type` marker sets
 /// `forceDeferred` and adds no type; a `Tuple[...]` appends each element; any
@@ -3592,11 +3480,6 @@ AnyValue ParenNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
   return emitter.emitExpr(subExpr, dest);
 }
 
-CValue ParenNode::emitMatch(IREmitter &emitter, CValue subject,
-                            PatternDeclKind patternKind) const {
-  return subExpr->emitMatch(emitter, subject, patternKind);
-}
-
 static AnyValue emitListLiteral(const ExprNode *expr,
                                 ArrayRef<ExprNode *> elements,
                                 IREmitter &emitter) {
@@ -3996,27 +3879,6 @@ ExprNode::ELVIITResult BinOpNode::emitLValueIfImplicitlyTyped(
   if (auto lv = emitter.emitExprLValue(lhs, dest))
     return AnyValue(lv);
   return {}; // Failure emitting the LValue.
-}
-
-CValue BinOpNode::emitMatch(IREmitter &emitter, CValue subject,
-                            PatternDeclKind patternKind) const {
-  if (kind != kAsPat)
-    return ExprNode::emitMatch(emitter, subject, patternKind);
-
-  // `pattern as name` applies `pattern` and binds `name` to the whole
-  // subject. The binding is always a `ref` (never a copy) so it aliases the
-  // matched value.
-  auto *name = dyn_cast<DeclRefNode>(rhs);
-  if (!name) {
-    emitter.emitError(rhs->getLoc(), "expected a name after 'as'");
-    return {};
-  }
-
-  // Bind first, while still in the case condition, so the VarDecl is hoisted
-  // before the enclosing elif and dominates the case body.
-  if (!name->emitMatch(emitter, subject, PatternDeclKind::kRef))
-    return {};
-  return lhs->emitMatch(emitter, subject, patternKind);
 }
 
 AnyValue BinOpNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
@@ -4435,26 +4297,6 @@ AnyValue UnaryOpNode::emitComptime(ExprDest &dest, IREmitter &emitter) const {
 
   PValue subPVal = emitter.emitExprPValue(subExpr, dest.getContext());
   return emitter.emitResult(subPVal, this, dest);
-}
-
-CValue UnaryOpNode::emitMatch(IREmitter &emitter, CValue subject,
-                              PatternDeclKind patternKind) const {
-  // `var`/`ref` patterns are unary wrappers that set the binding mode for
-  // their subpattern (e.g. `case var x:` / `case ref (a, b):`).
-  if (kind != kVarPat && kind != kRefPat)
-    return ExprNode::emitMatch(emitter, subject, patternKind);
-
-  // Nested specifiers like `var ref x` are redundant; keep going with the
-  // innermost kind after warning, matching assignment-pattern behavior.
-  if (patternKind != PatternDeclKind::kNone &&
-      patternKind != PatternDeclKind::kBind) {
-    emitter.emitWarning(getLoc()) << "nested 'var' or 'ref' patterns are "
-                                     "redundant, remove the outer pattern";
-  }
-
-  PatternDeclKind subKind =
-      kind == kVarPat ? PatternDeclKind::kVar : PatternDeclKind::kRef;
-  return subExpr->emitMatch(emitter, subject, subKind);
 }
 
 AnyValue UnaryOpNode::emitIR(ExprDest &dest, IREmitter &emitter) const {
@@ -5751,89 +5593,6 @@ LogicalResult TupleNode::emitDestructuringPValue(PValue toUnpack,
   }
 
   return success();
-}
-
-CValue TupleNode::emitMatch(IREmitter &emitter, CValue subject,
-                            PatternDeclKind patternKind) const {
-  ASTType subjectType = subject.getRValueType();
-  ASTType tupleType = emitter.shared.lookupBuiltinType(
-      "Tuple", emitter.getDeclScope(), getLoc());
-
-  if (!tupleType.isEqualCanon(
-          subjectType.getWithoutParameters(emitter.shared))) {
-    emitter.emitError(getLoc(), "expected a tuple type to match against, got ")
-        << subjectType << getRange();
-    return {};
-  }
-
-  assert(subjectType.getParamBindings().size() == 2 &&
-         "Tuple has two parameters");
-  auto vaAttr = sugarCast<ParamListAttr>(subjectType.getParamBindings()[0]);
-  if (vaAttr.getValues().size() != exprs.size()) {
-    emitter.emitError(getLoc(), "cannot match value of ")
-        << subjectType << " of " << vaAttr.getValues().size() << " element"
-        << plural(vaAttr.getValues().size()) << " against a pattern with "
-        << exprs.size() << " element" << plural(exprs.size()) << getRange();
-    return {};
-  }
-
-  // Empty tuple pattern `()` always matches an empty `Tuple[]`.
-  if (exprs.empty())
-    return PValue(SIMDAttr::getScalarBool(emitter.getContext(), true));
-
-  // Borrow the subject so each element access can reuse it.
-  BValue subjectBVal = emitter.emitBValue({subject, this}, EC_MatchSubject);
-  if (!subjectBVal)
-    return {};
-
-  // Extract `subject[i]` the same way comptime tuple destructuring does —
-  // via a synthesized subscript that prefers `__getitem_param__`.
-  auto getTupleItem = [&](ASTType eltType, unsigned index) -> CValue {
-    ExprDest eltDest(eltType, EC_TupleElement);
-    TypedAttr indexAttr =
-        IntegerAttr::get(IndexType::get(emitter.getContext()), index);
-    CValue intIndexCValue =
-        emitter.emitInt(ASTExprAnd<PValue>{PValue(indexAttr), this},
-                        ExprContext::EC_CallParamValue);
-    if (!intIndexCValue)
-      return {};
-    PValue intIndex = intIndexCValue.getIfPValue();
-    assert(intIndex && "Int must be PValue when constructed from int attr");
-
-    SyntheticNode indexExpr(getLoc(), intIndex);
-    Operand exprOperand(&indexExpr, getLoc(), ArgUnpackStyle::kPositional);
-    SubscriptNode subscript(this, this->getLoc(), {}, this->getLoc());
-    auto elem = emitGetterSetterAccess(&subscript, {subjectBVal, this},
-                                       exprOperand, eltDest, emitter);
-    if (!elem) {
-      eltDest.resetForError(emitter);
-      return {};
-    }
-    return emitter.emitCValue({elem, this}, EC_TupleElement);
-  };
-
-  auto matchElement = [&, patternKind](unsigned index) -> ASTExprAnd<CValue> {
-    CValue eltVal = getTupleItem(ASTType(vaAttr.getValues()[index]), index);
-    if (!eltVal)
-      return {};
-    CValue eltMatch = exprs[index]->emitMatch(emitter, eltVal, patternKind);
-    return {eltMatch, exprs[index]};
-  };
-
-  // Match the first element, then AND each subsequent element with
-  // short-circuiting so later patterns (and future bindings) are skipped on
-  // failure.
-  ASTExprAnd<CValue> combined = matchElement(0);
-  if (!combined.ir)
-    return {};
-  for (unsigned i = 1, e = exprs.size(); i != e; ++i) {
-    combined = {emitter.emitAndMatchPredicates(combined,
-                                               [&] { return matchElement(i); }),
-                exprs[i]};
-    if (!combined.ir)
-      return {};
-  }
-  return combined.ir;
 }
 
 // There are two options. We are emitting an instance of Tuple.
