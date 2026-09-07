@@ -123,8 +123,8 @@ def if_examples(cond: __mlir_type.`!kgen.scalar<bool>`):
     # CHECK-NEXT: lit.call {{.*}}__init__{{.*}}(%d)
     var d = MemExample()
 
-    # CHECK: hlcf.elif {
-    # CHECK-NEXT: [[ONE:%.+]] = kgen.param.constant: scalar<bool> = <true>
+    # CHECK: [[ONE:%.+]] = kgen.param.constant: scalar<bool> = <true>
+    # CHECK-NEXT: hlcf.elif {
     # CHECK-NEXT: hlcf.elif.yield [[ONE]]
     # CHECK-NEXT: } then {
     # expected-warning @below {{'if' condition always evaluates to 'True'; 'else' branch is unreachable}}
@@ -285,8 +285,8 @@ def chris_origin_example(a: Bool, b: Bool):
                 # CHECK: lit.try.raise
                 raise Error()
         # CHECK: except
-        # CHECK: hlcf.elif
-        # CHECK-NEXT: lit.call
+        # CHECK: lit.call {{.*}}__mlir_bool__
+        # CHECK-NEXT: hlcf.elif
         # CHECK-NEXT: hlcf.elif.yield
         # CHECK-NEXT: } then {
         # CHECK-NEXT: __deinit__{{.*}}(%x)
@@ -510,8 +510,8 @@ def test_param_for1(cond: Bool, cond2: Bool):
         # CHECK-NEXT: lit.call {{.*}}marker()
         marker()
 
+        # CHECK-NEXT: lit.call {{.*}}__mlir_bool__
         # CHECK-NEXT: hlcf.elif {
-        # ... cond ...
         # CHECK: } then {
         if cond:
             # CHECK: lit.call {{.*}}__deinit__{{.*}}(%mem)
@@ -595,8 +595,8 @@ def test_elif(cond: Bool, cond2: Bool):
     var mem2 = MemExample()
     var mem3 = MemExample()
 
-    # CHECK: hlcf.elif {
-    # CHECK-NEXT:  __mlir_bool__
+    # CHECK:  __mlir_bool__
+    # CHECK-NEXT: hlcf.elif {
     # CHECK-NEXT: hlcf.elif.yield
     # CHECK-NEXT: } then {
     if cond:

@@ -1653,7 +1653,9 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
       builder, matchLocation, TypeRange(), caseEntries.size() * 2);
 
   // Emit each case: we emit the condition and match logic into the predicate
-  // block, then emit the body into its corresponding block.
+  // block, then emit the body into its corresponding block. Pattern bindings
+  // are created here, so the first case stays in-region — hoisting it into
+  // the parent would collide with later matches in the same function.
   for (auto [idx, caseEntry] : llvm::enumerate(caseEntries)) {
     auto &condBlock = elifOp.getElifRegions()[idx * 2].emplaceBlock();
     builder.setInsertionPointToStart(&condBlock);
@@ -2952,47 +2954,47 @@ ParseResult StmtParser::parseElif(Location ifLoc, LexerCursor startCursor,
   // we end up after it when this is done.
   llvm::SaveAndRestore builderSaver(builder);
 
-  // Create a new elifOp state and initialize it with 2 blocks.
-  HLCF::ElifOp elifOp = HLCF::ElifOp::create(builder, ifLoc, TypeRange(), 2);
-  elifOp.getElifRegions()[0].emplaceBlock();
-  elifOp.getElifRegions()[1].emplaceBlock();
+  // Unreachable-arm metadata collected while emitting conditions; processed
+  // after the full elif is built so we can mark regions dead.
+  SmallVector<DeadCodeInfo> ifOpsWithDeadCode;
 
-  auto parseCondition =
-      [&](Location loc) -> std::pair<ParseResult, std::optional<DeadCodeInfo>> {
-    unsigned indexOfCondition = elifOp.getElifRegions().size() - 2;
-    Block &conditionBlock = elifOp.getElifRegions()[indexOfCondition].front();
-    builder.setInsertionPointToStart(&conditionBlock);
+  // Emit a condition at the current insertion point. The first `if` condition
+  // is emitted before the elif; later `elif` conditions stay in their regions.
+  auto emitConditionExpr = [&](unsigned condRegionIndex) -> FailureOr<Value> {
     auto emitter = getEmitter();
 
     ExprNode *condExp = nullptr;
     if (parseExpression(condExp, curIndent, Precedence::kAssignExpr))
-      return {failure(), {}};
+      return failure();
 
-    // Create the 'elif' and parse the body into its "then" region.
     RValue condI1RVal = emitter.emitExprScalarBool(condExp, EC_BoolCondition);
     if (!condI1RVal)
-      return {failure(), {}};
-    std::optional<bool> knownConditionForWarning;
+      return failure();
     if (PValue condI1PVal = condI1RVal.getIfPValue();
         auto asBoolAttr = sugarDynCastIfPresent<SIMDAttr>(condI1PVal.get())) {
-      knownConditionForWarning = asBoolAttr.getAsBool();
+      ifOpsWithDeadCode.push_back({asBoolAttr.getAsBool(),
+                                   condExp->getLocation(emitter),
+                                   condRegionIndex});
     }
     SRValue condRVal =
         emitter.emitSRValue({condI1RVal, condExp}, EC_BoolCondition);
     if (!condRVal)
-      return {failure(), {}};
-
-    // Terminate the condition region of the current ElifOp.
-    HLCF::ElifYieldOp::create(builder, loc, condRVal,
-                              /*no extra values*/ ValueRange());
-
-    std::optional<DeadCodeInfo> deadCodeInfo;
-    if (knownConditionForWarning.has_value()) {
-      deadCodeInfo = {knownConditionForWarning.value(),
-                      condExp->getLocation(emitter), indexOfCondition};
-    }
-    return {success(), deadCodeInfo};
+      return failure();
+    return Value(condRVal);
   };
+
+  // First condition is evaluated in the parent, then yielded by the elif.
+  FailureOr<Value> firstCond = emitConditionExpr(/*condRegionIndex=*/0);
+  if (failed(firstCond) ||
+      parseToken(Token::colon, "expected ':' after 'if' expression"))
+    return failure();
+
+  HLCF::ElifOp elifOp = HLCF::ElifOp::create(builder, ifLoc, TypeRange(), 2);
+  elifOp.getElifRegions()[0].emplaceBlock();
+  elifOp.getElifRegions()[1].emplaceBlock();
+  builder.setInsertionPointToStart(&elifOp.getElifRegions()[0].front());
+  HLCF::ElifYieldOp::create(builder, ifLoc, *firstCond,
+                            /*no extra values*/ ValueRange());
 
   auto appendElifRegionPair = [&]() {
     // We need to add two regions.
@@ -3018,34 +3020,28 @@ ParseResult StmtParser::parseElif(Location ifLoc, LexerCursor startCursor,
     elifOp = replacement;
   };
 
-  // Vector of unreachable code metadata.  After emitting code, these need to
-  // raise warnings and be marked as dead.
-  SmallVector<DeadCodeInfo> ifOpsWithDeadCode;
-  auto [ifParseResult, maybeDeadCodeInfo] = parseCondition(ifLoc);
-  if (maybeDeadCodeInfo.has_value())
-    ifOpsWithDeadCode.push_back(maybeDeadCodeInfo.value());
-  if (ifParseResult ||
-      parseToken(Token::colon, "expected ':' after 'if' expression"))
-    return failure();
   // Parse Then region.
   builder.setInsertionPointToStart(&elifOp.getElifRegions().back().front());
   if (failed(parseLocalScopeSuite(curIndent)))
     return failure();
   HLCF::YieldOp::create(builder, ifLoc);
 
-  // Parse Elif chain if it exists.
+  // Parse Elif chain if it exists. Subsequent conditions stay in their regions
+  // so they are only evaluated when earlier arms fail.
   while (getToken().is(Token::kw_elif) &&
          isTokenInCurrentStatement(curIndent, /*allowSameIndent=*/true)) {
     Location elifLoc = translateLocation(consumeToken(Token::kw_elif).getLoc());
     appendElifRegionPair();
 
-    // Parse Condition region.
-    auto [ifParseResult, maybeDeadCodeInfo] = parseCondition(elifLoc);
-    if (ifParseResult ||
+    unsigned condRegionIndex = elifOp.getElifRegions().size() - 2;
+    builder.setInsertionPointToStart(
+        &elifOp.getElifRegions()[condRegionIndex].front());
+    FailureOr<Value> elifCond = emitConditionExpr(condRegionIndex);
+    if (failed(elifCond) ||
         parseToken(Token::colon, "expected ':' after 'elif' expression"))
       return failure();
-    if (maybeDeadCodeInfo.has_value())
-      ifOpsWithDeadCode.push_back(maybeDeadCodeInfo.value());
+    HLCF::ElifYieldOp::create(builder, elifLoc, *elifCond,
+                              /*no extra values*/ ValueRange());
 
     // Parse Then region.
     builder.setInsertionPointToStart(&elifOp.getElifRegions().back().front());
@@ -4233,19 +4229,16 @@ static LogicalResult emitIfClause(StmtParser &stmtEmitter,
   auto location = stmtEmitter.translateLocation(clause.kwLoc);
   auto emitter = stmtEmitter.getEmitter();
 
+  RValue condI1RVal = emitter.emitExprScalarBool(clause.expr, EC_BoolCondition);
+  if (!condI1RVal)
+    return failure();
+  SRValue condRVal =
+      emitter.emitSRValue({condI1RVal, clause.expr}, EC_BoolCondition);
+  if (!condRVal)
+    return failure();
+
   return success((bool)emitter.emitIfThen(
-      location, TypeRange(),
-      [&]() -> FailureOr<Value> {
-        RValue condI1RVal =
-            emitter.emitExprScalarBool(clause.expr, EC_BoolCondition);
-        if (!condI1RVal)
-          return failure();
-        SRValue condRVal =
-            emitter.emitSRValue({condI1RVal, clause.expr}, EC_BoolCondition);
-        if (!condRVal)
-          return failure();
-        return Value(condRVal);
-      },
+      location, condRVal, TypeRange(),
       [&]() -> LogicalResult {
         llvm::SaveAndRestore builderSaver(stmtEmitter.getBuilder());
         stmtEmitter.getBuilder().setInsertionPointToStart(

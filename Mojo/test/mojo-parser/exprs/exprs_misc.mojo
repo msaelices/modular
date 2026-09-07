@@ -399,14 +399,14 @@ def test_mergewith(
     _ = {} if cond else Int()
 
     # https://github.com/modular/modular/issues/5380
-    # CHECK: hlcf.elif {
-    # CHECK-NEXT: [[FALSE:%.*]] = kgen.param.constant: scalar<bool> = <false>
+    # CHECK: [[FALSE:%.*]] = kgen.param.constant: scalar<bool> = <false>
     # CHECK-NEXT: [[COND:%.*]] = hlcf.if [[FALSE]]
     # CHECK-NEXT:   kgen.unreachable
     # CHECK-NEXT: } else {
     # CHECK-NEXT:   = kgen.param.constant: !Bool = <{:scalar<bool> false}>
     # CHECK-NEXT:   hlcf.yield
     # CHECK-NEXT: }
+    # CHECK: hlcf.elif {
     # expected-warning @+1 {{unreachable code on right side of 'False and ...'}}
     if False and cond:
         pass

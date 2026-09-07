@@ -809,7 +809,6 @@ def walrus_assign() raises:
   _ = simpleMath(a := 3, a)
   # CHECK-NEXT: lit.ownership.use [[TMP]]
 
-  # CHECK-NEXT: hlcf.elif {
   # CHECK-NEXT: [[FOUR:%.*]] = kgen.param.constant: !alias_Int1 = <rebind(:!Int {:scalar<index> 4})>
   # CHECK-NEXT: lit.ref.store [[FOUR]], %b
   if b := 4:

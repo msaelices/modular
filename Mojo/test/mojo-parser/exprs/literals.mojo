@@ -174,12 +174,12 @@ def test_list_comprehension():
     # CHECK: lit.loop {
     # CHECK-NEXT: [[ANONI4:%.*]] = lit.var.decl "anonymous*"
     # CHECK:     lit.call {{.*}}SimpleIntRange::@"__next__
-    # CHECK: hlcf.elif {
-    # CHECK-NEXT:    [[TMP:%.*]] = lit.ref.load %i4
+    # CHECK:     [[TMP:%.*]] = lit.ref.load %i4
     # CHECK-NEXT:    [[REB:%.*]] = kgen.rebind [[TMP]]
     # CHECK-NEXT:    [[TMPREF:%.*]] = lit.ref.load [[REB]]
     # CHECK-NEXT:    @SIMD::@"__bool__
     # CHECK-NEXT:    @Bool::@"__mlir_bool__
+    # CHECK-NEXT:    hlcf.elif {
     # CHECK-NEXT:    hlcf.elif.yield
     # CHECK-NEXT: } then {
     # CHECK-NEXT: [[RES:%.*]] = lit.ref.load %i4
@@ -188,12 +188,12 @@ def test_list_comprehension():
 
     var xs = [1, 2, 3]
 
-    # CHECK: hlcf.elif {
     # CHECK:   [[LEN:%.*]] = {{.*}}@List::@"__len__
     # CHECK:   [[LEN0:%.*]] = kgen.rebind [[LEN]]
     # CHECK:   [[ZERO:%.*]] = kgen.param.constant:{{.*}}{:scalar<index> 0}
     # CHECK:   [[NE:%.*]] = {{.*}}@SIMD::@"__ne__{{.*}}([[LEN0]], [[ZERO]])
     # CHECK:   [[RET:%.*]] = {{.*}}@Bool::@"__mlir_bool__{{.*}}([[NE]])
+    # CHECK: hlcf.elif {
     # CHECK:   hlcf.elif.yield [[RET]]
     # CHECK: } then {
     # CHECK:   [[NONE:%.*]] = kgen.param.constant: none = <#kgen.none>

@@ -523,17 +523,11 @@ public:
   /// returns null on error.
   RValue emitExprScalarBool(const ExprNode *condExpr, ExprContext context);
 
-  /// Emit a 2-arm `hlcf.elif` that produces `resultTypes`. Each callback runs
-  /// with the insertion point already at the start of that block. `emitCond`
-  /// returns the `i1` to yield; `emitThen` / `emitElse` should terminate their
-  /// block (typically with `hlcf.yield`). On success the insertion point is
-  /// after the elif and the op is returned; on failure, returns null.
-  Operation *emitIfThen(Location loc, TypeRange resultTypes,
-                        llvm::function_ref<FailureOr<Value>()> emitCond,
-                        llvm::function_ref<LogicalResult()> emitThen,
-                        llvm::function_ref<LogicalResult()> emitElse);
-
-  /// Like the above, but yields an already-computed condition.
+  /// Emit a 2-arm `hlcf.elif` that produces `resultTypes`. `cond` is an
+  /// already-computed i1; the first cond region only yields it. `emitThen` /
+  /// `emitElse` run at the start of their blocks and should terminate them
+  /// (typically with `hlcf.yield`). On success the insertion point is after
+  /// the elif and the op is returned; on failure, returns null.
   Operation *emitIfThen(Location loc, Value cond, TypeRange resultTypes,
                         llvm::function_ref<LogicalResult()> emitThen,
                         llvm::function_ref<LogicalResult()> emitElse);

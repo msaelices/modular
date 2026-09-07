@@ -1491,21 +1491,18 @@ RValue IREmitter::emitExprScalarBool(const ExprNode *condExpr,
   return emitScalarBool({emitExprCValue(condExpr, context), condExpr}, context);
 }
 
-Operation *
-IREmitter::emitIfThen(Location loc, TypeRange resultTypes,
-                      llvm::function_ref<FailureOr<Value>()> emitCond,
-                      llvm::function_ref<LogicalResult()> emitThen,
-                      llvm::function_ref<LogicalResult()> emitElse) {
+Operation *IREmitter::emitIfThen(Location loc, Value cond,
+                                 TypeRange resultTypes,
+                                 llvm::function_ref<LogicalResult()> emitThen,
+                                 llvm::function_ref<LogicalResult()> emitElse) {
   assert(builder && "emitIfThen requires a dynamic builder");
   OpBuilder &b = *builder;
+
   HLCF::ElifOp elifOp = HLCF::ElifOp::create(b, loc, resultTypes, 2);
 
   auto &condBlock = elifOp.getElifRegions()[0].emplaceBlock();
   b.setInsertionPointToStart(&condBlock);
-  FailureOr<Value> cond = emitCond();
-  if (failed(cond))
-    return nullptr;
-  HLCF::ElifYieldOp::create(b, loc, *cond, /*no extra values*/ ValueRange());
+  HLCF::ElifYieldOp::create(b, loc, cond, /*no extra values*/ ValueRange());
 
   auto &thenBlock = elifOp.getElifRegions()[1].emplaceBlock();
   b.setInsertionPointToStart(&thenBlock);
@@ -1519,15 +1516,6 @@ IREmitter::emitIfThen(Location loc, TypeRange resultTypes,
 
   b.setInsertionPointAfter(elifOp);
   return elifOp;
-}
-
-Operation *IREmitter::emitIfThen(Location loc, Value cond,
-                                 TypeRange resultTypes,
-                                 llvm::function_ref<LogicalResult()> emitThen,
-                                 llvm::function_ref<LogicalResult()> emitElse) {
-  return emitIfThen(
-      loc, resultTypes, [&]() -> FailureOr<Value> { return cond; }, emitThen,
-      emitElse);
 }
 
 CValue IREmitter::emitAndMatchPredicates(

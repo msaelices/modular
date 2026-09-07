@@ -580,9 +580,9 @@ struct ExoticDelExample(RegisterPassable):
     # CHECK-NEXT: lit.call {{.*}}__deinit__{{.*}}([[BPTR]])
 
     # Test the condition
-    # CHECK-NEXT: hlcf.elif
     # CHECK-NEXT: [[CONDPTR:%.*]] = lit.ref.struct.ger %self[cond]
     # CHECK-NEXT: [[CONDVAL:%.*]] = lit.ref.load [[CONDPTR]]
+    # CHECK-NEXT: hlcf.elif
     # CHECK-NEXT: hlcf.elif.yield [[CONDVAL]]
     # CHECK-NEXT: } then {
     if self.cond:
