@@ -1129,11 +1129,11 @@ def flash_attention_dispatch[
                         DynamicInt(max_prompt_len),
                         max_cache_valid_length,
                         scale,
-                        kv_input_row_offsets,
+                        _optional_lt_to_tt(kv_input_row_offsets),
                         batch_size,
                         NoPartition[get_accum_type[q.dtype]()](),
                         ctx,
-                        sink_weights,
+                        _optional_lt_to_tt(sink_weights),
                     )
                 else:
                     comptime assert is_sm100
@@ -1813,11 +1813,11 @@ def flash_attention_dispatch[
                                     StaticInt[1](),
                                     max_cache_valid_length_value,
                                     scale,
-                                    kv_input_row_offsets,
+                                    _optional_lt_to_tt(kv_input_row_offsets),
                                     batch_size,
                                     NoPartition[accum_type](),
                                     ctx,
-                                    sink_weights,
+                                    _optional_lt_to_tt(sink_weights),
                                 )
                         else:
                             var nullptr_device = DeviceBuffer[accum_type].empty(
@@ -1935,7 +1935,7 @@ def flash_attention_dispatch[
                                     StaticInt[1](),
                                     max_cache_valid_length_value,
                                     scale,
-                                    kv_input_row_offsets,
+                                    _optional_lt_to_tt(kv_input_row_offsets),
                                     batch_size,
                                     SplitKPartition(
                                         exp_sum_qk_max_data.unsafe_ptr().as_unsafe_any_origin(),
@@ -1944,7 +1944,7 @@ def flash_attention_dispatch[
                                         UInt32(num_partitions_value),
                                     ),
                                     ctx,
-                                    sink_weights,
+                                    _optional_lt_to_tt(sink_weights),
                                 )
                         else:
                             # Same ladder, on the intermediate dtype and writing

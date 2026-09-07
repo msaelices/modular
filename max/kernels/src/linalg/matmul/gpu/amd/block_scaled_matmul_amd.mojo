@@ -2395,9 +2395,19 @@ def _preshuffle_a_scale_4d_kernel[
     K_SCALES: Int,
     SrcLayout: TensorLayout,
     DstLayout: TensorLayout,
+    SrcEngine: TensorEngine,
+    DstEngine: TensorEngine,
 ](
-    src: TileTensor[DType.float8_e8m0fnu, SrcLayout, ImmutAnyOrigin],
-    dst: TileTensor[mut=True, DType.float8_e8m0fnu, DstLayout, MutAnyOrigin],
+    src: TileTensor[
+        DType.float8_e8m0fnu, SrcLayout, ImmutAnyOrigin, Engine=SrcEngine
+    ],
+    dst: TileTensor[
+        mut=True,
+        DType.float8_e8m0fnu,
+        DstLayout,
+        MutAnyOrigin,
+        Engine=DstEngine,
+    ],
     M: Int32,
     padded_M: Int32,
 ):
@@ -2471,7 +2481,7 @@ def _launch_block_scaled_preb[
     var a_scales_pre_d = ctx.enqueue_create_buffer[DType.float8_e8m0fnu](
         total_scale_cells
     )
-    var a_scales_pre_dst_tt = TileTensor[mut=True](
+    var a_scales_pre_dst_tt = TileTensor[mut=True, Engine=_](
         a_scales_pre_d, row_major(Coord(total_scale_cells))
     )
     comptime PRESHUFFLE_BLOCK = 256
@@ -2480,6 +2490,8 @@ def _launch_block_scaled_preb[
             SCALE_K,
             type_of(a_scales).LayoutType,
             type_of(a_scales_pre_dst_tt).LayoutType,
+            type_of(a_scales).Engine,
+            type_of(a_scales_pre_dst_tt).Engine,
         ]
     ](
         a_scales,
@@ -2490,7 +2502,7 @@ def _launch_block_scaled_preb[
         block_dim=PRESHUFFLE_BLOCK,
     )
 
-    var a_scales_pre_view = TileTensor[mut=False](
+    var a_scales_pre_view = TileTensor[mut=False, Engine=_](
         a_scales_pre_d, row_major(Coord(a_scale_pad, Idx[SCALE_K]))
     )
 
