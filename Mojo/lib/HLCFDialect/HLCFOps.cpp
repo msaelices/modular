@@ -783,6 +783,20 @@ ElifOp::parametric_interpret(ArrayRef<Attribute> operands,
   return interpret(operands, state);
 }
 
+OpBuilder ElifOp::getThenBodyBuilder() {
+  assert(!getThenRegion().empty() && "Need a then block");
+  return OpBuilder::atBlockEnd(&getThenRegion().front());
+}
+
+OpBuilder ElifOp::getElseBodyBuilder() {
+  assert(!getElseRegion().empty() && "Need an else block");
+  return OpBuilder::atBlockEnd(&getElseRegion().front());
+}
+
+Block &ElifOp::getThenBlock() { return getThenRegion().front(); }
+
+Block &ElifOp::getElseBlock() { return getElseRegion().front(); }
+
 //===----------------------------------------------------------------------===//
 // ElifYieldOp
 //===----------------------------------------------------------------------===//

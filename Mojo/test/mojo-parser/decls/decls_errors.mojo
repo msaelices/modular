@@ -338,7 +338,7 @@ def always_inline_builtin_3() raises: pass
 
 @always_inline("builtin")
 def always_inline_builtin_4(a: Bool):
-  # expected-error @+1 {{'@always_inline("builtin")' does not support MLIR operation hlcf.elif}}
+  # expected-error @+1 {{'@always_inline("builtin")' can only handle single-result if}}
   if a:
      pass
 

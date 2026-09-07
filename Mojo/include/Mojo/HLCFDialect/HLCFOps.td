@@ -710,6 +710,17 @@ def HLCF_ElifOp : HLCFParentOp<"elif"> {
     }]>,
   ];
 
+  let extraClassDeclaration = [{
+    /// Return OpBuilder's pointing the end of the then/else block.
+    OpBuilder getThenBodyBuilder();
+    OpBuilder getElseBodyBuilder();
+
+    /// Get 'then' block.
+    Block& getThenBlock();
+    /// Get 'else' block.
+    Block& getElseBlock();
+  }];
+
   let hasVerifier = 1;
 }
 #endif // HLCFOPS_TD
