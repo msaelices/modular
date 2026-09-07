@@ -1660,7 +1660,7 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
   auto emitCasePredicate = [&](const CaseEntry &caseEntry) -> SRValue {
     auto emitter = getEmitter();
     CValue condCVal = caseEntry.patternExpr->emitMatch(emitter, subjectBVal,
-                                                       PatternDeclKind::kNone);
+                                                       PatternDeclKind::kBind);
 
     // If a guard predicate is present, AND it with the pattern predicate.
     // Always evaluate the guard even when the pattern is known-false so
@@ -1708,11 +1708,11 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
     // A bad first pattern still needs an operand for the elif, so recover
     // with a statically-false arm. That keeps the later cases (and the rest
     // of the enclosing suite) parsed, so their diagnostics still fire.
-    Value condValue =
-        firstCond ? Value(firstCond)
-                  : ParamConstantOp::create(
-                        builder, firstCaseLoc,
-                        SIMDAttr::getScalarBool(builder.getContext(), false));
+    Value condValue = firstCond;
+    if (!firstCond)
+      condValue = ParamConstantOp::create(
+          builder, firstCaseLoc,
+          SIMDAttr::getScalarBool(builder.getContext(), false));
 
     unsigned numExtraRegions =
         caseEntries.size() > 1 ? (caseEntries.size() - 1) * 2 : 0;

@@ -44,18 +44,6 @@ def match_missing_cases(x: Int):
     case foo(): # expected-error {{use of unknown declaration 'foo'}}
         pass
 
-
-def match_bare_identifier(x: Int, y: Int):
-    __match x:
-    # Bare names are reserved for a future implicit-binding syntax; they are
-    # not "match against the existing value named y".
-    # expected-error @below {{bare identifier 'y' is not a valid match pattern; use 'var y' or 'ref y' to bind a name}}
-    case y:
-        pass
-    case _:
-        pass
-
-
 # expected-error @+1 {{'__match' must be contained in a function}}
 __match 1:
     case 0:
@@ -92,14 +80,6 @@ def various_match_issues(a: Int, point: Tuple[Int, Int], value: String):
     # expected-warning @+1 {{nested 'var' or 'ref' patterns are redundant, remove the outer pattern}}
     case ref var y:
         _ = y.byte_length()
-    case _:
-        pass
-
-    # Use of a name without var/ref should be an error (for now).
-    __match value:
-    # expected-error @+1 {{bare identifier 'x' is not a valid match pattern; use 'var x' or 'ref x' to bind a name}}
-    case x:
-        pass
     case _:
         pass
 

@@ -17,6 +17,48 @@
 # code is put out in the right place.
 def case_callee[p: Int](): pass
 
+# CHECK-LABEL: lit.fn @"match_bindings
+def match_bindings(i: Int, var s: String):
+    # Bare bindings are "imm" bindings: register values become `bound`,
+    # memory values become an immutable `ref` (muttoimm).
+    # CHECK:       [[BX:%.*]] = lit.var.decl "x" bound
+    # CHECK:       lit.ref.store %i, [[BX]]
+    # CHECK:       lit.call {{.*}}@"__add__(
+    __match i:
+    case x:
+        _ = x+1
+
+    # CHECK:       [[SX:%.*]] = lit.var.decl "x" ref
+    # CHECK:       lit.ref.store {{.*}}, [[SX]]
+    # CHECK:       lit.ref.load [[SX]]
+    # CHECK:       lit.call {{.*}}@"__len__(::String)"{{.*}}muttoimm
+    __match s:
+    case x:
+        _ = x.__len__()
+
+    # 'var' bindings make a copy.
+    # CHECK:       [[VX:%.*]] = lit.var.decl "x" var
+    # CHECK:       lit.ref.store %i, [[VX]]
+    # CHECK:       lit.call {{.*}}@"__iadd__({{.*}}([[VX]],
+    __match i:
+    case var x:
+        x += 1
+
+    # CHECK:       [[VS:%.*]] = lit.var.decl "x" var
+    # CHECK:       lit.call {{.*}}@"__init__(copy:::String)"{{.*}}[[VS]]
+    # CHECK:       lit.call {{.*}}@"__iadd__{{.*}}([[VS]],
+    __match s:
+    case var x:
+        x += "x"
+
+    # Ref bindings work with mutable references to the original.
+    # CHECK:       [[RX:%.*]] = lit.var.decl "x" ref
+    # CHECK:       lit.ref.store %s, [[RX]]
+    # CHECK:       lit.call {{.*}}@"__iadd__{{.*}}[mut *"s`
+    __match s:
+    case ref x:
+        x += "x"
+
 
 # CHECK-LABEL: lit.fn @"match_same_indent
 # CHECK-NEXT:    [[L0:%.*]] = kgen.param.constant: !Int = <{:scalar<index> 0}>
