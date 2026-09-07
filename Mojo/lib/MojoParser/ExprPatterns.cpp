@@ -21,6 +21,7 @@
 #include "Mojo/HLCFDialect/HLCFOps.h"
 #include "Mojo/MojoParser/ASTDecl.h"
 #include "Mojo/MojoParser/CallOperands.h"
+#include "Mojo/MojoParser/DeclResolver.h"
 #include "MojoUtils.h"
 #include "ParserEvaluationContext.h"
 
@@ -166,17 +167,145 @@ CValue BinOpNode::emitMatch(IREmitter &emitter, CValue subject,
   return ExprNode::emitMatch(emitter, subject, patternKind);
 }
 
+/// Collect VarDeclOps registered in `scope`, keyed by binding name.
+static void
+collectPatternBindings(ASTDecl &scope,
+                       SmallVectorImpl<std::pair<StringAttr, VarDeclOp>> &out) {
+  for (auto &[name, decls] : scope.getDeclsInScope()) {
+    for (ASTDecl *decl : decls) {
+      auto varDecl = dyn_cast_or_null<VarDeclOp>(decl->getIfOperation());
+      if (!varDecl)
+        continue;
+      out.push_back({name, varDecl});
+    }
+  }
+}
+
+/// Verify LHS/RHS or-pattern alternatives bind the same names with matching
+/// kinds and types, rewrite RHS stores to use the LHS VarDecls, erase the
+/// duplicate RHS VarDeclOps, and promote the LHS bindings into `parentScope`.
+static LogicalResult mergeOrPatternBindings(IREmitter &emitter,
+                                            ASTDecl &parentScope,
+                                            ASTDecl &lhsScope,
+                                            ASTDecl *rhsScope, SMLoc loc) {
+  SmallVector<std::pair<StringAttr, VarDeclOp>, 4> lhsBindings;
+  collectPatternBindings(lhsScope, lhsBindings);
+
+  SmallVector<std::pair<StringAttr, VarDeclOp>, 4> rhsBindings;
+  if (rhsScope)
+    collectPatternBindings(*rhsScope, rhsBindings);
+
+  // No bindings on either side — nothing to promote.
+  if (lhsBindings.empty() && rhsBindings.empty())
+    return success();
+
+  // RHS was never emitted (e.g. LHS constant-folded true). Promote LHS only.
+  if (!rhsScope) {
+    parentScope.mergeDeclsFrom(lhsScope);
+    return success();
+  }
+
+  if (lhsBindings.empty() || rhsBindings.empty()) {
+    StringAttr missing = lhsBindings.empty() ? rhsBindings.front().first
+                                             : lhsBindings.front().first;
+    emitter.emitError(loc, "or-pattern alternatives must bind the same names")
+        << "; '" << missing.getValue() << "' is bound in one alternative but "
+        << "not the other";
+    return failure();
+  }
+
+  llvm::DenseMap<StringAttr, VarDeclOp> rhsByName;
+  for (auto &[name, varDecl] : rhsBindings)
+    rhsByName[name] = varDecl;
+
+  for (auto &[name, lhsVar] : lhsBindings) {
+    auto it = rhsByName.find(name);
+    if (it == rhsByName.end()) {
+      emitter.emitError(loc, "or-pattern alternatives must bind the same names")
+          << "; '" << name.getValue() << "' is bound in one alternative but "
+          << "not the other";
+      return failure();
+    }
+    VarDeclOp rhsVar = it->second;
+    if (lhsVar.getKind() != rhsVar.getKind()) {
+      emitter.emitError(loc, "or-pattern binding '")
+          << name.getValue() << "' must use the same 'var'/'ref' kind in each "
+          << "alternative";
+      return failure();
+    }
+    // VarDecl types are `!lit.ref[decl] T`. Each alternative creates its own
+    // decl, so the self-origin always differs even when `T` matches. Compare
+    // the element types (and address space) instead.
+    ASTType lhsType = lhsVar.getType().getElementType();
+    ASTType rhsType = rhsVar.getType().getElementType();
+    if (!lhsType.isEqualCanon(rhsType)) {
+      auto diag = emitter.emitError(loc, "or-pattern binding '")
+                  << name.getValue()
+                  << "' has incompatible types across alternatives";
+      diag.attachNote(loc) << "left alternative has type " << lhsType
+                           << ", right has type " << rhsType;
+      return failure();
+    }
+
+    // Both alternatives write the same name; keep the LHS VarDecl and retarget
+    // RHS initializers to it.
+    rhsVar.getResult().replaceAllUsesWith(lhsVar.getResult());
+    rhsVar->erase();
+    rhsByName.erase(it);
+  }
+
+  if (!rhsByName.empty()) {
+    emitter.emitError(loc, "or-pattern alternatives must bind the same names")
+        << "; '" << rhsByName.begin()->first.getValue()
+        << "' is bound in one alternative but not the other";
+    return failure();
+  }
+
+  parentScope.mergeDeclsFrom(lhsScope);
+  return success();
+}
+
 CValue BinOpNode::emitOrMatch(IREmitter &emitter, CValue subject,
                               PatternDeclKind patternKind) const {
-  // `pat1 | pat2` matches if either alternative matches. Bindings across
-  // alternatives are not supported yet.
-  CValue lhsMatch = lhs->emitMatch(emitter, subject, patternKind);
+  // `pat1 | pat2` matches if either alternative matches. Bindings introduced
+  // by either arm must agree; they are collected in temporary scopes, checked
+  // for compatibility, then promoted into the enclosing case scope. This
+  // enables matching patterns like "(var x, 4) | (5, var x)", but both sides
+  // must bind the same names and to the same types.
+  if (!emitter.builder)
+    return emitter.emitErrorForDynamicValueInParameter(this);
+
+  auto createBindingScope = [&](SMLoc scopeLoc) -> ASTDecl & {
+    return emitter.getDeclResolver().addFullyResolvedDecl(
+        /*declVal=*/nullptr, StringAttr(), scopeLoc, &emitter.declScope);
+  };
+
+  // Emit the LHS to catch any nested bindings.
+  ASTDecl &lhsScope = createBindingScope(lhs->getLoc());
+  IREmitter lhsEmitter(lhsScope, *emitter.builder);
+  CValue lhsMatch = lhs->emitMatch(lhsEmitter, subject, patternKind);
+  emitter.builder = lhsEmitter.builder;
   if (!lhsMatch)
     return {};
-  return emitter.emitOrMatchPredicates({lhsMatch, lhs}, [&] {
-    return ASTExprAnd<CValue>{rhs->emitMatch(emitter, subject, patternKind),
-                              rhs};
+
+  // Emit the RHS to catch any nested bindings - if the LHS is irrefutable, the
+  // RHS doesn't get emitted.
+  ASTDecl *rhsScope = nullptr;
+  CValue result = emitter.emitOrMatchPredicates({lhsMatch, lhs}, [&] {
+    rhsScope = &createBindingScope(rhs->getLoc());
+    IREmitter rhsEmitter(*rhsScope, *emitter.builder);
+    CValue rhsMatch = rhs->emitMatch(rhsEmitter, subject, patternKind);
+    emitter.builder = rhsEmitter.builder;
+    return ASTExprAnd<CValue>{rhsMatch, rhs};
   });
+  if (!result)
+    return {};
+
+  // Verify that they're compatible.
+  if (failed(mergeOrPatternBindings(emitter, emitter.declScope, lhsScope,
+                                    rhsScope, getLoc())))
+    return {};
+  return result;
 }
 
 CValue BinOpNode::emitAsMatch(IREmitter &emitter, CValue subject,

@@ -130,6 +130,59 @@ def various_match_issues(a: Int, point: Tuple[Int, Int], value: String):
         pass
 
 
+def match_or_pattern_binding_diags(var point: Tuple[Int, Int],
+                                   mixed: Tuple[Int, String]):
+    # Binding only on the left alternative.
+    __match point:
+    # expected-error @+1 {{or-pattern alternatives must bind the same names; 'x' is bound in one alternative but not the other}}
+    case (0, var x) | (1, 2):
+        pass
+    case _:
+        pass
+
+    # Binding only on the right alternative.
+    __match point:
+    # expected-error @+1 {{or-pattern alternatives must bind the same names; 'x' is bound in one alternative but not the other}}
+    case (0, 1) | (var x, 2):
+        pass
+    case _:
+        pass
+
+    # Same name, but `var` vs `ref`.
+    __match point:
+    # expected-error @+1 {{or-pattern binding 'x' must use the same 'var'/'ref' kind in each alternative}}
+    case (0, var x) | (ref x, 1):
+        pass
+    case _:
+        pass
+
+    # Different binding names across alternatives.
+    __match point:
+    # expected-error @+1 {{or-pattern alternatives must bind the same names; 'x' is bound in one alternative but not the other}}
+    case (var x, 0) | (var y, 1):
+        pass
+    case _:
+        pass
+
+    # Different number of bindings. Leading literals keep both arms live so
+    # the or does not constant-fold away the RHS.
+    __match point:
+    # expected-error @+1 {{or-pattern alternatives must bind the same names}}
+    case (0, var x) | (var x, var y):
+        pass
+    case _:
+        pass
+
+    # Same name and kind, but incompatible types (String vs Int).
+    __match mixed:
+    # expected-error @+2 {{or-pattern binding 'x' has incompatible types across alternatives}}
+    # expected-note @+1 {{left alternative has type 'String', right has type 'Int'}}
+    case (0, var x) | (var x, _):
+        pass
+    case _:
+        pass
+
+
 @fieldwise_init
 struct Vec3:
     var x: Int
