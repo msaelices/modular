@@ -711,6 +711,14 @@ def HLCF_ElifOp : HLCFParentOp<"elif"> {
   ];
 
   let extraClassDeclaration = [{
+    /// Create a 2-arm elif, run `emitThen` / `emitElse` at the start of each
+    /// region (they must terminate the blocks), and leave the insertion point
+    /// after the op. Returns null if either callback fails.
+    static ElifOp create(OpBuilder &builder, Location loc,
+                         TypeRange resultTypes, Value cond,
+                         function_ref<LogicalResult()> emitThen,
+                         function_ref<LogicalResult()> emitElse);
+
     /// Return OpBuilder's pointing the end of the then/else block.
     OpBuilder getThenBodyBuilder();
     OpBuilder getElseBodyBuilder();

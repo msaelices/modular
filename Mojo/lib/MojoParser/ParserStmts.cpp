@@ -1513,8 +1513,8 @@ ParseResult StmtParser::parseWhileStmt(size_t curIndent) {
   if (!condVal)
     return success(); // IRGen error already emitted; parse succeeded!
 
-  Operation *condIf = emitter.emitIfThen(
-      whileLoc, condVal, TypeRange{},
+  HLCF::ElifOp condIf = HLCF::ElifOp::create(
+      *emitter.builder, whileLoc, TypeRange{}, condVal,
       [&]() -> LogicalResult {
         HLCF::YieldOp::create(*emitter.builder, whileLoc);
         return success();
@@ -1946,8 +1946,8 @@ LoopResult StmtParser::emitForStmt(SMLoc forLoc, ExprNode *targetExpr,
 
     // Emit an if statement, if the condition is true then yield other break to
     // the else block.
-    Operation *condIf = emitter.emitIfThen(
-        forLocation, shouldContinue, TypeRange{},
+    HLCF::ElifOp condIf = HLCF::ElifOp::create(
+        *emitter.builder, forLocation, TypeRange{}, shouldContinue,
         [&]() -> LogicalResult {
           HLCF::YieldOp::create(*emitter.builder, forLocation);
           return success();
@@ -2851,8 +2851,8 @@ ParseResult StmtParser::parseSingleWithStmt(size_t curIndent, SMLoc smLoc,
       // Fail, but non-fatal so return success to keep parsing.
       return success();
     // If __exit__ returns false, then re-raise the error.
-    Operation *stopRethrowIf = emitter.emitIfThen(
-        loc, exitI1Val, TypeRange{},
+    HLCF::ElifOp stopRethrowIf = HLCF::ElifOp::create(
+        *emitter.builder, loc, TypeRange{}, exitI1Val,
         [&]() -> LogicalResult {
           // On true, nothing is to be done.
           HLCF::YieldOp::create(*emitter.builder, loc);
@@ -2894,8 +2894,8 @@ ParseResult StmtParser::parseSingleWithStmt(size_t curIndent, SMLoc smLoc,
     // exception (exc flag still true).
     Value excFlag = RefLoadOp::create(builder, loc, excVar);
     auto emitter = getEmitter();
-    Operation *excIf = emitter.emitIfThen(
-        loc, excFlag, TypeRange{},
+    HLCF::ElifOp excIf = HLCF::ElifOp::create(
+        *emitter.builder, loc, TypeRange{}, excFlag,
         [&]() -> LogicalResult {
           builder = *emitter.builder;
           emitNormalExitLogic();
@@ -4323,8 +4323,8 @@ static LogicalResult emitIfClause(StmtParser &stmtEmitter,
   if (!condRVal)
     return failure();
 
-  return success((bool)emitter.emitIfThen(
-      location, condRVal, TypeRange(),
+  return success((bool)HLCF::ElifOp::create(
+      *emitter.builder, location, TypeRange(), condRVal,
       [&]() -> LogicalResult {
         llvm::SaveAndRestore builderSaver(stmtEmitter.getBuilder());
         stmtEmitter.getBuilder().setInsertionPointToStart(
