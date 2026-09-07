@@ -378,7 +378,7 @@ forms to follow Python's precedent:
     ```
 
 Other language features may add additional pattern forms. In particular, the
-separate enum/sum-type proposal adds patterns for selecting and decomposing
+separate enum/`EnumLike` proposal adds patterns for selecting and decomposing
 sum-type alternatives through the same underlying machinery.
 
 Finally, **match guards** are useful but are not themselves patterns:
@@ -567,8 +567,8 @@ Other pieces likewise decompose naturally into relatively independent projects:
   protocol.
 - **Match guards** add boolean filtering after a pattern has successfully
   matched.
-- The separate enum/sum-type proposal adds another family of patterns using the
-  same infrastructure.
+- The separate enum/`EnumLike` proposal adds another family of patterns using
+  the same infrastructure.
 - Exhaustiveness and redundancy analysis can become progressively more
   sophisticated as additional pattern forms land.
 

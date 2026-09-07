@@ -206,3 +206,50 @@ def match_struct_pattern_diags(v: Vec3):
         pass
     case _:
         pass
+
+
+def match_enum_pattern_diags(opt: Optional[Int], someEnum: Some[EnumLike]):
+    # No-payload cases must be written without parentheses.
+    __match opt:
+    # expected-error @+1 {{enum case 'None' has no associated value}}
+    case Optional.None():
+        pass
+    case _:
+        pass
+
+    # Cannot destructure a case whose payload is NoneType.
+    __match opt:
+    # expected-error @+1 {{enum case 'None' has no associated value}}
+    case Optional.None(value):
+        pass
+    case _:
+        pass
+
+    # Payload cases require a subpattern inside the parentheses.
+    __match opt:
+    # expected-error @+1 {{enum case 'Some' requires a payload pattern inside the parentheses}}
+    case Optional.Some():
+        pass
+    case _:
+        pass
+
+    # Unknown case name (attribute form).
+    __match opt:
+    # expected-error @+1 {{'Nope' is not a case of 'Optional[Int]'}}
+    case Optional.Nope:
+        pass
+    case _:
+        pass
+
+    # Unknown case name (call form).
+    __match opt:
+    # expected-error @+1 {{'Nope' is not a case of 'Optional[Int]'}}
+    case Optional.Nope(ref x):
+        pass
+    case _:
+        pass
+
+    # Can only pattern match on concrete types.
+    __match someEnum:
+    case .What: # expected-error {{cannot match on a parametric enum type}}
+        pass

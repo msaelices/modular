@@ -520,3 +520,48 @@ def match_vec3(v: Vec3):
     case var Vec3(x, y, z):
         _ = x + y + z
         case_callee[2]()
+
+
+# CHECK-LABEL: lit.fn @"match_optional
+def match_optional(opt: Optional[Int], mut mut_opt: Optional[Int]):
+    # Immutable Optional: discriminant check, then payload projection + bind.
+    # CHECK:       lit.call {{.*}}@"_get_enum_discriminant{{.*}}[imm *"opt`
+    # CHECK:       lit.call {{.*}}@"__eq__(
+    # CHECK:       [[ELT:%.*]] = lit.var.decl "elt" ref
+    # CHECK:       lit.call {{.*}}@"_unsafe_get_enum_payload{{.*}}(%opt)
+    # CHECK:       lit.ref.store {{.*}}, [[ELT]]
+    __match opt:
+    case Optional.Some(ref elt):
+        _ = elt
+        case_callee[0]()
+    # CHECK:       lit.call {{.*}}@"_get_enum_discriminant{{.*}}[imm *"opt`
+    # CHECK:       lit.call {{.*}}@"__eq__(
+    # CHECK:       lit.call {{.*}}@"case_callee{{.*}}<index> 1
+    case Optional.None:
+        case_callee[1]()
+
+    # Mutable Optional: same match path; subject origin is mut (muttoimm on
+    # read-only EnumLike accessors until those use an interior origin).
+    # CHECK:       lit.ref.immut %mut_opt
+    # CHECK:       lit.call {{.*}}@"_get_enum_discriminant{{.*}}[muttoimm *"mut_opt`
+    # CHECK:       lit.call {{.*}}@"__eq__(
+    # CHECK:       [[MELT:%.*]] = lit.var.decl "elt" ref
+    # CHECK:       lit.call {{.*}}@"_unsafe_get_enum_payload{{.*}}muttoimm *"mut_opt`
+    # CHECK:       lit.ref.store {{.*}}, [[MELT]]
+    __match mut_opt:
+    case Optional.Some(ref elt):
+        _ = elt
+        case_callee[2]()
+    # CHECK:       lit.call {{.*}}@"_get_enum_discriminant{{.*}}[muttoimm *"mut_opt`
+    # CHECK:       lit.call {{.*}}@"case_callee{{.*}}<index> 3
+    case Optional.None:
+        case_callee[3]()
+
+    # Matching with inferred base also work.
+    __match opt:
+    case .Some(ref elt):
+        case_callee[0]()
+    case ((.None)):  # Extra parens are fine of course.
+        case_callee[1]()
+    case .Some:  # just check the tag, don't bind the value.
+        case_callee[2]()

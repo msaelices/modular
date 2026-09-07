@@ -174,7 +174,7 @@ and:
 setBrushColor(.rgb(r=255, g=0, b=0))
 ```
 
-## Matching and Destructuring Cases
+## Matching and destructuring cases
 
 Enum cases introduce a corresponding kind of pattern that tests the active case
 and decomposes its associated state. For example:
@@ -190,7 +190,7 @@ case .green:
 case .blue:
     print("blue")
 
-case var .rgb(r, g, b):
+case .rgb(var r, var g, var b):
     use(r, g, b)
 ```
 
@@ -198,29 +198,84 @@ The case pattern first tests whether the value contains the specified
 enumerator. If so, its associated-value patterns are recursively applied to the
 case's payload.
 
-Case patterns are therefore ordinary **refutable patterns**. They are not
-specific to the `match` statement and should work in the proposed `if let`
-syntax as well:
+Case patterns are ordinary **refutable patterns**. They are not specific to the
+`match` statement and should work in the proposed `if let` syntax as well:
 
 ```mojo
-if .rgb(var r, var g, var b) = color:
+if var .rgb(r, g, b) = color:
     use(r, g, b)
 ```
 
-Case patterns should compose recursively with all other pattern forms:
+Case patterns compose recursively with all other pattern forms:
 
 ```mojo
-case .success(value=[var first, *rest]):
+case .success([var first, *rest]):
     ...
 ```
 
 Likewise, enum cases themselves may contain enums or other destructurable types.
 
-The pattern-matching proposal defines the general mechanics of pattern success,
-failure, binding, and control flow. Enums merely add another refutable pattern
-form to that system.
+The [pattern-matching proposal](pattern-matching.md) defines the general
+mechanics of pattern success, failure, binding, and control flow. Enums add
+another refutable pattern form to that system, implemented against the
+`EnumLike` trait described below.
 
-## Methods, Traits, and Generic Enums
+### How enum pattern matching works
+
+From the programmer's point of view, there are two surface forms:
+
+1. **Case-only patterns** name an alternative with no parentheses:
+   `Optional.None`, `.red`, `Color.blue`. These succeed when the subject's
+   active case matches the name. They introduce no payload bindings.
+2. **Case-with-payload patterns** look like a call: `Optional.Some(ref elt)`,
+   `.rgb(var r, var g, var b)`. These succeed when the case matches **and**
+   each payload subpattern matches the associated state.
+
+A few rules follow from that split:
+
+- Cases with **no associated value** (payload type `NoneType`) must use the
+  case-only form. Writing `Optional.None()` or `Optional.None(value)` is an
+  error: there is nothing to destructure.
+- Cases **with** associated value require a payload pattern when parentheses
+  are used. `Optional.Some()` with empty parentheses is rejected; write
+  `Optional.Some(_)` to ignore the payload, or `Optional.Some` (case-only) to
+  test the discriminant without projecting it.
+- Leading-dot forms (`.Some(ref x)`) resolve the case name against the
+  subject's type, the same way contextual member lookup works for
+  construction.
+- Qualified forms (`Optional.Some(ref x)`) require the type prefix to be the
+  subject's nominal type (unbound `Optional` may match `Optional[Int]`).
+
+Under the hood, the compiler never special-cases the `enum` keyword when
+emitting these patterns. It asks whether the **subject type** conforms to
+`EnumLike`, then:
+
+1. Resolves the written case name (`.rgb` / `Color.rgb`) to a case index by
+   searching `_enum_case_names`.
+2. Emits a predicate comparing `_get_enum_discriminant()` to that index.
+3. If the pattern has payload subpatterns, projects the active payload with
+   `_unsafe_get_enum_payload[id]()` and recursively matches each subpattern
+   against that projected value (short-circuiting so the payload is only
+   projected when the discriminant matches).
+
+Payload bindings use the same `var` / `ref` / bare-binding rules as every
+other pattern. For example:
+
+```mojo
+match value:
+case .some(ref element):
+    use(element)  # borrows the payload; mutability follows the subject
+```
+
+borrow the payload rather than copying or moving it, subject to the usual
+ownership and exclusivity rules.
+
+Unknown case names (`Optional.Nope`) are diagnosed against `_enum_case_names`
+rather than ordinary member lookup: enum cases need not exist as real members
+of the type for matching to work (hand-written `EnumLike` conformances can
+expose logical cases that are not constructor APIs).
+
+## Methods, traits, and generic enums
 
 Enums should be full nominal Mojo types rather than restricted tagged unions.
 
@@ -235,7 +290,7 @@ enum Color:
 
     def is_grayscale(self) -> Bool:
         match self:
-        case var .rgb(r, g, b):
+        case .rgb(var r, var g, var b):
             return r == g == b  # Mojo loves Python, woo!
         case _:
             return False
@@ -318,95 +373,128 @@ should borrow the payload rather than copying or moving it.
 Similarly, mutable access to an enum payload should follow the same ownership
 and exclusivity rules as mutable access to ordinary stored state.
 
-## The `SumType` Trait
+## The `EnumLike` trait
 
 The `enum` syntax is syntactic sugar for introducing a sum type, but the
 underlying semantic abstraction is broader than syntactic enums. A type that has
 a finite set of mutually exclusive alternatives, each with a statically known
-payload shape, is a **sum type** regardless of how it was declared or
+payload shape, is **enum-like** regardless of how it was declared or
 represented.
 
-Mojo should capture this abstraction with a built-in `SumType` trait:
+Mojo captures this abstraction with a built-in `EnumLike` trait:
 
 ```mojo
-trait SumType:
-    def get_discriminator(self) -> Int:
+trait EnumLike:
+    comptime _enum_case_length: Int
+    comptime _enum_case_names: _MLIR.KGENParamListType[KGENString]
+    comptime _enum_case_types: _MLIR.KGENParamListType[AnyType]
+
+    comptime _enum_elt_type_for_case[id: Int]: AnyType = TypeList[
+        Self._enum_case_types
+    ]()[id]
+
+    def _get_enum_discriminant(self) -> Int:
         ...
 
-    comptime payload_types: <type list>
-    comptime case_names: <string list>
-    # Other stuff too, not fully designed.
+    # FIXME: Prefer an interior origin so payload refs preserve subject
+    # mutability cleanly.
+    def _unsafe_get_enum_payload[
+        id: Int
+    ](ref self) -> ref[self] TypeList[Self._enum_case_types]()[id]:
+        ...
 ```
 
-The compiler automatically synthesizes a `SumType` conformance for every `enum`,
-but the trait should not be restricted to compiler-generated enum types.
-User-defined types may conform as well when they provide equivalent semantics,
-for example:
+The compiler automatically synthesizes an `EnumLike` conformance for every
+`enum`, but the trait is not restricted to compiler-generated enum types.
+User-defined types may conform as well when they provide equivalent semantics.
+`Optional` is the motivating example: it is a struct (not spelled `enum`) that
+conforms to `EnumLike` so pattern matching can treat `None` / `Some` as logical
+cases:
 
 ```mojo
-struct MyCompactOptionalT: Fooable:
+struct Optional[T: Movable](Copyable, EnumLike):
     ...
+    comptime _enum_case_length = 2
+    comptime _enum_case_names = ParameterList.of[
+        "None".value, "Some".value
+    ].values
+    comptime _enum_case_types = TypeList.of[NoneType, Self.T].values
+
+    def _get_enum_discriminant(self) -> Int: ...
+    def _unsafe_get_enum_payload[id: Int](ref self) -> ...: ...
 ```
 
-The runtime discriminator selects the active alternative:
+The runtime discriminant selects the active alternative:
 
 ```mojo
-Color.red.get_discriminator() == 0
-Color.green.get_discriminator() == 1
-Color.blue.get_discriminator() == 2
-Color.rgb(r=1, g=2, b=3).get_discriminator() == 3
+Color.red._get_enum_discriminant() == 0
+Color.green._get_enum_discriminant() == 1
+Color.blue._get_enum_discriminant() == 2
+Color.rgb(r=1, g=2, b=3)._get_enum_discriminant() == 3
 ```
 
-The discriminator is a semantic case index, not necessarily a promise about the
+The discriminant is a semantic case index, not necessarily a promise about the
 physical representation or ABI of the type. An implementation may use an
 explicit tag, a niche representation, or some other encoding while presenting
-the same `SumType` interface.
+the same `EnumLike` interface.
 
-### `SumType` as the Basis for Pattern Matching
+Payload type `NoneType` means "this case has no associated value." That is how
+`Optional.None` is modeled, and it is what causes the pattern matcher to reject
+payload subpatterns for that case.
 
-An important goal of this design is that syntactic enums should not be
-privileged by the pattern-matching implementation. Instead, the compiler
-implements enum-style refutable patterns in terms of the `SumType` trait.
+### `EnumLike` as the basis for pattern matching
 
-For when type checking an assignment into a pattern for a type conforming to
-`SumType`, e.g.:
+Syntactic enums should not be privileged by the pattern-matching
+implementation. The compiler implements enum-style refutable patterns in terms
+of `EnumLike`.
+
+When matching a subject whose type conforms to `EnumLike`, for example:
 
 ```mojo
 if .rgb(var r, var g, var b) = color:
     ...
 ```
 
-The compiler performs three steps:
-
-1. Resolve `.rgb` to the corresponding case index using the static `SumType`
-   metadata.
-2. Compare that case index with `color.get_discriminator()`.
-3. If it matches, project the payload and recursively apply the payload pattern.
-
-This means the compiler's pattern-matching machinery operates on **sum types**,
-rather than special-casing declarations spelled with `enum`.
-
-### Reflection and Derived Conformances
-
-The same interface provides a useful foundation for generic reflection. For
-example, `Equatable` trait provides a default implementation for eq/ne. It can
-notice sum types and first compare the active cases:
+or:
 
 ```mojo
-if lhs.get_discriminator() != rhs.get_discriminator():
+match opt:
+case Optional.Some(ref elt):
+    use(elt)
+case Optional.None:
+    handle_missing()
+```
+
+the compiler performs the steps in [How enum pattern matching
+works](#how-enum-pattern-matching-works): resolve the case name through
+`_enum_case_names`, compare `_get_enum_discriminant()`, and (when needed)
+project with `_unsafe_get_enum_payload[id]()` before recursively matching
+payload patterns.
+
+This means the compiler's pattern-matching machinery operates on **enum-like
+types**, rather than special-casing declarations spelled with `enum`.
+
+### Reflection and derived conformances
+
+The same interface provides a useful foundation for generic reflection. For
+example, an `Equatable` default implementation can notice `EnumLike` types and
+first compare the active cases:
+
+```mojo
+if lhs._get_enum_discriminant() != rhs._get_enum_discriminant():
     return False
 ```
 
-When the discriminators match, `payload_types` identifies the payload type
+When the discriminants match, `_enum_case_types` identifies the payload type
 corresponding to that case, allowing the implementation to compare the
 associated state when that state is itself `Equatable`.
 
-Similarly, `case_names` enables reflective operations that need a human-readable
-name for an alternative, such as formatting, debugging, serialization, or
-generic inspection:
+Similarly, `_enum_case_names` enables reflective operations that need a
+human-readable name for an alternative, such as formatting, debugging,
+serialization, or generic inspection:
 
 ```mojo
-comptime name = T.case_names[index]
+comptime name = T._enum_case_names[index]
 ```
 
 Other derived behaviors such as hashing or serialization can use the same
@@ -416,13 +504,13 @@ This gives the language a useful separation of concerns:
 
 - `enum` is convenient syntax for declaring a nominal sum type.
 - The compiler lowers that syntax onto Mojo's ordinary nominal-type machinery
-  and synthesizes a `SumType` conformance.
-- `SumType` defines the semantic and reflective interface for finite
+  and synthesizes an `EnumLike` conformance.
+- `EnumLike` defines the semantic and reflective interface for finite
   alternatives.
-- Pattern matching is implemented against `SumType`, rather than giving
+- Pattern matching is implemented against `EnumLike`, rather than giving
   syntactic enums special treatment.
 - User-defined representations may participate in the same system by conforming
-  to `SumType` themselves.
+  to `EnumLike` themselves (as `Optional` already does in the prototype).
 
 This is consistent with the broader implementation philosophy of the proposal:
 enums should introduce useful high-level syntax and synthesized machinery
@@ -637,7 +725,7 @@ naturally:
 - How do documentation and diagnostics refer to the type?
 - Where do methods or trait conformances live?
 - How does contextual lookup find case constructors?
-- How do anonymous cases participate in reflection and `SumType` metadata?
+- How do anonymous cases participate in reflection and `EnumLike` metadata?
 - How do source and ABI stability work when an alternative is added or
   reordered?
 
