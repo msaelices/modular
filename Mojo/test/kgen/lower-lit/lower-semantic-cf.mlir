@@ -884,7 +884,7 @@ lit.fn @self_recursive_arg_diff(%a: index) -> !kgen.none {
 // CHECK-NEXT: [[V1SB:%.*]] = pop.cast_from_builtin [[V1]] : i1 to !kgen.scalar<bool>
 // CHECK-NEXT: [[V0:%.*]] = hlcf.elif [[V1SB]] -> index {
 // CHECK-NEXT: hlcf.yield %arg0 : index
-// CHECK-NEXT: } {
+// CHECK-NEXT: } else {
 // CHECK-NEXT: [[V2:%*.]] = index.cmp eq(%arg0, %idx1)
 // CHECK-NEXT: [[V2SB:%.*]] = pop.cast_from_builtin [[V2]] : i1 to !kgen.scalar<bool>
 // CHECK-NEXT: hlcf.elif.yield [[V2SB]]
@@ -901,7 +901,7 @@ lit.fn @elif(%arg0: index, %arg1: index, %arg2: index) -> index {
   %c0_sb = pop.cast_from_builtin %c0 : i1 to !kgen.scalar<bool>
   %0 = hlcf.elif %c0_sb -> index {
     hlcf.yield %arg0 : index
-  } {
+  } else {
     %c = index.cmp eq(%arg0, %idx1)
     %c_sb = pop.cast_from_builtin %c : i1 to !kgen.scalar<bool>
     hlcf.elif.yield %c_sb

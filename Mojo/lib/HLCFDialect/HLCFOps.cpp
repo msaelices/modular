@@ -667,36 +667,39 @@ parseElif(OpAsmParser &parser, Region &thenRegion,
   if (failed(parser.parseRegion(thenRegion)))
     return failure();
 
-  // Additional (cond, then) pairs until `else`.
-  while (failed(parser.parseOptionalKeyword("else"))) {
-    SmallVector<OpAsmParser::Argument> conditionArgs;
-    if (failed(parser.parseArgumentList(
-            conditionArgs, AsmParser::Delimiter::OptionalParen, true, false)))
-      return failure();
-    if (failed(parser.parseRegion(
-            *elifRegionsRegions.emplace_back(std::make_unique<Region>()),
-            conditionArgs)))
+  // Each subsequent arm is introduced by `else`. If `then` follows the
+  // region, it is an additional (cond, then) pair; otherwise it is the final
+  // else region.
+  while (true) {
+    if (failed(parser.parseKeyword("else")))
       return failure();
 
-    if (failed(parser.parseKeyword("then")))
-      return failure();
-    SmallVector<OpAsmParser::Argument> thenArgs;
+    SmallVector<OpAsmParser::Argument> regionArgs;
     if (failed(parser.parseArgumentList(
-            thenArgs, AsmParser::Delimiter::OptionalParen, true, false)))
+            regionArgs, AsmParser::Delimiter::OptionalParen, true, false)))
       return failure();
-    if (failed(parser.parseRegion(
-            *elifRegionsRegions.emplace_back(std::make_unique<Region>()),
-            thenArgs)))
+
+    auto region = std::make_unique<Region>();
+    if (failed(parser.parseRegion(*region, regionArgs)))
       return failure();
+
+    if (succeeded(parser.parseOptionalKeyword("then"))) {
+      elifRegionsRegions.push_back(std::move(region));
+
+      SmallVector<OpAsmParser::Argument> thenArgs;
+      if (failed(parser.parseArgumentList(
+              thenArgs, AsmParser::Delimiter::OptionalParen, true, false)))
+        return failure();
+      if (failed(parser.parseRegion(
+              *elifRegionsRegions.emplace_back(std::make_unique<Region>()),
+              thenArgs)))
+        return failure();
+      continue;
+    }
+
+    elseRegion.takeBody(*region);
+    return success();
   }
-
-  SmallVector<OpAsmParser::Argument> elseArgs;
-  if (failed(parser.parseArgumentList(
-          elseArgs, AsmParser::Delimiter::OptionalParen, true, false)))
-    return failure();
-  if (failed(parser.parseRegion(elseRegion, elseArgs)))
-    return failure();
-  return success();
 }
 
 static void printElif(OpAsmPrinter &printer, Operation *elifOp,
@@ -716,19 +719,18 @@ static void printElif(OpAsmPrinter &printer, Operation *elifOp,
   };
 
   printer.printRegion(thenRegion);
-  printer << " ";
 
   assert(conditionalRegions.size() % 2 == 0);
   for (unsigned i = 0, e = conditionalRegions.size(); i != e; i += 2) {
+    printer << " else ";
     printArgumentList(conditionalRegions[i].getArguments());
     printer.printRegion(conditionalRegions[i], /*printEntryBlockArgs=*/false);
     printer << " then ";
     printArgumentList(conditionalRegions[i + 1].getArguments());
     printer.printRegion(conditionalRegions[i + 1],
                         /*printEntryBlockArgs=*/false);
-    printer << " ";
   }
-  printer << "else ";
+  printer << " else ";
   printArgumentList(elseRegion.getArguments());
   printer.printRegion(elseRegion, /*printEntryBlockArgs=*/false);
 }

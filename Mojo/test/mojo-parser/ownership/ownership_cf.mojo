@@ -596,7 +596,7 @@ def test_elif(cond: Bool, cond2: Bool):
         # CHECK-NEXT: lit.call {{.*}}marker()
         marker()
         # CHECK-NEXT: hlcf.yield
-    # CHECK-NEXT: } {
+    # CHECK-NEXT: } else {
     # mem1 never used at this point, destroy in the condition.
     # CHECK-NEXT: lit.call {{.*}}__deinit__{{.*}}(%mem1)
     # CHECK-NEXT: lifetime.end %mem1
@@ -613,7 +613,7 @@ def test_elif(cond: Bool, cond2: Bool):
         # CHECK-NEXT: lit.call {{.*}}marker()
         marker()
         # CHECK-NEXT: hlcf.yield
-    # CHECK-NEXT: } {
+    # CHECK-NEXT: } else {
 
     # Last use of mem2 is in this condition.
     # CHECK-NEXT: lit.ref.struct.ger %mem2[x]

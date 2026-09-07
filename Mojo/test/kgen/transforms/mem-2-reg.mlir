@@ -510,7 +510,7 @@ kgen.func @elif(%arg0 : index, %arg1: index, %arg2: index) -> index {
   // CHECK-NEXT: [[V0:%.*]]:4 = hlcf.elif [[C1B]] -> index, index, index, index {
   // CHECK-NEXT:   [[W3:%.*]] = index.add %arg1, %idx1
   // CHECK-NEXT:   hlcf.yield [[W3]], [[C0]], [[W3]], %arg2 : index, index, index, index
-  // CHECK-NEXT: } {
+  // CHECK-NEXT: } else {
   // CHECK-NEXT:   [[X3:%.*]] = index.add [[C0]], %idx1
   // CHECK-NEXT:   [[X4:%.*]] = index.cmp eq([[X3]], %idx1)
   // CHECK-NEXT:   [[X4B:%.*]] = pop.cast_from_builtin [[X4]] : i1 to !kgen.scalar<bool>
@@ -533,7 +533,7 @@ kgen.func @elif(%arg0 : index, %arg1: index, %arg2: index) -> index {
     %var5 = index.add %4, %idx1
     pop.store %var5, %varThen : !kgen.pointer<index>
     hlcf.yield %var5 : index
-  } {
+  } else {
     %8 = pop.load %varCondition : !kgen.pointer<index>
     %var9 = index.add %8, %idx1
     pop.store %var9, %varCondition : !kgen.pointer<index>

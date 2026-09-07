@@ -387,13 +387,13 @@ kgen.generator @elif(%arg0: index, %arg1: index) -> index {
   %cond0b = pop.cast_from_builtin %cond0 : i1 to !kgen.scalar<bool>
   %0 = hlcf.elif %cond0b -> index {
     hlcf.yield %idx0 : index
-  } {
+  } else {
     %cond1 = index.cmp eq(%arg0, %idx1)
     %cond1b = pop.cast_from_builtin %cond1 : i1 to !kgen.scalar<bool>
     hlcf.elif.yield %cond1b
   } then {
     hlcf.yield %idx1 : index
-  } {
+  } else {
     %cond2 = index.cmp eq(%arg0, %idx2)
     %cond2b = pop.cast_from_builtin %cond2 : i1 to !kgen.scalar<bool>
     hlcf.elif.yield %cond2b
@@ -442,7 +442,7 @@ kgen.func @elifManyRegionsWithArgs(%arg0: index) -> index {
   %c3 = pop.cast_from_builtin %3 : i1 to !kgen.scalar<bool>
   %0:2 = hlcf.elif %c3 -> index, index {
     hlcf.yield %2, %2 : index, index
-  } {
+  } else {
     %4 = index.cmp eq(%arg0, %idx4)
     %c4 = pop.cast_from_builtin %4 : i1 to !kgen.scalar<bool>
     %5 = index.add %2, %idx3

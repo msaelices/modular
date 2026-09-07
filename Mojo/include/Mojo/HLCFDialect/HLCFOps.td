@@ -636,7 +636,7 @@ def HLCF_ElifYieldOp : HLCFTerminatorOp<"elif.yield", [
     ```mlir
     %0 = hlcf.elif %cond0 -> index {
       hlcf.yield %arg0 : index
-    } {
+    } else {
       hlcf.elif.yield %cond1, %x : i32
     } then (%xThen: i32) {
       hlcf.yield %arg0 : index
@@ -658,10 +658,10 @@ def HLCF_ElifOp : HLCFParentOp<"elif"> {
   let summary = "elif operation";
   let description = [{
     The `hlcf.elif` operation is a multi-arm conditional. The first condition
-    is an SSA operand; its matching `then` is `$thenRegion`. Additional
-    `elif` arms live in `$elifRegions` as (condition, then) pairs, where each
-    condition region is terminated by `hlcf.elif.yield`. The final `$elseRegion`
-    runs when every condition is false.
+    is an SSA operand; its matching `then` is `$thenRegion`. Additional arms
+    are written as `else { cond } then { then }` pairs in `$elifRegions`, where
+    each condition region is terminated by `hlcf.elif.yield`. The final
+    `$elseRegion` runs when every condition is false.
 
     All `then` / `else` regions are terminated by `hlcf.yield`, whose operand
     types must match the results of the parent `hlcf.elif`.
@@ -681,7 +681,7 @@ def HLCF_ElifOp : HLCFParentOp<"elif"> {
     ```mlir
     %0 = hlcf.elif %cond0 -> index {
       hlcf.yield %arg0 : index
-    } {
+    } else {
       hlcf.elif.yield %cond1
     } then {
       hlcf.yield %arg1 : index
