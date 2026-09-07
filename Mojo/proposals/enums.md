@@ -511,6 +511,55 @@ ownership and pattern systems provides the important functionality while keeping
 the language and implementation model straightforward. More specialized
 capabilities can be added later without weakening that foundation.
 
+### Future consideration: Control over layout and discriminators
+
+The initial proposal provides a pure algebraic data type. Languages like C and
+C++ use a very different model, which is nonetheless very useful - enums can
+have specified discriminator values, and supports efficient casts to integer
+values, and support a specifier for layout information. For example:
+
+```C++
+enum MyColors : int32_t {
+    red   = 0xFF0000,
+    green = 0x00FF00,
+    blue  = 0x0000FF
+}
+```
+
+The base proposal doesn't include such affordances, but they can be layered on
+top when and if demand appears and the complexity is justified. Mojo doesn't
+currently provide fine-grain control of struct layout, which is something that
+should be tackled exposing layout control for enums.
+
+Note that C also supports "enums as random collections of values", such as:
+
+```C++
+enum {
+  Value1 = 42,
+  Value2 = 17,
+  Value3 = 42
+};
+```
+
+This is a fundamentally different construct than an algebraic data type. Mojo
+supports such concepts with existing `comptime` values, enums do not need to
+provide support for this use-case.
+
+### Future consideration: Recursive/indirect enum cases
+
+The initial proposal doesn't provide support for
+[Swift-style indirect enum cases](https://www.hackingwithswift.com/example-code/language/what-are-indirect-enums).
+
+We can evaluate adding such a thing in the future, but it would be preferred to
+express this with existing language features if possible, e.g.:
+
+```mojo
+enum LinkedListItem[T: Copyable] {
+    case endPoint(value: T)
+    case linkNode(value: T, next: HeapBox[LinkedListItem])
+}
+```
+
 ### Future consideration: Anonymous Sum Types
 
 Note: This is specifically NOT part of the initial proposal. This is included to
