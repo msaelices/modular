@@ -3179,19 +3179,20 @@ void UninitializedValueScan::checkIfLikeOp(Operation &op) {
 
 // This is used for the HLCF::ElifOp.
 void UninitializedValueScan::checkElIfOp(HLCF::ElifOp op) {
-  // ElIf contains pairs of regions in the elifRegions list, which correspond
-  // to a 'condition' and a 'if true' block for each condition.  The live-out
-  // set is the intersection of all of the live-out sets for each condition.
-  MutableArrayRef<Region> ifRegions = op.getElifRegions();
-  assert((ifRegions.size() % 2) == 0 && "Must have pairs of regions");
-
-  // The ultimate live-out set is the intersection of each of the "then" blocks,
-  // along with the live-out set of the ultimate else.  Start assuming this set
-  // isn't reachable.
+  // Region layout: thenRegion, elseRegion, then additional (cond, then) pairs
+  // in elifRegions. Live-out is the intersection of all then arms and else.
   auto thenLiveOutValues =
       TrackedAndInteriorLiveness::getEmptyWithMatchingSize(liveness);
-  TrackedAndInteriorLiveness scratchSet(0, 0); // 0,0 because always overwritten
+  TrackedAndInteriorLiveness scratchSet(0, 0); // always overwritten below
 
+  // First then uses the live-in set of the elif (cond is an SSA operand).
+  scratchSet = liveness;
+  scanBlock(op.getThenRegion().front());
+  thenLiveOutValues.mergeWith(liveness, valueSet.domInfo);
+  std::swap(liveness, scratchSet);
+
+  MutableArrayRef<Region> ifRegions = op.getElifRegions();
+  assert((ifRegions.size() % 2) == 0 && "Must have pairs of regions");
   for (size_t nextElIfRegion = 0, e = ifRegions.size(); nextElIfRegion != e;
        nextElIfRegion += 2) {
     // Check the next condition accumulating into liveness.
@@ -3199,8 +3200,7 @@ void UninitializedValueScan::checkElIfOp(HLCF::ElifOp op) {
     // Save the live set after the condition but before the 'then' block.
     scratchSet = liveness;
 
-    // Scan the "then" block for this condition, the result is the exit set for
-    // this case.
+    // Scan the "then" block for this condition.
     scanBlock(ifRegions[nextElIfRegion + 1].front());
     thenLiveOutValues.mergeWith(liveness, valueSet.domInfo);
 
@@ -4612,63 +4612,73 @@ void DestructorInsertion::checkIfLikeOp(
 // This is used for the HLCF::ElifOp.
 void DestructorInsertion::checkElIfOp(
     HLCF::ElifOp op, SmallVector<ResultEffect> &resultEffects) {
-  assert(resultEffects.empty() && "Need to handle these like if-like ops");
+  // Handle owned register results of the elif the same way as if-like ops.
+  if (!resultEffects.empty()) {
+    ImplicitLocOpBuilder builder(op.getLoc(), op->getBlock(),
+                                 std::next(Block::iterator(op)));
+    DestructorInserter dtorInserter(builder, valueSet, diagsToEmit);
+    for (auto [result, effect] : llvm::zip(op.getResults(), resultEffects)) {
+      switch (effect) {
+      case ResultEffect::ignore:
+        continue;
+      case ResultEffect::regDefine:
+        checkDef(result, *op, /*isDeref=*/false, dtorInserter);
+        break;
+      default:
+        llvm_unreachable("unknown result effect for 'elif'");
+      }
+    }
+    resultEffects.clear();
+  }
 
-  // ElIf contains pairs of regions in the elifRegions list, which correspond
-  // to a 'condition' and a 'if true' block for each condition.  The live-out
-  // set is the intersection of all of the live-out sets for each condition.
+  // Region layout: thenRegion, elseRegion, then additional (cond, then) pairs.
+  // Backward pass: else, then each additional pair, then the first thenRegion.
   MutableArrayRef<Region> ifRegions = op.getElifRegions();
   assert((ifRegions.size() % 2) == 0 && "Must have pairs of regions");
 
-  // Destructor insertion is a backward pass, so we process the else to see the
-  // consumed set coming in, then process each if/then pair as merging with its
-  // consume set.
   BitVector thenExitConsumedValues = consumedValues;
   Block *elseBlock = &op.getElseRegion().front();
   scanBlock(*elseBlock);
 
-  // For each `if cond: then else: ..` block, we have a consumed value set for
-  // the else, which we have to unify with this then block before we can
-  // continue up the if/else chain.
   for (size_t i = ifRegions.size(); i != 0; i -= 2) {
     Block &condBlock = ifRegions[i - 2].front();
     Block &thenBlock = ifRegions[i - 1].front();
 
-    // Process the 'then' block with the consume set from after the 'if' chain.
     BitVector elseConsumeSet = std::move(consumedValues);
     consumedValues = thenExitConsumedValues;
     scanBlock(thenBlock);
 
-    // We now have the consume set from the 'then' and else'.  Merge these
-    // two sets, and if they differ, insert destructor calls.
     BitVector merged = unifyConsumedSets(consumedValues, elseConsumeSet);
-    if (!merged.empty()) { // In the common case, they are identical.
-      // 'consumedValues' is the current set for the 'then' block, so insert
-      // those dtors if needed.
+    if (!merged.empty()) {
       destroyValuesAtEntryIfNeeded(consumedValues, thenBlock, merged,
                                    op.getLoc());
-
-      // Insert destructors in the 'else' block.
       destroyValuesAtEntryIfNeeded(elseConsumeSet, *elseBlock, merged,
                                    op.getLoc());
-
-      // The upward consume set is the union of both sides.
       consumedValues = std::move(merged);
     }
 
-    // After the 'then' and 'else' blocks are unified, we need to scan the
-    // 'cond' block to see which one was picked.  The condition block contains
-    // an arbitrary expression which can be the last use of various values, so
-    // it gets destructors inserted as well.
     scanBlock(condBlock);
-
-    // For the next 'if cond: then' block, this condition is the effective else
-    // block.
+    // For the next arm up the chain, this condition is the effective else.
     elseBlock = &condBlock;
   }
 
-  // At the end, the upwardly demanded set for the whole statement is what the
-  // statement demands.
+  // Finally unify the first thenRegion with the remaining "else" path. The
+  // first condition is an SSA operand (no cond region to scan).
+  {
+    Block &thenBlock = op.getThenRegion().front();
+    BitVector elseConsumeSet = std::move(consumedValues);
+    consumedValues = thenExitConsumedValues;
+    scanBlock(thenBlock);
+
+    BitVector merged = unifyConsumedSets(consumedValues, elseConsumeSet);
+    if (!merged.empty()) {
+      destroyValuesAtEntryIfNeeded(consumedValues, thenBlock, merged,
+                                   op.getLoc());
+      destroyValuesAtEntryIfNeeded(elseConsumeSet, *elseBlock, merged,
+                                   op.getLoc());
+      consumedValues = std::move(merged);
+    }
+  }
 }
 
 /// Given two consume sets that correspond to an 'if-like' construct which

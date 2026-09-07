@@ -73,9 +73,7 @@ def if_examples(cond: __mlir_type.`!kgen.scalar<bool>`):
     # CHECK-NEXT: lifetime.end %_b
     var _b = MemExample()
 
-    # CHECK: hlcf.elif
-    # CHECK-NEXT: hlcf.elif.yield
-    # CHECK-NEXT: } then {
+    # CHECK: hlcf.elif %cond {
     if cond:
         # CHECK-NEXT: lifetime.start %_a
         # CHECK-NEXT: lit.call {{.*}}__init__{{.*}}(%_a)
@@ -97,9 +95,7 @@ def if_examples(cond: __mlir_type.`!kgen.scalar<bool>`):
     # CHECK-NEXT: lifetime.start %c
     # CHECK-NEXT: lit.call {{.*}}__init__{{.*}}(%c)
     var c = MemExample()
-    # CHECK: hlcf.elif {
-    # CHECK-NEXT: hlcf.elif.yield %cond
-    # CHECK-NEXT: } then {
+    # CHECK: hlcf.elif %cond {
     if cond:
         # CHECK-NEXT: lit.call {{.*}}__deinit__{{.*}}(%c)
         # CHECK-NEXT: lifetime.end %c
@@ -124,9 +120,7 @@ def if_examples(cond: __mlir_type.`!kgen.scalar<bool>`):
     var d = MemExample()
 
     # CHECK: [[ONE:%.+]] = kgen.param.constant: scalar<bool> = <true>
-    # CHECK-NEXT: hlcf.elif {
-    # CHECK-NEXT: hlcf.elif.yield [[ONE]]
-    # CHECK-NEXT: } then {
+    # CHECK-NEXT: hlcf.elif [[ONE]] {
     # expected-warning @below {{'if' condition always evaluates to 'True'; 'else' branch is unreachable}}
     if True:
         # CHECK-NEXT: [[IMMREF:%.*]] = lit.ref.immut %d
@@ -243,8 +237,7 @@ def try_examples(cond: __mlir_type.`!kgen.scalar<bool>`):
     # CHECK-NEXT: [[ERRSLOT:%.*]] = lit.var.decl "e"
     # CHECK-NEXT: lit.try "{{.*}}" {
     try:
-        # CHECK-NEXT:  hlcf.elif
-        # CHECK-NEXT:  hlcf.elif.yield
+        # CHECK-NEXT:  hlcf.elif %cond {
         if cond:
             raise Error()
         # CHECK-NOT: %d
@@ -286,9 +279,7 @@ def chris_origin_example(a: Bool, b: Bool):
                 raise Error()
         # CHECK: except
         # CHECK: lit.call {{.*}}__mlir_bool__
-        # CHECK-NEXT: hlcf.elif
-        # CHECK-NEXT: hlcf.elif.yield
-        # CHECK-NEXT: } then {
+        # CHECK-NEXT: hlcf.elif %{{.*}} {
         # CHECK-NEXT: __deinit__{{.*}}(%x)
         # CHECK: return
         # CHECK: else
@@ -335,9 +326,7 @@ def loop_example(cond1: __mlir_type.`!kgen.scalar<bool>`, cond2: __mlir_type.`!k
         # CHECK-NEXT: lifetime.start %c
         # CHECK-NEXT: lit.call {{.*}}__init__{{.*}}(%c)
         c = MemExample()
-        # CHECK-NEXT: hlcf.elif {
-        # CHECK-NEXT: hlcf.elif.yield %cond2
-        # CHECK-NEXT: } then {
+        # CHECK-NEXT: hlcf.elif %cond2 {
         if cond2:
             # CHECK-NEXT: lifetime.start %b
             # CHECK-NEXT: lit.call {{.*}}__init__{{.*}}(%b)
@@ -511,8 +500,7 @@ def test_param_for1(cond: Bool, cond2: Bool):
         marker()
 
         # CHECK-NEXT: lit.call {{.*}}__mlir_bool__
-        # CHECK-NEXT: hlcf.elif {
-        # CHECK: } then {
+        # CHECK-NEXT: hlcf.elif %{{.*}} {
         if cond:
             # CHECK: lit.call {{.*}}__deinit__{{.*}}(%mem)
             # CHECK-NEXT: lifetime.end %mem
@@ -521,9 +509,7 @@ def test_param_for1(cond: Bool, cond2: Bool):
             # CHECK-NEXT: kgen.param.for.break
             break
 
-        # CHECK: hlcf.elif {
-        # ... cond2 ...
-        # CHECK: } then {
+        # CHECK: hlcf.elif %{{.*}} {
         if cond2:
             # CHECK: lit.call {{.*}}__deinit__{{.*}}(%mem)
             # CHECK-NEXT: lifetime.end %mem
@@ -596,9 +582,7 @@ def test_elif(cond: Bool, cond2: Bool):
     var mem3 = MemExample()
 
     # CHECK:  __mlir_bool__
-    # CHECK-NEXT: hlcf.elif {
-    # CHECK-NEXT: hlcf.elif.yield
-    # CHECK-NEXT: } then {
+    # CHECK-NEXT: hlcf.elif %{{.*}} {
     if cond:
         # CHECK-NEXT: lit.call {{.*}}__deinit__{{.*}}(%mem3)
         # CHECK-NEXT: lifetime.end %mem3

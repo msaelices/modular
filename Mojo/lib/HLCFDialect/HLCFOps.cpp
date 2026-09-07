@@ -660,27 +660,24 @@ LogicalResult ForYieldOp::verify() {
 //===----------------------------------------------------------------------===//
 
 static ParseResult
-parseElif(OpAsmParser &parser,
+parseElif(OpAsmParser &parser, Region &thenRegion,
           SmallVectorImpl<std::unique_ptr<Region>> &elifRegionsRegions,
           Region &elseRegion) {
-  unsigned i = 0;
-  do {
-    // Parse condition region.
-    SmallVector<OpAsmParser::Argument> conditionArgs;
-    if (i > 0) {
-      if (failed(parser.parseArgumentList(
-              conditionArgs, AsmParser::Delimiter::OptionalParen, true, false)))
-        return failure();
-    }
+  // First then region (condition is an SSA operand parsed by ODS).
+  if (failed(parser.parseRegion(thenRegion)))
+    return failure();
 
-    if (parser
-            .parseRegion(
-                *elifRegionsRegions.emplace_back(std::make_unique<Region>()),
-                conditionArgs)
-            .failed())
+  // Additional (cond, then) pairs until `else`.
+  while (failed(parser.parseOptionalKeyword("else"))) {
+    SmallVector<OpAsmParser::Argument> conditionArgs;
+    if (failed(parser.parseArgumentList(
+            conditionArgs, AsmParser::Delimiter::OptionalParen, true, false)))
+      return failure();
+    if (failed(parser.parseRegion(
+            *elifRegionsRegions.emplace_back(std::make_unique<Region>()),
+            conditionArgs)))
       return failure();
 
-    // Parse result region.
     if (failed(parser.parseKeyword("then")))
       return failure();
     SmallVector<OpAsmParser::Argument> thenArgs;
@@ -691,8 +688,8 @@ parseElif(OpAsmParser &parser,
             *elifRegionsRegions.emplace_back(std::make_unique<Region>()),
             thenArgs)))
       return failure();
-    ++i;
-  } while (failed(parser.parseOptionalKeyword("else")));
+  }
+
   SmallVector<OpAsmParser::Argument> elseArgs;
   if (failed(parser.parseArgumentList(
           elseArgs, AsmParser::Delimiter::OptionalParen, true, false)))
@@ -703,6 +700,7 @@ parseElif(OpAsmParser &parser,
 }
 
 static void printElif(OpAsmPrinter &printer, Operation *elifOp,
+                      Region &thenRegion,
                       MutableArrayRef<Region> conditionalRegions,
                       Region &elseRegion) {
   auto printArgumentList = [&](ArrayRef<BlockArgument> args) {
@@ -716,16 +714,18 @@ static void printElif(OpAsmPrinter &printer, Operation *elifOp,
     }
     printer << ")";
   };
-  unsigned i = 0;
+
+  printer.printRegion(thenRegion);
+  printer << " ";
+
   assert(conditionalRegions.size() % 2 == 0);
-  unsigned conditionCount = conditionalRegions.size() / 2;
-  for (unsigned r = 0; r < conditionCount; ++r) {
-    if (i > 0)
-      printArgumentList(conditionalRegions[i].getArguments());
-    printer.printRegion(conditionalRegions[i++], /*printEntryBlockArgs=*/false);
-    printer << " then ";
+  for (unsigned i = 0, e = conditionalRegions.size(); i != e; i += 2) {
     printArgumentList(conditionalRegions[i].getArguments());
-    printer.printRegion(conditionalRegions[i++], /*printEntryBlockArgs=*/false);
+    printer.printRegion(conditionalRegions[i], /*printEntryBlockArgs=*/false);
+    printer << " then ";
+    printArgumentList(conditionalRegions[i + 1].getArguments());
+    printer.printRegion(conditionalRegions[i + 1],
+                        /*printEntryBlockArgs=*/false);
     printer << " ";
   }
   printer << "else ";
@@ -744,8 +744,15 @@ LogicalResult ElifOp::verify() {
 void ElifOp::getEntryTargets(
     ArrayRef<Attribute> operands,
     SmallVectorImpl<HLCF::ControlFlowTarget> &targets) {
-  assert(operands.empty());
-  targets.push_back(std::optional<unsigned>(1));
+  assert(operands.size() == 1);
+  // Region layout: 0 = then, 1 = else, 2+ = additional (cond, then) pairs.
+  unsigned nextOnFalse = getElifRegions().empty() ? 1 : 2;
+  if (auto cond = dyn_cast_if_present<KGEN::SIMDAttr>(operands.front())) {
+    targets.emplace_back(cond.getAsBool() ? 0 : nextOnFalse);
+  } else {
+    targets.emplace_back(0);
+    targets.emplace_back(nextOnFalse);
+  }
 }
 
 ValueRange ElifOp::getEntryArguments(std::optional<unsigned int> target) {
@@ -757,7 +764,15 @@ ValueRange ElifOp::getEntryArguments(std::optional<unsigned int> target) {
 
 ErrorTreeOrSuccess ElifOp::interpret(ArrayRef<Attribute> operands,
                                      InterpreterState &state) {
-  return state.transferControlFlowTo(getElifRegions()[0], operands);
+  auto cond = dyn_cast_if_present<KGEN::SIMDAttr>(operands[0]);
+  if (!cond)
+    return ErrorTree(getLoc(), "non-constant condition");
+
+  if (cond.getAsBool())
+    return state.transferControlFlowTo(getThenRegion(), {});
+  if (!getElifRegions().empty())
+    return state.transferControlFlowTo(getElifRegions()[0], {});
+  return state.transferControlFlowTo(getElseRegion(), {});
 }
 
 ErrorTreeOrSuccess
@@ -779,13 +794,16 @@ void ElifYieldOp::getBranchTargets(
   // stack values that were promoted to register values and thus now rely on
   // block arguments.
   assert(!operands.empty());
+  // Region layout: 0 = then, 1 = else, 2+ = elifRegions.
   unsigned myIndex = getOperation()->getParentRegion()->getRegionNumber();
+  assert(myIndex >= 2 && "elif.yield only belongs in additional cond regions");
   unsigned nextValueRegion = myIndex + 1;
-  unsigned nextConditionRegion = nextValueRegion + 1;
+  unsigned nextConditionRegion = myIndex + 2;
   unsigned numRegions =
       getOperation()->getParentRegion()->getParentOp()->getNumRegions();
+  // Fall to else (region 1) when there is no next condition region.
   unsigned nextConditionRegionOrElse =
-      nextConditionRegion == numRegions ? 0 : nextConditionRegion;
+      nextConditionRegion >= numRegions ? 1 : nextConditionRegion;
   ValueRange carryOver(getOperands().drop_front(1));
   if (auto constantResult =
           dyn_cast_if_present<KGEN::SIMDAttr>(operands.front())) {
@@ -802,22 +820,23 @@ void ElifYieldOp::getBranchTargets(
 ErrorTreeOrSuccess ElifYieldOp::interpret(ArrayRef<Attribute> operands,
                                           InterpreterState &state) {
   auto parent = cast<ElifOp>(getOperation()->getParentOp());
-  unsigned myIndex = getOperation()->getParentRegion()->getRegionNumber() - 1;
+  // Region layout: 0 = then, 1 = else, 2+ = elifRegions.
+  unsigned myRegionNumber =
+      getOperation()->getParentRegion()->getRegionNumber();
+  assert(myRegionNumber >= 2);
+  unsigned myElifIndex = myRegionNumber - 2;
   ArrayRef<Attribute> blockArguments = operands.slice(1);
   if (auto cond = dyn_cast_if_present<KGEN::SIMDAttr>(operands[0])) {
     if (cond.getAsBool()) {
-      return state.transferControlFlowTo(parent.getElifRegions()[myIndex + 1],
-                                         blockArguments);
+      return state.transferControlFlowTo(
+          parent.getElifRegions()[myElifIndex + 1], blockArguments);
     }
-    unsigned nextIndex = myIndex + 2;
+    unsigned nextIndex = myElifIndex + 2;
     if (nextIndex < parent.getElifRegions().size()) {
-      return state.transferControlFlowTo(parent.getElifRegions()[myIndex + 2],
-                                         blockArguments);
-    } else {
-      return state.transferControlFlowTo(parent.getElseRegion(),
+      return state.transferControlFlowTo(parent.getElifRegions()[nextIndex],
                                          blockArguments);
     }
-    return success();
+    return state.transferControlFlowTo(parent.getElseRegion(), blockArguments);
   }
   return ErrorTree(getLoc(), "non-constant condition in elif chain.");
 }

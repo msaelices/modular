@@ -418,9 +418,7 @@ def test_result_consume_reg(cond: __mlir_type.`!kgen.scalar<bool>`) -> RegExampl
   # CHECK-NEXT: lit.ref.store [[TMP]], %example2
   var example2 = RegExample()
 
-  # CHECK-NEXT: hlcf.elif
-  # CHECK-NEXT: hlcf.elif.yield
-  # CHECK-NEXT: } then {
+  # CHECK-NEXT: hlcf.elif %cond {
   if (cond):
     # CHECK-NEXT: lit.ownership.use %example2
     # CHECK-NEXT: [[TMP2:%.*]] = lit.load.consume %example2
@@ -582,9 +580,7 @@ struct ExoticDelExample(RegisterPassable):
     # Test the condition
     # CHECK-NEXT: [[CONDPTR:%.*]] = lit.ref.struct.ger %self[cond]
     # CHECK-NEXT: [[CONDVAL:%.*]] = lit.ref.load [[CONDPTR]]
-    # CHECK-NEXT: hlcf.elif
-    # CHECK-NEXT: hlcf.elif.yield [[CONDVAL]]
-    # CHECK-NEXT: } then {
+    # CHECK-NEXT: hlcf.elif [[CONDVAL]] {
     if self.cond:
       # This side we manually consume for c.
 
@@ -845,9 +841,7 @@ def test_partial_overwrite(cond: __mlir_type.`!kgen.scalar<bool>`):
   # CHECK-NEXT: lit.call {{.*}}__init__{{.*}}(%pair)
   var pair = MemPair()
 
-  # CHECK-NEXT: hlcf.elif
-  # CHECK-NEXT: hlcf.elif.yield %cond
-  # CHECK-NEXT: } then {
+  # CHECK-NEXT: hlcf.elif %cond {
   if cond:
     # Inserted destruction of incoming pair.b
     # CHECK-NEXT: [[BREF:%.*]] = lit.ref.struct.ger %pair[b]
@@ -981,7 +975,7 @@ def destroyWholeValuesIfLastReferenceWasInLoop(cond: __mlir_type.`!kgen.scalar<b
 def overwrite(y: MemExample, x: Bool) raises:
    var foo = MemPair()
    if x:
-   # CHECK: } then {
+   # CHECK: hlcf.elif %{{.*}} {
    # CHECK-NEXT: lit.call {{.*}}::@MemPair::@"__deinit__
       raise Error()
    # CHECK: } else {

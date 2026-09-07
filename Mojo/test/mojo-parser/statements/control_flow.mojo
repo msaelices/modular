@@ -19,9 +19,7 @@
 
 # CHECK-LABEL: lit.fn @"test_elif_chain
 # CHECK-NEXT:    [[TEST_A_SB:%.*]] = lit.call {{.*}}::@Bool::@"__mlir_bool__{{.*}}"(%a)
-# CHECK-NEXT:    hlcf.elif {
-# CHECK-NEXT:      hlcf.elif.yield [[TEST_A_SB]]
-# CHECK-NEXT:    } then {
+# CHECK-NEXT:    hlcf.elif [[TEST_A_SB]] {
 # CHECK-NEXT:      %inside_a = lit.var.decl "inside_a"
 # CHECK-NEXT:      hlcf.yield
 # CHECK-NEXT:    } {
@@ -65,8 +63,7 @@ def test_constant(a: Bool) -> Bool:
     # CHECK-NEXT: [[FIVEI:%.*]] = kgen.rebind [[FIVE]]
     # CHECK-NEXT: [[BOOL:%.*]] = lit.call {{.*}}__bool__{{.*}}([[FIVEI]])
     # CHECK-NEXT: [[SB:%.*]] = lit.call {{.*}}__mlir_bool__{{.*}}([[BOOL]])
-    # CHECK-NEXT: hlcf.elif {
-    # CHECK-NEXT: hlcf.elif.yield [[SB]]
+    # CHECK-NEXT: hlcf.elif [[SB]] {
     if z := 5:
         return a
 
@@ -76,23 +73,17 @@ def test_constant(a: Bool) -> Bool:
 # CHECK-LABEL: lit.fn @"test_if_nested
 def test_if_nested(a: Bool, b: Bool, c: Bool) -> Bool:
     # CHECK-NEXT: %0 = lit.call {{.*}}@"__mlir_bool__{{.*}}"(%a)
-    # CHECK-NEXT: hlcf.elif {
-    # CHECK-NEXT:   hlcf.elif.yield %0
-    # CHECK-NEXT: } then {
+    # CHECK-NEXT: hlcf.elif %0 {
     # CHECK-NEXT:   %inside_a = lit.var.decl "inside_a"
     # CHECK-NEXT:   hlcf.yield
     # CHECK-NEXT: } else {
     # CHECK-NEXT:   [[TEST_B_SB:%.*]] = lit.call {{.*}}@"__mlir_bool__{{.*}}"(%b)
-    # CHECK-NEXT:   hlcf.elif {
-    # CHECK-NEXT:     hlcf.elif.yield [[TEST_B_SB]]
-    # CHECK-NEXT:   } then {
+    # CHECK-NEXT:   hlcf.elif [[TEST_B_SB]] {
     # CHECK-NEXT:     %inside_b = lit.var.decl "inside_b"  var : !lit.ref<:meta<!Int> #alias_Int, mut *"inside_b`1">
     # CHECK-NEXT:     hlcf.yield
     # CHECK-NEXT:   } else {
     # CHECK-NEXT:     [[TEST_C_SB:%.*]] = lit.call {{.*}}@"__mlir_bool__{{.*}}"(%c)
-    # CHECK-NEXT:     hlcf.elif {
-    # CHECK-NEXT:       hlcf.elif.yield [[TEST_C_SB]]
-    # CHECK-NEXT:     } then {
+    # CHECK-NEXT:     hlcf.elif [[TEST_C_SB]] {
     # CHECK-NEXT:       %inside_c = lit.var.decl "inside_c"
     # CHECK-NEXT:       hlcf.yield
     # CHECK-NEXT:     } else {
@@ -121,9 +112,7 @@ def test_if_nested(a: Bool, b: Bool, c: Bool) -> Bool:
 # CHECK-LABEL: lit.fn @"if_try
 def if_try(p: Bool):
     # CHECK:      [[TEST_P_SB:%.*]] = lit.call {{.*}}@"__mlir_bool__{{.*}}"(%p)
-    # CHECK-NEXT: hlcf.elif {
-    # CHECK-NEXT:   hlcf.elif.yield [[TEST_P_SB]]
-    # CHECK-NEXT: } then {
+    # CHECK-NEXT: hlcf.elif [[TEST_P_SB]] {
     # CHECK-NEXT:   %e = lit.var.decl {{.*}} !lit.ref<!Error,
     # CHECK-NEXT:   lit.try %e : {{.*}} {
     # CHECK-NEXT:     %b = lit.var.decl "b"  var
@@ -165,9 +154,7 @@ def testCondAsArg(exit_early: __mlir_type.`!kgen.scalar<bool>`):
 # CHECK-LABEL: lit.fn @"constantTrue
 def constantTrue(cond: Bool, x: Int, y: Int) -> Int:
     # CHECK-NEXT:  [[TRUE:%.*]] = kgen.param.constant: scalar<bool> = <true>
-    # CHECK-NEXT: hlcf.elif {
-    # CHECK-NEXT:  hlcf.elif.yield [[TRUE]]
-    # CHECK-NEXT: } then {
+    # CHECK-NEXT: hlcf.elif [[TRUE]] {
     # CHECK-NEXT:   [[XT:%.*]] = kgen.rebind %x : !Int to !alias_Int1
     # CHECK-NEXT:   lit.return [[XT]] : !alias_Int1
     # CHECK-NEXT:   hlcf.yield
@@ -181,9 +168,7 @@ def constantTrue(cond: Bool, x: Int, y: Int) -> Int:
 # CHECK-LABEL: lit.fn @"constantFalse
 def constantFalse(cond: Bool, x: Int, y: Int) -> Int:
     # CHECK:      %0 = lit.call {{.*}}@"__mlir_bool__{{.*}}"(%cond)
-    # CHECK-NEXT: hlcf.elif {
-    # CHECK-NEXT:   hlcf.elif.yield %0
-    # CHECK-NEXT: } then {
+    # CHECK-NEXT: hlcf.elif %0 {
     # CHECK-NEXT:   [[XT0:%.*]] = kgen.rebind %x : !Int to !alias_Int1
     # CHECK-NEXT:   lit.return [[XT0]] : !alias_Int1
     # CHECK-NEXT:   hlcf.yield
@@ -223,9 +208,7 @@ def constantFalse(cond: Bool, x: Int, y: Int) -> Int:
 # CHECK-NEXT:    kgen.param.constant: {{.*}} = <rebind(:!Int {:scalar<index> 0})>
 # CHECK-NEXT:    lit.ref.store {{.+}}, %inside_a
 # CHECK-NEXT:    [[TEST_B_SB:%.*]] = lit.call {{.*}}@"__mlir_bool__{{.*}}"(%b)
-# CHECK-NEXT:    hlcf.elif {
-# CHECK-NEXT:      hlcf.elif.yield [[TEST_B_SB]]
-# CHECK-NEXT:    } then {
+# CHECK-NEXT:    hlcf.elif [[TEST_B_SB]] {
 # CHECK-NEXT:      kgen.param.constant: !alias_Int1 = <rebind(:!Int {:scalar<index> 1})>
 # CHECK-NEXT:      lit.ref.store
 # CHECK-NEXT:      hlcf.yield
@@ -252,9 +235,7 @@ def test_while(a: Bool, b: Bool) -> Bool:
 
 # CHECK-LABEL: lit.fn @"test_else_outside_while
 def test_else_outside_while(a: Bool, b: Bool) raises -> Bool:
-    # CHECK: hlcf.elif {
-    # CHECK:   hlcf.elif.yield
-    # CHECK: } then {
+    # CHECK: hlcf.elif %{{.*}} {
     if b:
         # CHECK: lit.loop {
         # CHECK:   [[V1_SB:%.*]] = lit.call {{.*}}@Bool::@"__mlir_bool__({{.*}}Bool)"(%a)
@@ -280,9 +261,7 @@ def test_break_continue_inside_while(a: Bool) raises -> Bool:
     # CHECK:   [[V1_SB:%.*]] = lit.call {{.*}}@Bool::@"__mlir_bool__({{.*}}Bool)"(%a)
     while a:
         # CHECK:      lit.call {{.*}}__mlir_bool__
-        # CHECK-NEXT: hlcf.elif {
-        # CHECK-NEXT:   hlcf.elif.yield
-        # CHECK-NEXT: } then {
+        # CHECK-NEXT: hlcf.elif %{{.*}} {
         if a:
             # CHECK-NEXT:   lit.break
             break
@@ -300,9 +279,7 @@ def test_break_continue_inside_while(a: Bool) raises -> Bool:
 
 # CHECK-LABEL: lit.fn @"test_early_return
 def test_early_return() raises:
-    # CHECK:  hlcf.elif {
-    # CHECK:    hlcf.elif.yield
-    # CHECK:  } then {
+    # CHECK:  hlcf.elif %{{.*}} {
     var a: Bool
     if a:
         # CHECK: lit.return

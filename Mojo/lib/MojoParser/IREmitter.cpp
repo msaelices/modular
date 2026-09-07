@@ -1498,13 +1498,9 @@ Operation *IREmitter::emitIfThen(Location loc, Value cond,
   assert(builder && "emitIfThen requires a dynamic builder");
   OpBuilder &b = *builder;
 
-  HLCF::ElifOp elifOp = HLCF::ElifOp::create(b, loc, resultTypes, 2);
+  HLCF::ElifOp elifOp = HLCF::ElifOp::create(b, loc, resultTypes, cond);
 
-  auto &condBlock = elifOp.getElifRegions()[0].emplaceBlock();
-  b.setInsertionPointToStart(&condBlock);
-  HLCF::ElifYieldOp::create(b, loc, cond, /*no extra values*/ ValueRange());
-
-  auto &thenBlock = elifOp.getElifRegions()[1].emplaceBlock();
+  auto &thenBlock = elifOp.getThenRegion().emplaceBlock();
   b.setInsertionPointToStart(&thenBlock);
   if (failed(emitThen()))
     return nullptr;

@@ -83,8 +83,7 @@ def test_var_decl_patterns(c: Bool) raises:
     # CHECK: lit.call {{.*}}marker
     marker()
 
-    # CHECK: hlcf.elif {
-    # CHECK: } then {
+    # CHECK: hlcf.elif %{{.*}} {
     # CHECK-NEXT: [[X2:%.*]] = lit.var.decl "x"
     # CHECK-NEXT: [[VAL:%.*]] = kgen.param.constant: !alias_Int1 = <rebind(:!Int {:scalar<index> 42})>
     # CHECK-NEXT: lit.ref.store [[VAL]], [[X2]]
@@ -406,7 +405,7 @@ def test_mergewith(
     # CHECK-NEXT:   = kgen.param.constant: !Bool = <{:scalar<bool> false}>
     # CHECK-NEXT:   hlcf.yield
     # CHECK-NEXT: }
-    # CHECK: hlcf.elif {
+    # CHECK: hlcf.elif %{{.*}} {
     # expected-warning @+1 {{unreachable code on right side of 'False and ...'}}
     if False and cond:
         pass

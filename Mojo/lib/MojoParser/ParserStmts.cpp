@@ -1649,25 +1649,7 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
   if (!subjectBVal)
     return failure();
 
-  HLCF::ElifOp elifOp = HLCF::ElifOp::create(
-      builder, matchLocation, TypeRange(), caseEntries.size() * 2);
-
-  // Emit each case: we emit the condition and match logic into the predicate
-  // block, then emit the body into its corresponding block. Pattern bindings
-  // are created here, so the first case stays in-region — hoisting it into
-  // the parent would collide with later matches in the same function.
-  for (auto [idx, caseEntry] : llvm::enumerate(caseEntries)) {
-    auto &condBlock = elifOp.getElifRegions()[idx * 2].emplaceBlock();
-    builder.setInsertionPointToStart(&condBlock);
-
-    // Pattern bindings (and the guard) live in a case-local scope that also
-    // wraps the body.
-    DebugInfo::DIBuilder::ScopeGuard scopeGuard;
-    llvm::SaveAndRestore<ASTDecl *> keepDecl(curDeclScope);
-    pushChildScope(scopeGuard, keepDecl);
-
-    // Emit the match condition and convert it to a bool we can test.
-    auto caseLoc = translateLocation(caseEntry.patternExpr->getLoc());
+  auto emitCasePredicate = [&](const CaseEntry &caseEntry) -> SRValue {
     auto emitter = getEmitter();
     CValue condCVal = caseEntry.patternExpr->emitMatch(emitter, subjectBVal,
                                                        PatternDeclKind::kNone);
@@ -1684,17 +1666,13 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
                     caseEntry.guardExpr};
           },
           /*evaluateRhsEvenIfLhsFalse=*/true);
-    SRValue condRVal = emitter.emitSRValue({condCVal, caseEntry.patternExpr},
-                                           EC_BoolCondition);
-    if (!condRVal)
-      continue;
-    HLCF::ElifYieldOp::create(builder, caseLoc, condRVal,
-                              /*no extra values*/ ValueRange());
+    return emitter.emitSRValue({condCVal, caseEntry.patternExpr},
+                               EC_BoolCondition);
+  };
 
-    // Now we parse the body of the case into the "then" block for this case.
-    auto &bodyBlock = elifOp.getElifRegions()[idx * 2 + 1].emplaceBlock();
+  auto emitCaseBody = [&](Block &bodyBlock, const CaseEntry &caseEntry,
+                          Location caseLoc) -> ParseResult {
     builder.setInsertionPointToStart(&bodyBlock);
-
     // Change the parser cursor to the start of the case body so we can parse
     // the right text. Use parseSuite (not parseLocalScopeSuite) so the body
     // shares the case scope above — pattern bindings remain visible.
@@ -1702,11 +1680,75 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
     if (failed(parseSuite(curIndent)))
       return failure();
     HLCF::YieldOp::create(builder, caseLoc);
+    return success();
+  };
+
+  // First case: pattern bindings are created while emitting the predicate.
+  // Keep them in a case-local scope that also wraps the body. The predicate
+  // itself becomes the elif operand; later cases stay in-region for
+  // short-circuit.
+  HLCF::ElifOp elifOp;
+  {
+    DebugInfo::DIBuilder::ScopeGuard scopeGuard;
+    llvm::SaveAndRestore<ASTDecl *> keepDecl(curDeclScope);
+    pushChildScope(scopeGuard, keepDecl);
+
+    auto firstCaseLoc =
+        translateLocation(caseEntries.front().patternExpr->getLoc());
+    SRValue firstCond = emitCasePredicate(caseEntries.front());
+
+    // A bad first pattern still needs an operand for the elif, so recover
+    // with a statically-false arm. That keeps the later cases (and the rest
+    // of the enclosing suite) parsed, so their diagnostics still fire.
+    Value condValue =
+        firstCond ? Value(firstCond)
+                  : ParamConstantOp::create(
+                        builder, firstCaseLoc,
+                        SIMDAttr::getScalarBool(builder.getContext(), false));
+
+    unsigned numExtraRegions =
+        caseEntries.size() > 1 ? (caseEntries.size() - 1) * 2 : 0;
+    elifOp = HLCF::ElifOp::create(builder, matchLocation, TypeRange(),
+                                  condValue, numExtraRegions);
+    elifOp.getThenRegion().emplaceBlock();
+    elifOp.getElseRegion().emplaceBlock();
+    for (Region &region : elifOp.getElifRegions())
+      region.emplaceBlock();
+
+    if (!firstCond) {
+      builder.setInsertionPointToStart(&elifOp.getThenRegion().front());
+      HLCF::YieldOp::create(builder, firstCaseLoc);
+    } else if (failed(emitCaseBody(elifOp.getThenRegion().front(),
+                                   caseEntries.front(), firstCaseLoc))) {
+      return failure();
+    }
+  }
+
+  for (auto [idx, caseEntry] :
+       llvm::enumerate(ArrayRef<CaseEntry>(caseEntries).drop_front())) {
+    unsigned extraIdx = idx; // 0-based into additional (cond, then) pairs
+    auto &condBlock = elifOp.getElifRegions()[extraIdx * 2].front();
+    builder.setInsertionPointToStart(&condBlock);
+
+    DebugInfo::DIBuilder::ScopeGuard scopeGuard;
+    llvm::SaveAndRestore<ASTDecl *> keepDecl(curDeclScope);
+    pushChildScope(scopeGuard, keepDecl);
+
+    auto caseLoc = translateLocation(caseEntry.patternExpr->getLoc());
+    SRValue condRVal = emitCasePredicate(caseEntry);
+    if (!condRVal)
+      continue;
+    HLCF::ElifYieldOp::create(builder, caseLoc, condRVal,
+                              /*no extra values*/ ValueRange());
+
+    if (failed(emitCaseBody(elifOp.getElifRegions()[extraIdx * 2 + 1].front(),
+                            caseEntry, caseLoc)))
+      return failure();
   }
 
   // The "else" of the elif is a noop.  TODO: We should mark this as unreachable
   // if there is an irrefutable pattern so we don't get dead code errors.
-  builder.createBlock(&elifOp.getElseRegion());
+  builder.setInsertionPointToStart(&elifOp.getElseRegion().front());
   HLCF::YieldOp::create(builder, matchLocation);
   builder.setInsertionPointAfter(elifOp);
   afterCaseCursor.restore(getLexer());
@@ -2943,11 +2985,12 @@ ParseResult StmtParser::parseElif(Location ifLoc, LexerCursor startCursor,
     /// The value of the constant condition.
     bool conditionValue;
 
-    /// The location of the constant condition block.
+    /// The location of the constant condition expression.
     Location location;
 
-    /// The index of the condition region within the ElifOp.
-    unsigned index;
+    /// Index into elifRegions of the condition region, or ~0u for the first
+    /// (operand) condition.
+    unsigned elifCondIndex;
   };
 
   // We will be moving the builder into sub-regions that are created, make sure
@@ -2960,7 +3003,7 @@ ParseResult StmtParser::parseElif(Location ifLoc, LexerCursor startCursor,
 
   // Emit a condition at the current insertion point. The first `if` condition
   // is emitted before the elif; later `elif` conditions stay in their regions.
-  auto emitConditionExpr = [&](unsigned condRegionIndex) -> FailureOr<Value> {
+  auto emitConditionExpr = [&](unsigned elifCondIndex) -> FailureOr<Value> {
     auto emitter = getEmitter();
 
     ExprNode *condExp = nullptr;
@@ -2974,7 +3017,7 @@ ParseResult StmtParser::parseElif(Location ifLoc, LexerCursor startCursor,
         auto asBoolAttr = sugarDynCastIfPresent<SIMDAttr>(condI1PVal.get())) {
       ifOpsWithDeadCode.push_back({asBoolAttr.getAsBool(),
                                    condExp->getLocation(emitter),
-                                   condRegionIndex});
+                                   elifCondIndex});
     }
     SRValue condRVal =
         emitter.emitSRValue({condI1RVal, condExp}, EC_BoolCondition);
@@ -2983,45 +3026,41 @@ ParseResult StmtParser::parseElif(Location ifLoc, LexerCursor startCursor,
     return Value(condRVal);
   };
 
-  // First condition is evaluated in the parent, then yielded by the elif.
-  FailureOr<Value> firstCond = emitConditionExpr(/*condRegionIndex=*/0);
+  // First condition is evaluated in the parent and becomes the elif operand.
+  FailureOr<Value> firstCond = emitConditionExpr(/*elifCondIndex=*/~0u);
   if (failed(firstCond) ||
       parseToken(Token::colon, "expected ':' after 'if' expression"))
     return failure();
 
-  HLCF::ElifOp elifOp = HLCF::ElifOp::create(builder, ifLoc, TypeRange(), 2);
-  elifOp.getElifRegions()[0].emplaceBlock();
-  elifOp.getElifRegions()[1].emplaceBlock();
-  builder.setInsertionPointToStart(&elifOp.getElifRegions()[0].front());
-  HLCF::ElifYieldOp::create(builder, ifLoc, *firstCond,
-                            /*no extra values*/ ValueRange());
+  HLCF::ElifOp elifOp =
+      HLCF::ElifOp::create(builder, ifLoc, TypeRange(), *firstCond);
+  elifOp.getThenRegion().emplaceBlock();
+  elifOp.getElseRegion().emplaceBlock();
 
   auto appendElifRegionPair = [&]() {
-    // We need to add two regions.
     builder.setInsertionPoint(elifOp);
     IRRewriter rewriter{builder};
-    HLCF::ElifOp replacement =
-        HLCF::ElifOp::create(builder, elifOp.getLoc(), elifOp->getResultTypes(),
-                             elifOp.getElifRegions().size() + 2);
+    HLCF::ElifOp replacement = HLCF::ElifOp::create(
+        builder, elifOp.getLoc(), elifOp->getResultTypes(), elifOp.getCond(),
+        elifOp.getElifRegions().size() + 2);
 
-    // Take previously parsed regions from old op.
+    replacement.getThenRegion().takeBody(elifOp.getThenRegion());
+    replacement.getElseRegion().takeBody(elifOp.getElseRegion());
     for (auto [index, source] : llvm::enumerate(elifOp.getElifRegions()))
       replacement.getElifRegions()[index].takeBody(source);
 
-    // Add another (Condition, Then) pair.
     Region &lastConditionRegion =
         replacement.getElifRegions()[replacement.getElifRegions().size() - 2];
     Region &lastThenRegion = replacement.getElifRegions().back();
     lastConditionRegion.emplaceBlock();
     lastThenRegion.emplaceBlock();
 
-    // Replace the original elif with the expanded elif.
     rewriter.replaceOp(elifOp, replacement);
     elifOp = replacement;
   };
 
   // Parse Then region.
-  builder.setInsertionPointToStart(&elifOp.getElifRegions().back().front());
+  builder.setInsertionPointToStart(&elifOp.getThenRegion().front());
   if (failed(parseLocalScopeSuite(curIndent)))
     return failure();
   HLCF::YieldOp::create(builder, ifLoc);
@@ -3050,7 +3089,7 @@ ParseResult StmtParser::parseElif(Location ifLoc, LexerCursor startCursor,
     HLCF::YieldOp::create(builder, elifLoc);
   }
 
-  builder.setInsertionPointToStart(&elifOp.getElseRegion().emplaceBlock());
+  builder.setInsertionPointToStart(&elifOp.getElseRegion().front());
   if (isTokenInCurrentStatement(curIndent, /*allowSameIndent=*/true) &&
       consumeIf(Token::kw_else)) {
     if (parseToken(Token::colon, "expected ':' after else"))
@@ -3061,24 +3100,33 @@ ParseResult StmtParser::parseElif(Location ifLoc, LexerCursor startCursor,
   HLCF::YieldOp::create(builder, ifLoc);
 
   // Process dead code.  Go backward to avoid needing to erase an already erased
-  // IfOp.
+  // region.
   if (!ifOpsWithDeadCode.empty()) {
-    for (auto [condition, condExprLoc, index] :
+    for (auto [condition, condExprLoc, elifCondIndex] :
          llvm::reverse(ifOpsWithDeadCode)) {
       shared.emitWarning(condExprLoc)
           << "'if' condition always evaluates to '"
           << (condition ? "True" : "False")
           << (condition ? "'; 'else' branch is unreachable"
                         : "'; 'if' branch is unreachable");
-      if (condition) {
-        // Condition is true which means all subsequent regions, including else
-        // region, are unreachable.
+      if (elifCondIndex == ~0u) {
+        // First (operand) condition.
+        if (condition) {
+          markRegionUnreachable(&elifOp.getElseRegion(), ifLoc);
+          for (auto &region : elifOp.getElifRegions())
+            markRegionUnreachable(&region, ifLoc);
+        } else {
+          markRegionUnreachable(&elifOp.getThenRegion(), ifLoc);
+        }
+      } else if (condition) {
+        // Additional arm is true: else and later pairs are unreachable.
         markRegionUnreachable(&elifOp.getElseRegion(), ifLoc);
-        for (auto &region : elifOp.getElifRegions().slice(index + 2))
+        for (auto &region : elifOp.getElifRegions().slice(elifCondIndex + 2))
           markRegionUnreachable(&region, ifLoc);
       } else {
-        // Condition is false. Only the first Then region is unreachable.
-        markRegionUnreachable(&elifOp.getElifRegions()[index + 1], ifLoc);
+        // Additional arm is false: its then is unreachable.
+        markRegionUnreachable(&elifOp.getElifRegions()[elifCondIndex + 1],
+                              ifLoc);
       }
     }
   }

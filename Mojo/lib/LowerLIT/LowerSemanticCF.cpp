@@ -259,13 +259,17 @@ void LowerSemanticCF::lowerElif(HLCF::ElifOp elifOp, bool &doesRaise,
   for (auto &region : elifOp->getRegions()) {
     if (region.empty())
       continue;
+    // Additional condition regions (elifRegions even indices) always transfer
+    // into a sibling then/else; they don't contribute to fallthrough of the
+    // elif itself. Region layout: 0=then, 1=else, 2+=elifRegions.
+    unsigned regionNumber = region.getRegionNumber();
+    bool isAdditionalCond = regionNumber >= 2 && ((regionNumber - 2) % 2 == 0);
+
     bool blockRaises = false, blockBreaks = false, blockFallThroughs = false;
     lowerBlock(region.front(), blockRaises, blockBreaks, blockFallThroughs);
     doesRaise |= blockRaises;
     doesBreak |= blockBreaks;
-    // Condition regions are odd indexed regions and always fallthrough to elif
-    // contained regions.
-    if (region.getRegionNumber() % 2 == 1)
+    if (isAdditionalCond)
       continue;
     elifFallsThrough |= blockFallThroughs;
   }

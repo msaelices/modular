@@ -18,6 +18,7 @@
 
 #include "ExprNodes.h"
 #include "IREmitter.h"
+#include "Mojo/HLCFDialect/HLCFOps.h"
 #include "Mojo/MojoParser/ASTDecl.h"
 #include "Mojo/MojoParser/CallOperands.h"
 #include "MojoUtils.h"
@@ -112,14 +113,17 @@ CValue DeclRefNode::emitMatch(IREmitter &emitter, CValue subject,
   // (BValues), so `var` bindings copy and `ref` bindings borrow — same
   // machinery as `var x = ...` / `ref x = ...` assignment.
   //
-  // Elif condition and then regions are siblings, so a VarDecl emitted into
-  // the condition would not dominate uses in the body (or in a guard that
-  // shares this scope). Emit the declaration in the parent block before the
-  // enclosing elif, then initialize it from the condition region.
+  // An elif condition region and its then region are siblings, so a VarDecl
+  // emitted into the condition would not dominate uses in the body (or in a
+  // guard that shares this scope). Emit the declaration in the parent block
+  // before the enclosing elif, then initialize it from the condition region.
+  // The first case's predicate is emitted directly into the parent block
+  // (it becomes the elif operand), where no hoisting is needed.
   OpBuilder &b = *emitter.builder;
   OpBuilder::InsertPoint condIP = b.saveInsertionPoint();
-  if (Operation *parentOp = condIP.getBlock()->getParentOp())
-    b.setInsertionPoint(parentOp);
+  if (auto elifOp =
+          dyn_cast_if_present<HLCF::ElifOp>(condIP.getBlock()->getParentOp()))
+    b.setInsertionPoint(elifOp);
 
   ExprDest declDest(LValueInitializerType{subject.getRValueType()}, EC_VarInit);
   declDest.setPatternDeclKind(patternKind);
