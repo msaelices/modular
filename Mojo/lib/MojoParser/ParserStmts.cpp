@@ -475,11 +475,11 @@ ParseResult StmtParser::parseSuite(ssize_t curIndent) {
     indent = getToken().getIndentation().value();
 
     // If the indentation is less than we expect, then the suite is done.
-    if (indent < bodyIndent)
+    if (indent <= curIndent)
       break;
 
     // Diagnose cases where the indentation is too great.
-    if (indent > bodyIndent) {
+    if (indent != bodyIndent) {
       emitError(getToken().getLoc()) << "statement indentation must match the "
                                         "rest of the block; adjust to align";
     } else {
@@ -1584,6 +1584,7 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
     ExprNode *patternExpr;
     ExprNode *guardExpr;
     LexerCursor caseCursor;
+    size_t caseIndent;
   };
   SmallVector<CaseEntry, 4> caseEntries;
 
@@ -1631,7 +1632,8 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
     }
 
     // Okay, we successfully parsed a case block. Remember it for later.
-    caseEntries.push_back({patternExpr, guardExpr, getLexer().getCursor()});
+    caseEntries.push_back(
+        {patternExpr, guardExpr, getLexer().getCursor(), caseIndent});
     skipUntilIndentation(caseIndent);
   }
 
@@ -1679,13 +1681,13 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
   };
 
   auto emitCaseBody = [&](Block &bodyBlock, const CaseEntry &caseEntry,
-                          Location caseLoc) -> ParseResult {
+                          Location caseLoc, size_t caseIndent) -> ParseResult {
     builder.setInsertionPointToStart(&bodyBlock);
     // Change the parser cursor to the start of the case body so we can parse
     // the right text. Use parseSuite (not parseLocalScopeSuite) so the body
     // shares the case scope above — pattern bindings remain visible.
     caseEntry.caseCursor.restore(getLexer());
-    if (failed(parseSuite(curIndent)))
+    if (failed(parseSuite(caseIndent)))
       return failure();
     HLCF::YieldOp::create(builder, caseLoc);
     return success();
@@ -1723,11 +1725,13 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
     for (Region &region : elifOp.getElifRegions())
       region.emplaceBlock();
 
+    size_t caseIndent = caseEntries.front().caseIndent;
     if (!firstCond) {
       builder.setInsertionPointToStart(&elifOp.getThenRegion().front());
       HLCF::YieldOp::create(builder, firstCaseLoc);
     } else if (failed(emitCaseBody(elifOp.getThenRegion().front(),
-                                   caseEntries.front(), firstCaseLoc))) {
+                                   caseEntries.front(), firstCaseLoc,
+                                   caseIndent))) {
       return failure();
     }
   }
@@ -1750,7 +1754,7 @@ ParseResult StmtParser::parseMatchStmt(size_t curIndent) {
                               /*no extra values*/ ValueRange());
 
     if (failed(emitCaseBody(elifOp.getElifRegions()[extraIdx * 2 + 1].front(),
-                            caseEntry, caseLoc)))
+                            caseEntry, caseLoc, caseEntry.caseIndent)))
       return failure();
   }
 
@@ -3031,22 +3035,61 @@ ParseResult StmtParser::parseElif(Location ifLoc, LexerCursor startCursor,
     unsigned elifCondIndex;
   };
 
+  // One if/elif arm: condition AST + suite start so we can allocate the ElIf
+  // once, then emit conditions and re-parse suites in a second pass.
+  struct ElifEntry {
+    ExprNode *condExpr;
+    LexerCursor bodyCursor;
+    Location keywordLoc;
+  };
+
   // We will be moving the builder into sub-regions that are created, make sure
   // we end up after it when this is done.
   llvm::SaveAndRestore builderSaver(builder);
+
+  // Parse all if/elif(/else) arms first so we know how many ElIf regions to
+  // allocate — same approach as parseMatchStmt.
+  SmallVector<ElifEntry, 4> elifEntries;
+
+  ExprNode *firstCondExpr = nullptr;
+  if (parseExpression(firstCondExpr, curIndent, Precedence::kAssignExpr) ||
+      parseToken(Token::colon, "expected ':' after 'if' expression"))
+    return failure();
+  elifEntries.push_back({firstCondExpr, getLexer().getCursor(), ifLoc});
+  skipUntilIndentation(curIndent);
+
+  while (getToken().is(Token::kw_elif) &&
+         isTokenInCurrentStatement(curIndent, /*allowSameIndent=*/true)) {
+    Location elifLoc = translateLocation(consumeToken(Token::kw_elif).getLoc());
+    ExprNode *condExpr = nullptr;
+    if (parseExpression(condExpr, curIndent, Precedence::kAssignExpr) ||
+        parseToken(Token::colon, "expected ':' after 'elif' expression"))
+      return failure();
+    elifEntries.push_back({condExpr, getLexer().getCursor(), elifLoc});
+    skipUntilIndentation(curIndent);
+  }
+
+  std::optional<LexerCursor> elseBodyCursor;
+  if (isTokenInCurrentStatement(curIndent, /*allowSameIndent=*/true) &&
+      consumeIf(Token::kw_else)) {
+    if (parseToken(Token::colon, "expected ':' after else"))
+      return failure();
+    elseBodyCursor = getLexer().getCursor();
+    skipUntilIndentation(curIndent);
+  }
+
+  auto afterElifCursor = getLexer().getCursor();
 
   // Unreachable-arm metadata collected while emitting conditions; processed
   // after the full elif is built so we can mark regions dead.
   SmallVector<DeadCodeInfo> ifOpsWithDeadCode;
 
-  // Emit a condition at the current insertion point. The first `if` condition
-  // is emitted before the elif; later `elif` conditions stay in their regions.
-  auto emitConditionExpr = [&](unsigned elifCondIndex) -> FailureOr<Value> {
+  // Emit a previously-parsed condition at the current insertion point. The
+  // first `if` condition is emitted before the elif; later `elif` conditions
+  // stay in their regions.
+  auto emitConditionExpr = [&](ExprNode *condExp,
+                               unsigned elifCondIndex) -> FailureOr<Value> {
     auto emitter = getEmitter();
-
-    ExprNode *condExp = nullptr;
-    if (parseExpression(condExp, curIndent, Precedence::kAssignExpr))
-      return failure();
 
     RValue condI1RVal = emitter.emitExprScalarBool(condExp, EC_BoolCondition);
     if (!condI1RVal)
@@ -3064,74 +3107,56 @@ ParseResult StmtParser::parseElif(Location ifLoc, LexerCursor startCursor,
     return Value(condRVal);
   };
 
-  // First condition is evaluated in the parent and becomes the elif operand.
-  FailureOr<Value> firstCond = emitConditionExpr(/*elifCondIndex=*/~0u);
-  if (failed(firstCond) ||
-      parseToken(Token::colon, "expected ':' after 'if' expression"))
-    return failure();
-
-  HLCF::ElifOp elifOp =
-      HLCF::ElifOp::create(builder, ifLoc, TypeRange(), *firstCond);
-  elifOp.getThenRegion().emplaceBlock();
-  elifOp.getElseRegion().emplaceBlock();
-
-  auto appendElifRegionPair = [&]() {
-    builder.setInsertionPoint(elifOp);
-    IRRewriter rewriter{builder};
-    HLCF::ElifOp replacement = HLCF::ElifOp::create(
-        builder, elifOp.getLoc(), elifOp->getResultTypes(), elifOp.getCond(),
-        elifOp.getElifRegions().size() + 2);
-
-    replacement.getThenRegion().takeBody(elifOp.getThenRegion());
-    replacement.getElseRegion().takeBody(elifOp.getElseRegion());
-    for (auto [index, source] : llvm::enumerate(elifOp.getElifRegions()))
-      replacement.getElifRegions()[index].takeBody(source);
-
-    Region &lastConditionRegion =
-        replacement.getElifRegions()[replacement.getElifRegions().size() - 2];
-    Region &lastThenRegion = replacement.getElifRegions().back();
-    lastConditionRegion.emplaceBlock();
-    lastThenRegion.emplaceBlock();
-
-    rewriter.replaceOp(elifOp, replacement);
-    elifOp = replacement;
-  };
-
-  // Parse Then region.
-  builder.setInsertionPointToStart(&elifOp.getThenRegion().front());
-  if (failed(parseLocalScopeSuite(curIndent)))
-    return failure();
-  HLCF::YieldOp::create(builder, ifLoc);
-
-  // Parse Elif chain if it exists. Subsequent conditions stay in their regions
-  // so they are only evaluated when earlier arms fail.
-  while (getToken().is(Token::kw_elif) &&
-         isTokenInCurrentStatement(curIndent, /*allowSameIndent=*/true)) {
-    Location elifLoc = translateLocation(consumeToken(Token::kw_elif).getLoc());
-    appendElifRegionPair();
-
-    unsigned condRegionIndex = elifOp.getElifRegions().size() - 2;
-    builder.setInsertionPointToStart(
-        &elifOp.getElifRegions()[condRegionIndex].front());
-    FailureOr<Value> elifCond = emitConditionExpr(condRegionIndex);
-    if (failed(elifCond) ||
-        parseToken(Token::colon, "expected ':' after 'elif' expression"))
-      return failure();
-    HLCF::ElifYieldOp::create(builder, elifLoc, *elifCond,
-                              /*no extra values*/ ValueRange());
-
-    // Parse Then region.
-    builder.setInsertionPointToStart(&elifOp.getElifRegions().back().front());
+  auto emitArmBody = [&](Block &bodyBlock,
+                         const ElifEntry &entry) -> ParseResult {
+    builder.setInsertionPointToStart(&bodyBlock);
+    entry.bodyCursor.restore(getLexer());
     if (failed(parseLocalScopeSuite(curIndent)))
       return failure();
-    HLCF::YieldOp::create(builder, elifLoc);
+    HLCF::YieldOp::create(builder, entry.keywordLoc);
+    return success();
+  };
+
+  // First condition is evaluated in the parent and becomes the elif operand.
+  FailureOr<Value> firstCond =
+      emitConditionExpr(elifEntries.front().condExpr, /*elifCondIndex=*/~0u);
+  if (failed(firstCond))
+    return failure();
+
+  unsigned numExtraRegions =
+      elifEntries.size() > 1 ? (elifEntries.size() - 1) * 2 : 0;
+  HLCF::ElifOp elifOp = HLCF::ElifOp::create(builder, ifLoc, TypeRange(),
+                                             *firstCond, numExtraRegions);
+  elifOp.getThenRegion().emplaceBlock();
+  elifOp.getElseRegion().emplaceBlock();
+  for (Region &region : elifOp.getElifRegions())
+    region.emplaceBlock();
+
+  if (failed(emitArmBody(elifOp.getThenRegion().front(), elifEntries.front())))
+    return failure();
+
+  // Subsequent conditions stay in their regions so they are only evaluated
+  // when earlier arms fail.
+  for (auto [idx, entry] :
+       llvm::enumerate(ArrayRef<ElifEntry>(elifEntries).drop_front())) {
+    unsigned condRegionIndex = idx * 2;
+    builder.setInsertionPointToStart(
+        &elifOp.getElifRegions()[condRegionIndex].front());
+    FailureOr<Value> elifCond =
+        emitConditionExpr(entry.condExpr, condRegionIndex);
+    if (failed(elifCond))
+      return failure();
+    HLCF::ElifYieldOp::create(builder, entry.keywordLoc, *elifCond,
+                              /*no extra values*/ ValueRange());
+
+    if (failed(emitArmBody(elifOp.getElifRegions()[condRegionIndex + 1].front(),
+                           entry)))
+      return failure();
   }
 
   builder.setInsertionPointToStart(&elifOp.getElseRegion().front());
-  if (isTokenInCurrentStatement(curIndent, /*allowSameIndent=*/true) &&
-      consumeIf(Token::kw_else)) {
-    if (parseToken(Token::colon, "expected ':' after else"))
-      return failure();
+  if (elseBodyCursor) {
+    elseBodyCursor->restore(getLexer());
     if (failed(parseLocalScopeSuite(curIndent)))
       return failure();
   }
@@ -3169,6 +3194,7 @@ ParseResult StmtParser::parseElif(Location ifLoc, LexerCursor startCursor,
     }
   }
 
+  afterElifCursor.restore(getLexer());
   return success();
 }
 
