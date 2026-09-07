@@ -748,6 +748,34 @@ void LowerSemanticCF::lowerBlock(Block &block, bool &doesRaise, bool &doesBreak,
 
     // Process a HLCF::ElifOp
     if (auto elifOp = dyn_cast<HLCF::ElifOp>(op)) {
+      // If the first condition is a known constant, mark unreachable regions
+      // so we don't consider them live.
+      SIMDAttr elifCond;
+      if (mlir::matchPattern(elifOp.getCond(), m_Constant(&elifCond))) {
+        bool constantCondValue = elifCond.getAsBool();
+        auto markDead = [&](Region &region) {
+          if (region.empty())
+            return;
+          Block &deadBlock = region.front();
+          Operation *firstDeadOp = &deadBlock.front();
+          if (!firstDeadOp->hasTrait<OpTrait::IsTerminator>())
+            emitWarning(firstDeadOp->getLoc(), "unreachable code after 'if ")
+                << (constantCondValue ? "True'" : "False'");
+          eraseOpToEndOfBlock(firstDeadOp);
+          auto b = OpBuilder::atBlockBegin(&deadBlock);
+          UnreachableOp::create(b, op.getLoc());
+        };
+        if (constantCondValue) {
+          // First then is taken; else and additional arms are dead.
+          markDead(elifOp.getElseRegion());
+          for (Region &region : elifOp.getElifRegions())
+            markDead(region);
+        } else {
+          // First then is dead; later arms / else remain live.
+          markDead(elifOp.getThenRegion());
+        }
+      }
+
       bool elifFallsThrough = false;
       lowerElif(elifOp, doesRaise, doesBreak, elifFallsThrough);
       if (elifFallsThrough) {

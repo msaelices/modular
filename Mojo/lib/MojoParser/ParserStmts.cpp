@@ -1502,9 +1502,10 @@ ParseResult StmtParser::parseWhileStmt(size_t curIndent) {
   //   hlcf.yield
   // else:
   //   lit.loop.break.else  // Jump to the 'else' block.
-  RValue condRVal = getEmitter().emitExprScalarBool(condExp, EC_BoolCondition);
+  auto emitter = getEmitter();
+  RValue condRVal = emitter.emitExprScalarBool(condExp, EC_BoolCondition);
   Value condVal =
-      getEmitter().emitSRValue({AnyValue(condRVal), condExp}, EC_BoolCondition);
+      emitter.emitSRValue({AnyValue(condRVal), condExp}, EC_BoolCondition);
 
   // After the condition is evaluated, validate the end of the statement.
   if (parseToken(Token::colon, "expected ':' after expression"))
@@ -1512,12 +1513,19 @@ ParseResult StmtParser::parseWhileStmt(size_t curIndent) {
   if (!condVal)
     return success(); // IRGen error already emitted; parse succeeded!
 
-  auto ifOp = HLCF::IfOp::create(builder, whileLoc, ValueRange{}, condVal);
-  builder.createBlock(&ifOp.getThenRegion());
-  HLCF::YieldOp::create(builder, whileLoc);
-  builder.createBlock(&ifOp.getElseRegion());
-  LoopBreakElseOp::create(builder, whileLoc);
-  builder.setInsertionPointAfter(ifOp);
+  Operation *condIf = emitter.emitIfThen(
+      whileLoc, condVal, TypeRange{},
+      [&]() -> LogicalResult {
+        HLCF::YieldOp::create(*emitter.builder, whileLoc);
+        return success();
+      },
+      [&]() -> LogicalResult {
+        LoopBreakElseOp::create(*emitter.builder, whileLoc);
+        return success();
+      });
+  if (!condIf)
+    return success();
+  builder.setInsertionPointAfter(condIf);
 
   if (failed(parseLocalScopeSuite(curIndent)))
     return failure();
@@ -1938,12 +1946,21 @@ LoopResult StmtParser::emitForStmt(SMLoc forLoc, ExprNode *targetExpr,
 
     // Emit an if statement, if the condition is true then yield other break to
     // the else block.
-    auto ifOp = HLCF::IfOp::create(builder, forLocation, shouldContinue);
-    builder.createBlock(&ifOp.getThenRegion());
-    HLCF::YieldOp::create(builder, forLocation);
-    builder.createBlock(&ifOp.getElseRegion());
-    LoopBreakElseOp::create(builder, forLocation);
-    builder.setInsertionPointAfter(ifOp);
+    Operation *condIf = emitter.emitIfThen(
+        forLocation, shouldContinue, TypeRange{},
+        [&]() -> LogicalResult {
+          HLCF::YieldOp::create(*emitter.builder, forLocation);
+          return success();
+        },
+        [&]() -> LogicalResult {
+          LoopBreakElseOp::create(*emitter.builder, forLocation);
+          return success();
+        });
+    if (!condIf) {
+      indvarDest.resetForError(emitter);
+      return LoopResult(LoopResult::ErrorKind::inLoopStmt);
+    }
+    builder.setInsertionPointAfter(condIf);
     emitter.builder = builder;
 
     // Emit the call to __next__ now that we know there is an element.
@@ -2432,7 +2449,7 @@ ParseResult StmtParser::parseSingleWithStmt(size_t curIndent, SMLoc smLoc,
   //     try {
   //       SUITE
   //     } except(errorVal : Error) {
-  //       hlcf.if (contextMgr.__exit__(errorVal)) {
+  //       hlcf.elif (contextMgr.__exit__(errorVal)) {
   //         hlcf.yield
   //       } else {
   //         raise errorVal
@@ -2801,7 +2818,7 @@ ParseResult StmtParser::parseSingleWithStmt(size_t curIndent, SMLoc smLoc,
     // Set up the except region for the nested try.  Pseudo code:
     //  except(%__inner_error__ : Error) {
     //    %stop_rethrow = contextMgr.__exit__(%__inner_error__);
-    //    hlcf.if %stop_rethrow {
+    //    hlcf.elif %stop_rethrow {
     //      hlcf.yield
     //    } else {
     //      raise %inner_error
@@ -2823,32 +2840,42 @@ ParseResult StmtParser::parseSingleWithStmt(size_t curIndent, SMLoc smLoc,
                                  EC_WithExitResult,
                                  {{MLValue(contextMgrDecl), contextExp},
                                   {MBValue(nestedErrDecl), contextExp}});
-    CValue exitResult = getEmitter().emitNamedMethodCall(
-        "__exit__", std::move(exitOperandList));
-    RValue exitI1RVal = getEmitter().emitScalarBool({exitResult, contextExp},
-                                                    EC_WithExitResult);
+    auto emitter = getEmitter();
+    CValue exitResult =
+        emitter.emitNamedMethodCall("__exit__", std::move(exitOperandList));
+    RValue exitI1RVal =
+        emitter.emitScalarBool({exitResult, contextExp}, EC_WithExitResult);
     SRValue exitI1Val =
-        getEmitter().emitSRValue({exitI1RVal, contextExp}, EC_WithExitResult);
+        emitter.emitSRValue({exitI1RVal, contextExp}, EC_WithExitResult);
     if (!exitI1Val)
       // Fail, but non-fatal so return success to keep parsing.
       return success();
     // If __exit__ returns false, then re-raise the error.
-    auto ifOp = HLCF::IfOp::create(builder, loc, exitI1Val);
+    Operation *stopRethrowIf = emitter.emitIfThen(
+        loc, exitI1Val, TypeRange{},
+        [&]() -> LogicalResult {
+          // On true, nothing is to be done.
+          HLCF::YieldOp::create(*emitter.builder, loc);
+          return success();
+        },
+        [&]() -> LogicalResult {
+          // On false, we re-raise the error. Sync the statement builder so
+          // getEmitter() emits into this else region.
+          builder = *emitter.builder;
+          ExprDest dest(MLValue(errDecl), EC_RaiseValue);
+          // If the error type is unresolved, resolve it to whatever we
+          // propagate.
+          if (isa<UnresolvedType>(errDecl.getType().getElementType()))
+            dest = ExprDest(errDecl, EC_RaiseValue);
+          getEmitter().emitResult(MRValue(nestedErrDecl), contextExp, dest);
+          LIT::RaiseOp::create(builder, loc);
+          HLCF::YieldOp::create(builder, loc);
+          return success();
+        });
+    if (!stopRethrowIf)
+      return success();
+    builder.setInsertionPointAfter(stopRethrowIf);
     TryYieldOp::create(builder, loc);
-
-    builder.createBlock(&ifOp.getThenRegion());
-    // On true, nothing is to be done.
-    HLCF::YieldOp::create(builder, loc);
-
-    // On false, we re-raise the error.
-    builder.createBlock(&ifOp.getElseRegion());
-    ExprDest dest(MLValue(errDecl), EC_RaiseValue);
-    // If the error type is unresolved, resolve it to whatever we propagate.
-    if (isa<UnresolvedType>(errDecl.getType().getElementType()))
-      dest = ExprDest(errDecl, EC_RaiseValue);
-    getEmitter().emitResult(MRValue(nestedErrDecl), contextExp, dest);
-    LIT::RaiseOp::create(builder, loc);
-    HLCF::YieldOp::create(builder, loc);
   }
 
   // Now that we have seen the body of the try, we can have inferred the thrown
@@ -2857,20 +2884,31 @@ ParseResult StmtParser::parseSingleWithStmt(size_t curIndent, SMLoc smLoc,
 
   // Emit the conditional call to __exit__.
   builder.createBlock(&tryOp.getFinallyRegion());
-  (void)handleRaisingFinallyRegion(tryOp, smLoc, [&] {
-    HLCF::IfOp excIf;
-    if (nestedTryOp) {
-      Value excFlag = RefLoadOp::create(builder, loc, excVar);
-      excIf = HLCF::IfOp::create(builder, loc, excFlag);
-      builder.createBlock(&excIf.getThenRegion());
+  (void)handleRaisingFinallyRegion(tryOp, smLoc, [&]() -> ParseResult {
+    if (!nestedTryOp) {
+      emitNormalExitLogic();
+      return success();
     }
-    emitNormalExitLogic();
-    if (nestedTryOp) {
-      HLCF::YieldOp::create(builder, loc);
-      // Stub the 'else' region.
-      builder.createBlock(&excIf.getElseRegion());
-      HLCF::YieldOp::create(builder, loc);
-    }
+
+    // Only call the no-error __exit__ when the suite completed without an
+    // exception (exc flag still true).
+    Value excFlag = RefLoadOp::create(builder, loc, excVar);
+    auto emitter = getEmitter();
+    Operation *excIf = emitter.emitIfThen(
+        loc, excFlag, TypeRange{},
+        [&]() -> LogicalResult {
+          builder = *emitter.builder;
+          emitNormalExitLogic();
+          HLCF::YieldOp::create(builder, loc);
+          return success();
+        },
+        [&]() -> LogicalResult {
+          HLCF::YieldOp::create(*emitter.builder, loc);
+          return success();
+        });
+    if (!excIf)
+      return failure();
+    builder.setInsertionPointAfter(excIf);
     return success();
   });
 

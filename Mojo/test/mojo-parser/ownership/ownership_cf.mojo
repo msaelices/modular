@@ -317,7 +317,7 @@ def loop_example(cond1: __mlir_type.`!kgen.scalar<bool>`, cond2: __mlir_type.`!k
     # Unneeded boilerplate due to 'while True':
     # CHECK-NEXT: hlcf.loop "_loop_0" {
     # CHECK-NEXT:  = kgen.param.constant: scalar<bool> = <true>
-    # CHECK-NEXT:      hlcf.if
+    # CHECK-NEXT:      hlcf.elif
     # CHECK-NEXT:        hlcf.yield
     # CHECK-NEXT:      } else {
     # CHECK-NEXT:        kgen.unreachable
@@ -379,7 +379,7 @@ struct TestLoopWithWholeObjectBit(Movable where False):
         var buf = MemExample()
 
         # CHECK-NEXT: hlcf.loop "_loop_0" {
-        # CHECK-NEXT:   hlcf.if %cond {
+        # CHECK-NEXT:   hlcf.elif %cond {
         # CHECK-NEXT:     hlcf.yield
         # CHECK-NEXT:   } else {
         # CHECK-NEXT:     hlcf.break
@@ -404,7 +404,7 @@ struct TestLoopWithWholeObjectBit(Movable where False):
 def testInfiniteloop():
     # CHECK-NEXT:  hlcf.loop "_loop_0" {
     # CHECK-NEXT:    [[T:%.+]] = kgen.param.constant: scalar<bool> = <true>
-    # CHECK-NEXT:    hlcf.if [[T]] {
+    # CHECK-NEXT:    hlcf.elif [[T]] {
     # CHECK-NEXT:      hlcf.yield
     # CHECK-NEXT:    } else {
     # CHECK-NEXT:      kgen.unreachable
@@ -650,7 +650,7 @@ def loop_any_origin(var mem: MemExample, cond: Bool):
     # there is an access through AnyOrigin within the loop.
     # CHECK: hlcf.loop
     # CHECK-NEXT:     lit.call {{.*}}Bool::@"__mlir_bool__
-    # CHECK-NEXT:     hlcf.if
+    # CHECK-NEXT:     hlcf.elif
     # CHECK-NEXT:       hlcf.yield
     # CHECK-NEXT:     } else {
     # CHECK-NEXT:       lit.call {{.*}}MemExample::@"__deinit__

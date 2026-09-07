@@ -3040,9 +3040,15 @@ void UninitializedValueScan::scanBlock(Block &block) {
     case OverallOpValueEffect::ifLikeOp:
       checkIfLikeOp(op);
       break;
-    case OverallOpValueEffect::elifOp:
-      checkElIfOp(cast<HLCF::ElifOp>(op));
+    case OverallOpValueEffect::elifOp: {
+      auto elifOp = cast<HLCF::ElifOp>(op);
+      // A single if/else shaped elif has the same region layout as IfOp.
+      if (elifOp.getElifRegions().empty())
+        checkIfLikeOp(op);
+      else
+        checkElIfOp(elifOp);
       break;
+    }
     case OverallOpValueEffect::loopOp:
       checkLoopOp(op);
       break;
@@ -3161,11 +3167,11 @@ void UninitializedValueScan::checkLocalControlFlowOp(Operation &op) {
   liveness.markReachable(false);
 }
 
-/// This is HLCF::IfOp or ParamIfOp, which are all if-like.
+/// This is HLCF::IfOp, ParamIfOp, or a simple (no extra arms) HLCF::ElifOp.
 void UninitializedValueScan::checkIfLikeOp(Operation &op) {
   // 'if' operations treat the condition as a use but have live outs that are
   // the intersection of the live values produced by the then/else branches.
-  assert((isa<HLCF::IfOp, ParamIfOp>(op)));
+  assert((isa<HLCF::IfOp, ParamIfOp, HLCF::ElifOp>(op)));
   assert(op.getNumRegions() == 2 && op.getRegion(0).hasOneBlock() &&
          op.getRegion(1).hasOneBlock() &&
          "if-like op should have two single-block regions");
@@ -4335,9 +4341,16 @@ void DestructorInsertion::scanBlock(Block &block) {
     case OverallOpValueEffect::ifLikeOp:
       checkIfLikeOp(op, opEffects.results);
       break;
-    case OverallOpValueEffect::elifOp:
-      checkElIfOp(cast<HLCF::ElifOp>(op), opEffects.results);
+    case OverallOpValueEffect::elifOp: {
+      auto elifOp = cast<HLCF::ElifOp>(op);
+      // A single if/else shaped elif has the same region layout as IfOp; reuse
+      // the proven if-like destructor logic (important inside loops).
+      if (elifOp.getElifRegions().empty())
+        checkIfLikeOp(op, opEffects.results);
+      else
+        checkElIfOp(elifOp, opEffects.results);
       break;
+    }
     case OverallOpValueEffect::loopOp:
       checkLoopOp(op);
       break;
@@ -4353,7 +4366,8 @@ void DestructorInsertion::scanBlock(Block &block) {
     DestructorInserter dtorInserter(builder, valueSet, diagsToEmit);
 
     assert((opEffects.results.size() == op.getNumResults() ||
-            overall == OverallOpValueEffect::ifLikeOp) &&
+            overall == OverallOpValueEffect::ifLikeOp ||
+            overall == OverallOpValueEffect::elifOp) &&
            "OperationEffects::analyze returned wrong # effects");
 
     for (auto [result, effect] :

@@ -189,7 +189,7 @@ def context_mgr_exit_raises() raises:
     # CHECK-NEXT: lit.try
     # CHECK-NEXT:   [[DID_ERR:%.*]] = lit.ref.load %__with_exc__
     # CHECK-NEXT:   lifetime.end %__with_exc__
-    # CHECK-NEXT:   hlcf.if [[DID_ERR]]
+    # CHECK-NEXT:   hlcf.elif [[DID_ERR]]
     # CHECK-NEXT:     [[IMM:%.*]] = lit.ref.immut %$CONTEXTMGR
     # CHECK-NEXT:     [[BOOL:%.*]] = lit.var.decl
     # CHECK-NEXT:     lit.var.lifetime.start %__finally_error__

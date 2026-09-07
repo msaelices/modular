@@ -943,7 +943,7 @@ struct DoNotPropagateErrorStateIntoContinueSet(Movable where False):
   # CHECK-LABEL: lit.fn @"__init__(
   def __init__(out self, cond: __mlir_type.`!kgen.scalar<bool>`, var list: List) raises:
     # CHECK:     hlcf.loop "_loop_0" {
-    # CHECK-NEXT:  hlcf.if %cond {
+    # CHECK-NEXT:  hlcf.elif %cond {
     # CHECK-NEXT:    hlcf.yield
     # CHECK-NEXT:  } else {
     # CHECK-NEXT:    hlcf.break "_loop_0"
@@ -961,7 +961,7 @@ def destroyWholeValuesIfLastReferenceWasInLoop(cond: __mlir_type.`!kgen.scalar<b
    # alive during the loop.  The solution here is to destroy memPair immediately
    # before the implicit break out of the loop
    while cond:
-     # CHECK:      hlcf.if %cond {
+     # CHECK:      hlcf.elif %cond {
      # CHECK-NEXT:   hlcf.yield
      # CHECK-NEXT: } else {
      # CHECK-NEXT:   lit.call {{.*}}::@MemPair::@"__deinit__({{.*}}(%memPair)

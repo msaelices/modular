@@ -200,7 +200,7 @@ def constantFalse(cond: Bool, x: Int, y: Int) -> Int:
 # CHECK:       %inside_else = lit.var.decl "inside_else" var
 # CHECK:       lit.loop {
 # CHECK:         [[V0_SB:%.*]] = lit.call {{.*}}@Bool::@"__mlir_bool__({{.*}}Bool)"(%a)
-# CHECK:         hlcf.if [[V0_SB]] {
+# CHECK:         hlcf.elif [[V0_SB]] {
 # CHECK-NEXT:        hlcf.yield
 # CHECK-NEXT:    } else {
 # CHECK-NEXT:        lit.loop.break.else
