@@ -11,12 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-# FIXME: "string" and "float" are not part of the standard library - they are
-# ancient relics of Mojo bringup. These should be removed from stubs.mojo and
-# the dependent tests should be migrated off of them.
-comptime string = __mlir_type.`!kgen.string`
-comptime float = __mlir_type.`!kgen.scalar<f64>`
-
 
 struct _MLIR:
     comptime KGENTypeType = __mlir_type.`!kgen.type`
@@ -834,10 +828,6 @@ struct Dict[K: Copyable & Deinitable, V: Copyable & Deinitable]:
 # ===----------------------------------------------------------------------=== #
 # Value Stubs
 # ===----------------------------------------------------------------------=== #
-
-
-# A linear type, see
-# https://www.notion.so/modularai/Linear-Types-14a1044d37bb809ab074c990fe1a84e3.
 
 
 @stable
