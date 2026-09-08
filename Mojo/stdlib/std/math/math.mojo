@@ -2915,7 +2915,7 @@ def scalb[
 
 
 @always_inline
-def _gcd_or_lcm[is_gcd: Bool](values: VariadicList[Int]) -> Int:
+def _gcd_or_lcm[is_gcd: Bool](values: VariadicList[Int, _]) -> Int:
     """Computes gcd or lcm of a variadic list of integers without allocation.
 
     This helper enables code reuse between the variadic implementations
@@ -2935,9 +2935,7 @@ def _gcd_or_lcm[is_gcd: Bool](values: VariadicList[Int]) -> Int:
 
     var result = values[0]
     for i in range(1, len(values)):
-
-        @parameter
-        if is_gcd:
+        comptime if is_gcd:
             result = gcd(values[i], result)
             if result == 1:
                 return result
