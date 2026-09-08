@@ -24,9 +24,8 @@ Devices
    CPU
    Device
    DeviceEvent
+   DeviceQueue
    DeviceSpec
-   DeviceStream
-   NPU
 
 Buffers
 -------
@@ -39,6 +38,7 @@ Buffers
    Buffer
    DevicePinnedBuffer
    DLPackArray
+   Usage
 
 .. autosummary::
    :nosignatures:

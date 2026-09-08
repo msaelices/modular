@@ -15,7 +15,7 @@ from std.testing import *
 from std.testing import TestSuite
 
 from std.compile import compile_info
-from std.gpu import thread_idx
+from max.gpu import thread_idx
 from std.memory import unsafe_stack_allocation
 from std.sys.info import _cdna_4_or_newer, _is_amd_cdna, CompilationTarget
 from std.sys.compile import SanitizeAddress
@@ -74,16 +74,14 @@ def test_data_layout_llvm() raises:
 def test_data_layout_asm() raises:
     @__parameter
     def my_func(src: Pointer[Int32, ImmutAnyOrigin]):
-        var a = unsafe_stack_allocation[
-            20, Int32, address_space=AddressSpace.SHARED
-        ]()
+        var a = unsafe_stack_allocation[20, Int32, address_space=.SHARED]()
         a[unsafe_offset=thread_idx.x] = src[unsafe_offset=0]
         barrier()
 
     var target_short_asm = compile_info[
         my_func,
         emission_kind="asm",
-        compile_options="nvptx-short-ptr=true",
+        compile_options="target-abi=shortptr",
         target=target_short_ptr,
     ]()
 

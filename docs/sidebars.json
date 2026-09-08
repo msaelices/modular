@@ -27,8 +27,10 @@
         "serve/image-to-text",
         "serve/image-generation",
         "serve/video-generation",
+        "serve/audio-generation",
         "serve/embeddings",
         "serve/function-calling",
+        "serve/reasoning",
         "serve/structured-output",
         "develop/max-pipeline-bring-your-own-model",
         "models"
@@ -53,7 +55,8 @@
         "serve/prefix-caching",
         "serve/lora-adapters",
         "serve/speculative-decoding",
-        "serve/recipes"
+        "serve/recipes",
+        "serve/metrics"
       ]
     },
     {
@@ -242,6 +245,17 @@
             "id": "api/python/experimental"
           },
           "items": [
+            {
+              "type": "category",
+              "label": "compilation",
+              "link": {
+                "type": "doc",
+                "id": "api/python/experimental.compilation"
+              },
+              "items": [
+                "__AUTOGEN:max.experimental.compilation__"
+              ]
+            },
             "api/python/experimental.functional",
             {
               "type": "category",
@@ -318,6 +332,17 @@
               },
               "items": [
                 "__AUTOGEN:max.experimental.torch__"
+              ]
+            },
+            {
+              "type": "category",
+              "label": "tree_utils",
+              "link": {
+                "type": "doc",
+                "id": "api/python/experimental.tree_utils"
+              },
+              "items": [
+                "__AUTOGEN:max.experimental.tree_utils__"
               ]
             }
           ]
@@ -436,6 +461,7 @@
                 "api/python/pipelines.architectures.llama4",
                 "api/python/pipelines.architectures.mamba",
                 "api/python/pipelines.architectures.minimax_m2",
+                "api/python/pipelines.architectures.minimax_music3",
                 "api/python/pipelines.architectures.mistral",
                 "api/python/pipelines.architectures.mistral3",
                 "api/python/pipelines.architectures.mpnet",
@@ -463,7 +489,20 @@
                 "api/python/pipelines.architectures.unified_mtp_deepseekV3",
                 "api/python/pipelines.architectures.unified_mtp_gemma4",
                 "api/python/pipelines.architectures.unified_mtp_glm5_2",
+                "api/python/pipelines.architectures.unified_mtp_inkling",
+                "api/python/pipelines.architectures.unified_mtp_qwen3_5",
                 "api/python/pipelines.architectures.wan"
+              ]
+            },
+            {
+              "type": "category",
+              "label": "audio",
+              "link": {
+                "type": "doc",
+                "id": "api/python/pipelines.audio"
+              },
+              "items": [
+                "__AUTOGEN:max.pipelines.audio__"
               ]
             },
             {
@@ -485,6 +524,17 @@
                 "id": "api/python/pipelines.diffusion"
               },
               "items": [
+                {
+                  "type": "category",
+                  "label": "config",
+                  "link": {
+                    "type": "doc",
+                    "id": "api/python/pipelines.diffusion.config"
+                  },
+                  "items": [
+                    "__AUTOGEN:max.pipelines.diffusion.config__"
+                  ]
+                },
                 {
                   "type": "category",
                   "label": "schedulers",
@@ -582,6 +632,17 @@
                   },
                   "items": [
                     "__AUTOGEN:max.pipelines.lib.registry__"
+                  ]
+                },
+                {
+                  "type": "category",
+                  "label": "request_text",
+                  "link": {
+                    "type": "doc",
+                    "id": "api/python/pipelines.lib.request_text"
+                  },
+                  "items": [
+                    "__AUTOGEN:max.pipelines.lib.request_text__"
                   ]
                 },
                 "__AUTOGEN:max.pipelines.lib__"

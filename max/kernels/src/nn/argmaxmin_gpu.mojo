@@ -14,7 +14,7 @@
 
 
 from std.bit import next_power_of_two
-from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
+from max.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
 from max.gpu.primitives.grid_controls import (
     PDL,
     PDLLevel,
@@ -26,7 +26,7 @@ from std.sys.info import has_apple_gpu_accelerator
 
 from max.gpu.host import DeviceContext, get_gpu_target
 from max.runtime.tracing import Trace, TraceLevel, trace_arg
-from layout import TensorLayout, TileTensor, coord_to_index_list
+from layout import TensorLayout, TensorEngine, TileTensor, coord_to_index_list
 from nn.topk import TopK_2, _block_reduce_topk, _topk_dead_val
 from std.utils.index import IndexList
 
@@ -55,7 +55,7 @@ def _argmaxmin_vec_update[
     dtype: DType, largest: Bool, simd_width: Int
 ](
     mut best_vals: SIMD[dtype, simd_width],
-    mut best_idxs: SIMD[DType.int32, simd_width],
+    mut best_idxs: SIMD[.int32, simd_width],
     vals: SIMD[dtype, simd_width],
     base: Int,
 ):
@@ -65,8 +65,8 @@ def _argmaxmin_vec_update[
     the lowest index wins a tie. NaN never compares greater and is therefore
     ignored, matching `TopK_2.insert`.
     """
-    comptime lane_offsets = iota[DType.int32, simd_width]()
-    var better: SIMD[DType.bool, simd_width]
+    comptime lane_offsets = iota[.int32, simd_width]()
+    var better: SIMD[.bool, simd_width]
     comptime if largest:
         better = vals.gt(best_vals)
     else:
@@ -83,12 +83,12 @@ def _argmaxmin_scan[
     unroll: Int,
     alignment: Int,
 ](
-    row: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    row: ImmPointer[Scalar[dtype], ImmutAnyOrigin],
     num_elements: Int,
     tid: Int,
     block_size: Int,
     mut best_vals: SIMD[dtype, simd_width],
-    mut best_idxs: SIMD[DType.int32, simd_width],
+    mut best_idxs: SIMD[.int32, simd_width],
 ):
     """Streams one row once, accumulating a per-lane (extremum, index)."""
     var lane_stride = block_size * simd_width
@@ -102,7 +102,7 @@ def _argmaxmin_scan[
             fill=SIMD[dtype, simd_width](_topk_dead_val[dtype, largest]())
         )
         comptime for u in range(unroll):
-            staged[u] = row.load[width=simd_width, alignment=alignment](
+            staged[u] = row.unsafe_load[width=simd_width, alignment=alignment](
                 offset + u * lane_stride
             )
         comptime for u in range(unroll):
@@ -115,7 +115,7 @@ def _argmaxmin_scan[
         _argmaxmin_vec_update[dtype, largest](
             best_vals,
             best_idxs,
-            row.load[width=simd_width, alignment=alignment](i),
+            row.unsafe_load[width=simd_width, alignment=alignment](i),
             i,
         )
         i += lane_stride
@@ -125,7 +125,7 @@ def _argmaxmin_scan[
 def _argmaxmin_block_partial[
     dtype: DType, largest: Bool, simd_width: Int, unroll: Int
 ](
-    row: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    row: ImmPointer[Scalar[dtype], ImmutAnyOrigin],
     begin: Int,
     count: Int,
     aligned: Bool,
@@ -134,8 +134,8 @@ def _argmaxmin_block_partial[
 ) -> TopK_2[dtype, largest]:
     """Reduces `row[begin : begin + count]` to one (extremum, global index)."""
     var best_vals = SIMD[dtype, simd_width](_topk_dead_val[dtype, largest]())
-    var best_idxs = SIMD[DType.int32, simd_width](0)
-    var chunk = row + begin
+    var best_idxs = SIMD[.int32, simd_width](0)
+    var chunk = row.unsafe_offset(begin)
 
     if aligned:
         _argmaxmin_scan[
@@ -170,7 +170,7 @@ def _argmaxmin_block_partial[
     # than anything scanned above, so a strict insert keeps first-index.
     var vec_end = align_down(count, simd_width)
     if tid < count - vec_end:
-        partial.insert(chunk[vec_end + tid], vec_end + tid)
+        partial.insert(chunk.unsafe_offset(vec_end + tid)[], vec_end + tid)
 
     partial.p += begin
     return partial
@@ -183,10 +183,13 @@ def _argmaxmin_scan_kernel[
     simd_width: Int,
     unroll: Int,
     InputLayoutType: TensorLayout,
+    InputEngine: TensorEngine,
 ](
-    input: TileTensor[dtype, InputLayoutType, ImmutAnyOrigin],
-    part_vals: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    part_idxs: UnsafePointer[Int32, MutAnyOrigin],
+    input: TileTensor[
+        dtype, InputLayoutType, ImmutAnyOrigin, Engine=InputEngine
+    ],
+    part_vals: MutPointer[Scalar[dtype], MutAnyOrigin],
+    part_idxs: MutPointer[Int32, MutAnyOrigin],
     num_elements_arg: Int32,
     split_len_arg: Int32,
     num_splits_arg: Int32,
@@ -205,6 +208,7 @@ def _argmaxmin_scan_kernel[
         simd_width: Elements per vector load.
         unroll: Vector loads issued back to back per loop trip.
         InputLayoutType: Layout of the input.
+        InputEngine: Engine of the input.
 
     Args:
         input: Input rows, contiguous with `num_elements` per row.
@@ -229,7 +233,7 @@ def _argmaxmin_scan_kernel[
         var partial = _argmaxmin_block_partial[
             dtype, largest, simd_width, unroll
         ](
-            input.ptr + row_id * num_elements,
+            input.ptr.unsafe_offset(row_id * num_elements),
             begin,
             count,
             aligned_arg != 0,
@@ -240,8 +244,8 @@ def _argmaxmin_scan_kernel[
 
         if tid == 0:
             var slot = row_id * Int(num_splits_arg) + split
-            part_vals[slot] = total.u
-            part_idxs[slot] = Int32(total.p)
+            part_vals.unsafe_offset(slot)[] = total.u
+            part_idxs.unsafe_offset(slot)[] = Int32(total.p)
 
 
 @__name(t"argmaxmin_combine_{dtype}_{out_idx_type}_{largest}")
@@ -250,12 +254,17 @@ def _argmaxmin_combine_kernel[
     out_idx_type: DType,
     largest: Bool,
     OutIdxLayoutType: TensorLayout,
+    OutIdxEngine: TensorEngine,
 ](
     out_idxs: TileTensor[
-        mut=True, out_idx_type, OutIdxLayoutType, MutAnyOrigin
+        mut=True,
+        out_idx_type,
+        OutIdxLayoutType,
+        MutAnyOrigin,
+        Engine=OutIdxEngine,
     ],
-    part_vals: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    part_idxs: UnsafePointer[Int32, ImmutAnyOrigin],
+    part_vals: ImmPointer[Scalar[dtype], ImmutAnyOrigin],
+    part_idxs: ImmPointer[Int32, ImmutAnyOrigin],
     num_splits_arg: Int32,
 ):
     """Reduces one row's per-slice winners to the final index.
@@ -265,6 +274,7 @@ def _argmaxmin_combine_kernel[
         out_idx_type: Output index dtype.
         largest: Select the maximum (argmax) or the minimum (argmin).
         OutIdxLayoutType: Layout of the output indices.
+        OutIdxEngine: Engine of the output indices.
 
     Args:
         out_idxs: One index per row.
@@ -283,12 +293,15 @@ def _argmaxmin_combine_kernel[
         # tie-break reproduces a single-pass first-index scan.
         var partial = TopK_2[dtype, largest]()
         for i in range(tid, num_splits, Int(block_dim.x)):
-            partial.insert(part_vals[base + i], Int(part_idxs[base + i]))
+            partial.insert(
+                part_vals.unsafe_offset(base + i)[],
+                Int(part_idxs.unsafe_offset(base + i)[]),
+            )
 
         var total = _block_reduce_topk[ascending=largest](partial)
 
         if tid == 0:
-            out_idxs.ptr[row_id] = Scalar[DType.int](total.p).cast[
+            out_idxs.ptr.unsafe_offset(row_id)[] = Int(total.p).cast[
                 out_idx_type
             ]()
 
@@ -325,8 +338,7 @@ def argmaxmin_gpu[
         coord_to_index_list(input.layout.shape_coord())
     )
 
-    @__parameter
-    def trace_information() -> String:
+    def trace_information() {imm} -> String:
         return String(";").join(
             Span(
                 [
@@ -338,7 +350,7 @@ def argmaxmin_gpu[
 
     with Trace[TraceLevel.OP, target=StaticString("gpu")](
         "argmaxmin_gpu",
-        Trace[TraceLevel.OP]._get_detail_str[trace_information](),
+        Trace[TraceLevel.OP]._get_detail_str(trace_information),
         task_id=Int(ctx.id()),
     ):
         var num_elements = in_shape[input.rank - 1]
@@ -392,9 +404,7 @@ def argmaxmin_gpu[
             combine_block_size = WARP_SIZE
 
         var part_vals = ctx.enqueue_create_buffer[dtype](num_rows * num_splits)
-        var part_idxs = ctx.enqueue_create_buffer[DType.int32](
-            num_rows * num_splits
-        )
+        var part_idxs = ctx.enqueue_create_buffer[.int32](num_rows * num_splits)
 
         comptime scan_kernel = _argmaxmin_scan_kernel[
             dtype,
@@ -402,6 +412,7 @@ def argmaxmin_gpu[
             simd_width,
             _ARGMAXMIN_UNROLL,
             input.LayoutType,
+            type_of(input).Engine,
         ]
         ctx.enqueue_function[scan_kernel](
             input.as_immut(),
@@ -415,12 +426,12 @@ def argmaxmin_gpu[
             block_dim=block_size,
             attributes=pdl_launch_attributes(PDLLevel.ON),
         )
-
         comptime combine_kernel = _argmaxmin_combine_kernel[
             dtype,
             output_type,
             largest,
             output.LayoutType,
+            type_of(output).Engine,
         ]
         ctx.enqueue_function[combine_kernel](
             output,

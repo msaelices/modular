@@ -36,8 +36,8 @@ from std.sys import get_defined_bool
 from std.sys.intrinsics import readfirstlane
 from std.math import ceildiv
 from std.math.uutils import umod, ufloordiv
-from std.gpu import block_idx
-from std.gpu import warp_id as get_warp_id
+from max.gpu import block_idx
+from max.gpu import warp_id as get_warp_id
 from max.gpu.sync import s_waitcnt
 from std.memory import bitcast
 from std.utils.numerics import get_accum_type, min_or_neg_inf
@@ -80,7 +80,7 @@ __extension Attention:
         comptime k_swizzle = _get_k_swizzle[Self.mma_shape[0], Self.BK]()
 
         var warp_id = UInt32(
-            readfirstlane(bitcast[DType.int32](UInt32(get_warp_id())))
+            readfirstlane(bitcast[.int32](UInt32(get_warp_id())))
         )
 
         # Split-K: compute this partition's key range.

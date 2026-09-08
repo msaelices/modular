@@ -38,10 +38,10 @@ def matrix_band_part[
 ](
     input_0_fn: InputFnType,
     input_shape: IndexList[rank],
-    num_lower: TileTensor[dtype=int_type, ...],
-    num_upper: TileTensor[dtype=int_type, ...],
-    exclude: TileTensor[dtype=cond_type, ...],
-    output: TileTensor[mut=True, dtype=dtype, ...],
+    num_lower: TileTensor[int_type, ...],
+    num_upper: TileTensor[int_type, ...],
+    exclude: TileTensor[cond_type, ...],
+    output: TileTensor[mut=True, dtype, ...],
     ctx: DeviceContext,
 ) raises:
     """Copies a band of `input_0_fn` into `output`, zeroing elements outside the band defined by `num_lower` and `num_upper`.
@@ -73,15 +73,16 @@ def matrix_band_part[
     var lower_diagonal_index = Int(num_lower.load_linear[1](IndexList[1](0)))
     var upper_diagonal_index = Int(num_upper.load_linear[1](IndexList[1](0)))
 
-    @__copy_capture(
-        input_shape,
-        lower_diagonal_index,
-        upper_diagonal_index,
-        output,
-        input_0_fn,
-    )
-    @__parameter
-    def dispatch[exclude: Bool]() raises:
+    def dispatch[
+        exclude: Bool
+    ]() raises {
+        var input_shape,
+        var lower_diagonal_index,
+        var upper_diagonal_index,
+        var output,
+        var input_0_fn,
+        imm,
+    }:
         _matrix_band_part_impl[
             dtype,
             int_type,
@@ -99,7 +100,7 @@ def matrix_band_part[
             ctx,
         )
 
-    unswitch[dispatch](exclude.load_linear[1](IndexList[1](0)) != 0)
+    unswitch(exclude.load_linear[1](IndexList[1](0)) != 0, dispatch)
 
 
 @always_inline
@@ -119,7 +120,7 @@ def _matrix_band_part_impl[
     input_shape: IndexList[rank],
     lower_diagonal_index: Int,
     upper_diagonal_index: Int,
-    output: TileTensor[mut=True, dtype=dtype, ...],
+    output: TileTensor[mut=True, dtype, ...],
     ctx: DeviceContext,
 ) raises:
     """Implements the elementwise band-part copy with the `exclude` flag specialized at compile time.
