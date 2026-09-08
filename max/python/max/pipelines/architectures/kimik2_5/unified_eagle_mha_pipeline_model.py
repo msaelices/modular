@@ -135,9 +135,7 @@ class Eagle3MHAKimiK25Model(_UnifiedSpecDecodeModelMixin, KimiK2_5Model):
         for key, value in target_state_dict.items():
             if key.startswith("vision_encoder."):
                 vision_state_dict[key] = value
-            elif key.startswith("language_model.") or key.startswith(
-                "language_"
-            ):
+            elif key.startswith(("language_model.", "language_")):
                 llm_state_dict[key] = value
 
         n_devices = len(self.devices)
@@ -284,6 +282,7 @@ class Eagle3MHAKimiK25Model(_UnifiedSpecDecodeModelMixin, KimiK2_5Model):
             pipeline_config=self.pipeline_config,
             huggingface_config=self.huggingface_config,
             llm_config=config,
+            max_seq_len=self.max_seq_len,
         )
         self.model_config = kimik2_5_config
         self.nn_model = KimiK2_5(kimik2_5_config)

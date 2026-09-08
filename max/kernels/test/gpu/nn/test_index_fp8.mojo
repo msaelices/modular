@@ -42,31 +42,31 @@ def test_index_fp8[
     var ks_size = batch_size * num_keys
     var o_size = batch_size * seq_len * num_keys
 
-    var q_ptr = ctx.enqueue_create_host_buffer[DType.float8_e4m3fn](q_size)
-    var qs_ptr = ctx.enqueue_create_host_buffer[DType.float32](qs_size)
-    var k_ptr = ctx.enqueue_create_host_buffer[DType.float8_e4m3fn](k_size)
-    var ks_ptr = ctx.enqueue_create_host_buffer[DType.float32](ks_size)
-    var o_ptr = ctx.enqueue_create_host_buffer[DType.float32](o_size)
-    var o_ref_ptr = ctx.enqueue_create_host_buffer[DType.float32](o_size)
-    var input_row_offsets = ctx.enqueue_create_host_buffer[DType.uint32](
+    var q_ptr = ctx.enqueue_create_host_buffer[.float8_e4m3fn](q_size)
+    var qs_ptr = ctx.enqueue_create_host_buffer[.float32](qs_size)
+    var k_ptr = ctx.enqueue_create_host_buffer[.float8_e4m3fn](k_size)
+    var ks_ptr = ctx.enqueue_create_host_buffer[.float32](ks_size)
+    var o_ptr = ctx.enqueue_create_host_buffer[.float32](o_size)
+    var o_ref_ptr = ctx.enqueue_create_host_buffer[.float32](o_size)
+    var input_row_offsets = ctx.enqueue_create_host_buffer[.uint32](
         batch_size + 1
     )
-    var cache_row_offsets = ctx.enqueue_create_host_buffer[DType.uint32](
+    var cache_row_offsets = ctx.enqueue_create_host_buffer[.uint32](
         batch_size + 1
     )
 
-    var q_device_ptr = ctx.enqueue_create_buffer[DType.float8_e4m3fn](q_size)
-    var qs_device_ptr = ctx.enqueue_create_buffer[DType.float32](qs_size)
-    var k_device_ptr = ctx.enqueue_create_buffer[DType.float8_e4m3fn](k_size)
-    var ks_device_ptr = ctx.enqueue_create_buffer[DType.float32](ks_size)
-    var input_row_offsets_device_ptr = ctx.enqueue_create_buffer[DType.uint32](
+    var q_device_ptr = ctx.enqueue_create_buffer[.float8_e4m3fn](q_size)
+    var qs_device_ptr = ctx.enqueue_create_buffer[.float32](qs_size)
+    var k_device_ptr = ctx.enqueue_create_buffer[.float8_e4m3fn](k_size)
+    var ks_device_ptr = ctx.enqueue_create_buffer[.float32](ks_size)
+    var input_row_offsets_device_ptr = ctx.enqueue_create_buffer[.uint32](
         batch_size + 1
     )
-    var cache_row_offsets_device_ptr = ctx.enqueue_create_buffer[DType.uint32](
+    var cache_row_offsets_device_ptr = ctx.enqueue_create_buffer[.uint32](
         batch_size + 1
     )
-    var o_device_ptr = ctx.enqueue_create_buffer[DType.float32](o_size)
-    var o_device_ref_ptr = ctx.enqueue_create_buffer[DType.float32](o_size)
+    var o_device_ptr = ctx.enqueue_create_buffer[.float32](o_size)
+    var o_device_ref_ptr = ctx.enqueue_create_buffer[.float32](o_size)
 
     rand(q_ptr.as_span())
     rand(qs_ptr.as_span())
@@ -123,7 +123,7 @@ def test_index_fp8[
         row_major(batch_size + 1),
     )
 
-    var cache_row_offsets_device = TileTensor[mut=False](
+    var cache_row_offsets_device = TileTensor[mut=False, Engine=_](
         cache_row_offsets_device_ptr,
         row_major(batch_size + 1),
     )
@@ -200,6 +200,15 @@ def main() raises:
         test_index_fp8[num_heads=64, depth=128](1, 501, 501, ctx)
         test_index_fp8[num_heads=64, depth=128](3, 600, 600, ctx)
         test_index_fp8[num_heads=64, depth=128](4, 722, 722, ctx)
+        # k-scale TMA alignment. The SM100 scorer stages the per-key scales
+        # through a flat `1 x total_keys` TMA view, where a key index IS the
+        # innermost coordinate and so must be 16-byte (4-f32) aligned. The
+        # per-tile term is always a multiple of `BM_key`, leaving the ragged
+        # batch base `b * num_keys` as the only misaligning term -- and 723
+        # walks all four residues in one case (0, 3, 2, 1). Before the producer
+        # rounded that base down, this faulted `CUDA_ERROR_ILLEGAL_INSTRUCTION`
+        # on the odd-residue entries; 722 above covers residue 2 alone.
+        test_index_fp8[num_heads=64, depth=128](4, 723, 723, ctx)
         test_index_fp8[num_heads=64, depth=128](5, 32, 64, ctx)
         test_index_fp8[num_heads=64, depth=128](2, 128, 256, ctx)
 

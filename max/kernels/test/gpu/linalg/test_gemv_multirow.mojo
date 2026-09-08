@@ -21,7 +21,7 @@ epilogue lambda and for an N that does not divide the row tile.
 from std.math import align_up, ceildiv
 from std.sys import simd_width_of
 
-from std.gpu import WARP_SIZE, global_idx
+from max.gpu import WARP_SIZE, global_idx
 from max.gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
 from layout import Coord, Idx, TileTensor, row_major
 from linalg.gemv import (
@@ -35,7 +35,7 @@ from std.utils import IndexList
 
 def _fill[
     dtype: DType, integral: Bool
-](x: UnsafePointer[Scalar[dtype], MutAnyOrigin], length: Int32, seed: Int32,):
+](x: MutPointer[Scalar[dtype], MutAnyOrigin], length: Int32, seed: Int32,):
     var i = Int(global_idx.x)
     if i >= Int(length):
         return
@@ -130,9 +130,9 @@ def test_matches_one_row_kernel[
         type_of(c).LayoutType,
         type_of(w).LayoutType,
         type_of(act).LayoutType,
-        type_of(c).Storage,
-        type_of(w).Storage,
-        type_of(act).Storage,
+        type_of(c).Engine,
+        type_of(w).Engine,
+        type_of(act).Engine,
         simd_width=simd_width,
         transpose_b=True,
         elementwise_lambda_fn=epilogue,
@@ -145,9 +145,9 @@ def test_matches_one_row_kernel[
         type_of(c).LayoutType,
         type_of(w).LayoutType,
         type_of(act).LayoutType,
-        type_of(c).Storage,
-        type_of(w).Storage,
-        type_of(act).Storage,
+        type_of(c).Engine,
+        type_of(w).Engine,
+        type_of(act).Engine,
         simd_width=simd_width,
         rows_per_warp=rows_per_warp,
         transpose_b=True,
@@ -229,9 +229,9 @@ def test_matches_host_reference[
         type_of(c).LayoutType,
         type_of(w).LayoutType,
         type_of(act).LayoutType,
-        type_of(c).Storage,
-        type_of(w).Storage,
-        type_of(act).Storage,
+        type_of(c).Engine,
+        type_of(w).Engine,
+        type_of(act).Engine,
         simd_width=simd_width,
         rows_per_warp=rows_per_warp,
         transpose_b=True,
@@ -258,8 +258,8 @@ def test_matches_host_reference[
         var acc = Float32(0)
         for i in range(K):
             acc += (
-                w_host[row * K + i].cast[DType.float32]()
-                * act_host[i].cast[DType.float32]()
+                w_host[row * K + i].cast[.float32]()
+                * act_host[i].cast[.float32]()
             )
         if c_host[row] != acc.cast[c_type]():
             mismatches += 1
@@ -272,23 +272,17 @@ def main() raises:
     with DeviceContext() as ctx:
         # Production shape of the wide-N shallow-K path (bf16 in, bf16 out).
         for seed in [1, 7, 24301]:
-            test_matches_one_row_kernel[
-                DType.bfloat16, DType.bfloat16, 262144, 256
-            ](ctx, seed)
+            test_matches_one_row_kernel[.bfloat16, .bfloat16, 262144, 256](
+                ctx, seed
+            )
 
         test_matches_one_row_kernel[
-            DType.bfloat16, DType.bfloat16, 262144, 256, with_epilogue=True
+            .bfloat16, .bfloat16, 262144, 256, with_epilogue=True
         ](ctx, 1)
 
         # f32 output, and a K deep enough to halve the row tile.
-        test_matches_one_row_kernel[DType.float32, DType.bfloat16, 262144, 512](
-            ctx, 1
-        )
+        test_matches_one_row_kernel[.float32, .bfloat16, 262144, 512](ctx, 1)
 
         # N divides neither the row tile nor the warp.
-        test_matches_one_row_kernel[
-            DType.bfloat16, DType.bfloat16, 100003, 256
-        ](ctx, 1)
-        test_matches_host_reference[
-            DType.bfloat16, DType.bfloat16, 100003, 256
-        ](ctx)
+        test_matches_one_row_kernel[.bfloat16, .bfloat16, 100003, 256](ctx, 1)
+        test_matches_host_reference[.bfloat16, .bfloat16, 100003, 256](ctx)

@@ -154,6 +154,16 @@ def register_all_models() -> None:
             ".unified_dspark_gemma4_12b",
             "gemma4_dspark_draft_arch",
         ),
+        _LazyArch(
+            "Gemma4ForConditionalGeneration_ModuleV3",
+            ".gemma4_modulev3",
+            "gemma4_modulev3_arch",
+        ),
+        _LazyArch(
+            "Gemma4UnifiedForConditionalGeneration_ModuleV3",
+            ".gemma4_modulev3",
+            "gemma4_unified_modulev3_arch",
+        ),
         _LazyArch("GlmMoeDsaForCausalLM", ".glm5_1", "glm5_1_arch"),
         _LazyArch("GptOssForCausalLM", ".gpt_oss", "gpt_oss_arch"),
         _LazyArch(
@@ -179,6 +189,11 @@ def register_all_models() -> None:
         _LazyArch("Ideogram4Pipeline", ".ideogram4", "ideogram4_arch"),
         _LazyArch(
             "InklingForConditionalGeneration", ".inkling", "inkling_arch"
+        ),
+        _LazyArch(
+            "UnifiedMTPInklingForConditionalGeneration",
+            ".unified_mtp_inkling",
+            "unified_mtp_inkling_arch",
         ),
         _LazyArch("InternVLChatModel", ".internvl", "internvl_arch"),
         _LazyArch(
@@ -219,6 +234,11 @@ def register_all_models() -> None:
         ),
         _LazyArch("MambaForCausalLM", ".mamba", "mamba_arch"),
         _LazyArch("MiniMaxM2ForCausalLM", ".minimax_m2", "minimax_m2_arch"),
+        _LazyArch(
+            "MiniMaxMusic3ModularPipeline",
+            ".minimax_music3",
+            "minimax_music3_arch",
+        ),
         _LazyArch("NemotronHForCausalLM", ".nemotron_h", "nemotron_h_arch"),
         _LazyArch("MistralForCausalLM", ".mistral", "mistral_arch"),
         _LazyArch(
@@ -333,6 +353,11 @@ def register_all_models() -> None:
             ".unified_mtp_glm5_2",
             "unified_mtp_glm5_2_arch",
         ),
+        _LazyArch(
+            "UnifiedMTPQwen3_5ForConditionalGeneration",
+            ".unified_mtp_qwen3_5",
+            "unified_mtp_qwen3_5_arch",
+        ),
         _LazyArch("WanPipeline", ".wan", "wan_arch"),
         _LazyArch("WanImageToVideoPipeline", ".wan", "wan_i2v_arch"),
         _LazyArch("ZImagePipeline", ".z_image_modulev3", "z_image_arch"),
@@ -346,6 +371,14 @@ def register_all_models() -> None:
     # Optional: pull in private tool parsers.
     try:
         import tool_parsers  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        pass
+
+    # Optional: import the Kimi K3 model if available.
+    try:
+        from kimi_k3 import kimi_k3_arch  # type: ignore[import-not-found]
+
+        PIPELINE_REGISTRY.register(kimi_k3_arch)
     except ModuleNotFoundError:
         pass
 

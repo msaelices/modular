@@ -28,7 +28,7 @@ from .._multistage_gemm_gpu import (
     WarpSplitKReductionSMem,
 )
 
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     block_idx,
@@ -42,7 +42,7 @@ from max.gpu.sync import (
     schedule_barrier,
     schedule_group_barrier,
 )
-from layout import TensorLayout, TileTensor
+from layout import TensorEngine, TensorLayout, TileTensor
 from layout.swizzle import Swizzle
 from layout.tile_layout import row_major, col_major
 from layout.tile_tensor import stack_allocation
@@ -164,10 +164,13 @@ struct AMDMatmul[
         c_layout: TensorLayout,
         a_layout: TensorLayout,
         b_layout: TensorLayout,
+        c_engine: TensorEngine,
+        a_engine: TensorEngine,
+        b_engine: TensorEngine,
     ](
-        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin],
-        a: TileTensor[Self.a_type, a_layout, ImmutAnyOrigin],
-        b: TileTensor[Self.b_type, b_layout, ImmutAnyOrigin],
+        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Engine=c_engine],
+        a: TileTensor[Self.a_type, a_layout, ImmutAnyOrigin, Engine=a_engine],
+        b: TileTensor[Self.b_type, b_layout, ImmutAnyOrigin, Engine=b_engine],
     ):
         """TileTensor GEMM matching original kernel config exactly.
 
@@ -178,6 +181,9 @@ struct AMDMatmul[
             c_layout: Tensor layout of the output C tile.
             a_layout: Tensor layout of the input A tile.
             b_layout: Tensor layout of the input B tile.
+            c_engine: Engine of the output C tile.
+            a_engine: Engine of the input A tile.
+            b_engine: Engine of the input B tile.
 
         Args:
             c: Output tile of shape `[M, N]` accumulating the matmul
@@ -221,10 +227,10 @@ struct AMDMatmul[
         # === SMEM: row_major tiles for the full BK-wide block ===
         comptime k_tile_size = Self.MMA_K * Self.k_group_size
 
-        var a_smem = stack_allocation[Self.a_type, AddressSpace.SHARED](
+        var a_smem = stack_allocation[Self.a_type, address_space=.SHARED](
             row_major[BM, BK]()
         )
-        var b_smem = stack_allocation[Self.a_type, AddressSpace.SHARED](
+        var b_smem = stack_allocation[Self.a_type, address_space=.SHARED](
             row_major[BN, BK]()
         )
 
@@ -233,10 +239,10 @@ struct AMDMatmul[
         comptime load_thread_rows = num_threads // load_thread_cols
         comptime a_reg_elems = BM * BK // num_threads
         comptime b_reg_elems = BN * BK // num_threads
-        var a_load_reg = stack_allocation[Self.a_type, AddressSpace.LOCAL](
+        var a_load_reg = stack_allocation[Self.a_type, address_space=.LOCAL](
             row_major[1, a_reg_elems]()
         )
-        var b_load_reg = stack_allocation[Self.a_type, AddressSpace.LOCAL](
+        var b_load_reg = stack_allocation[Self.a_type, address_space=.LOCAL](
             row_major[1, b_reg_elems]()
         )
 

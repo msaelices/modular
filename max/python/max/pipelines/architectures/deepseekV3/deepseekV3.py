@@ -115,6 +115,25 @@ def _validate_parallelism_config(config: DeepseekV3Config) -> None:
         )
 
 
+def mask_padded_tail(
+    logits: TensorValue, vocab_size: int, unpadded_vocab_size: int | None
+) -> TensorValue:
+    """Sends the dummy/padding rows of the vocabulary to negative infinity."""
+    if unpadded_vocab_size is None or unpadded_vocab_size >= vocab_size:
+        return logits
+    device = logits.device
+    # Two broadcast scalars rather than a materialized row: keeps a
+    # vocab-sized fp32 constant out of the graph.
+    keep = ops.broadcast_to(
+        ops.constant(0.0, DType.float32, device=device), [unpadded_vocab_size]
+    )
+    drop = ops.broadcast_to(
+        ops.constant(float("-inf"), DType.float32, device=device),
+        [vocab_size - unpadded_vocab_size],
+    )
+    return logits + ops.cast(ops.concat([keep, drop]), logits.dtype)
+
+
 def deepseek_logits_postprocess(
     h: list[TensorValue],
     input_row_offsets: list[TensorValue],
@@ -132,6 +151,8 @@ def deepseek_logits_postprocess(
     logits_scaling: float = 1.0,
     capture_hidden_states: list[list[TensorValue]] | None = None,
     emit_last_token_logits: bool = True,
+    unpadded_vocab_size: int | None = None,
+    vocab_size: int | None = None,
 ) -> tuple[TensorValue, ...]:
     """Logits postprocessing for DeepseekV3 and DeepseekV3NextN.
 
@@ -247,6 +268,17 @@ def deepseek_logits_postprocess(
             else input_row_offsets[0]
         )
 
+    if unpadded_vocab_size is not None:
+        assert vocab_size is not None, (
+            "vocab_size must accompany unpadded_vocab_size"
+        )
+        if last_logits is not None:
+            last_logits = mask_padded_tail(
+                last_logits, vocab_size, unpadded_vocab_size
+            )
+        if logits is not None:
+            logits = mask_padded_tail(logits, vocab_size, unpadded_vocab_size)
+
     if logits_scaling != 1.0:
         if last_logits is not None:
             last_logits = last_logits / logits_scaling
@@ -329,12 +361,12 @@ class DeepseekV3DecoderLayer(Module):
             mla_kwargs["o_proj_quant_config"] = config.quant_config
             mla_kwargs["o_proj_dtype"] = config.dtype
 
-        mla_cls: (
-            type[DataParallelLatentAttentionWithRope]
-            | type[DataParallelLatentAttentionWithRopeFp8]
-            | type[TensorParallelLatentAttentionWithRope]
-            | type[TensorParallelLatentAttentionWithRopeFp8]
-        )
+        mla_cls: type[
+            DataParallelLatentAttentionWithRope
+            | DataParallelLatentAttentionWithRopeFp8
+            | TensorParallelLatentAttentionWithRope
+            | TensorParallelLatentAttentionWithRopeFp8
+        ]
         match self.mode:
             case ParallelismMode.TP_EP:
                 # TP attention + EP MoE: the cross-device communication is
@@ -925,7 +957,7 @@ class DeepseekV3(Module):
             return_logits=self.return_logits,
             return_hidden_states=self.return_hidden_states,
             logits_scaling=self.logits_scaling,
-            capture_hidden_states=eagle3_captured if eagle3_captured else None,
+            capture_hidden_states=eagle3_captured or None,
         )
 
     def input_types(

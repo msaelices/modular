@@ -24,7 +24,7 @@ support for various data types and memory layouts.
 from .. import DeviceBuffer
 from std.sys import size_of
 
-from std.gpu._utils import to_llvm_ptr
+from std._gpu._utils import to_llvm_ptr
 
 from std.utils import IndexList, StaticTuple
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
@@ -112,21 +112,21 @@ struct TensorMapDataType(TrivialRegisterPassable):
             DType.float8_e8m0fnu,
         ), "Unsupported dtype"
 
-        comptime if dtype == DType.float32:
+        comptime if dtype == .float32:
             return Self.FLOAT32
-        elif dtype == DType.float16:
+        elif dtype == .float16:
             return Self.FLOAT16
-        elif dtype == DType.uint16:
+        elif dtype == .uint16:
             return Self.UINT16
         elif dtype in (DType.float8_e4m3fn, DType.float8_e8m0fnu, DType.uint8):
             return Self.UINT8
-        elif dtype == DType.uint32:
+        elif dtype == .uint32:
             return Self.UINT32
-        elif dtype == DType.int32:
+        elif dtype == .int32:
             return Self.INT32
-        elif dtype == DType.int64:
+        elif dtype == .int64:
             return Self.INT64
-        elif dtype == DType.uint64:
+        elif dtype == .uint64:
             return Self.UINT64
         else:
             return Self.BFLOAT16
@@ -409,12 +409,22 @@ def create_tma_descriptor[
         " but is: ",
         global_strides_arg[0],
     )
+    # cuTensorMapEncodeTiled requires globalAddress aligned to 32 bytes for
+    # PACKED_FP4_ALIGN16B and 16 bytes otherwise.
+    comptime required_addr_align = 32 if unpack_fp4 else 16
+    debug_assert(
+        Int(global_buf.unsafe_ptr()) % required_addr_align == 0,
+        "TMA globalAddress must be ",
+        required_addr_align,
+        "-byte aligned, but is: ",
+        Int(global_buf.unsafe_ptr()),
+    )
     comptime if unpack_fp4:
         comptime assert (
-            dtype == DType.uint8
+            dtype == .uint8
         ), "packed FP4 must be presented as uint8, two E2M1 values per byte"
         # `cuTensorMapEncodeTiled` requires globalDim[0] % 128 == 0 for the
-        # ALIGN16B packed types, and 32-byte alignment on globalAddress.
+        # ALIGN16B packed types.
         debug_assert(
             global_dim_arg[0] % 128 == 0,
             (
