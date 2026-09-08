@@ -15,7 +15,7 @@ from std.math import log, log2, log10
 from std.sys import simd_width_of
 
 from max.algorithm.functional import elementwise
-from std.gpu import *
+from max.gpu import *
 from max.gpu.host import DeviceContext, get_gpu_target
 from std.testing import assert_almost_equal, TestSuite
 
@@ -72,15 +72,15 @@ def run_elementwise[
 
 def test_log() raises:
     with DeviceContext() as ctx:
-        run_elementwise[DType.float32, log](ctx)
-        run_elementwise[DType.float32, log10](ctx)
-        run_elementwise[DType.float32, log2](ctx)
-        run_elementwise[DType.float16, log](ctx)
-        run_elementwise[DType.float16, log10](ctx)
-        run_elementwise[DType.float16, log2](ctx)
-        run_elementwise[DType.bfloat16, log](ctx)
-        run_elementwise[DType.bfloat16, log10](ctx)
-        run_elementwise[DType.bfloat16, log2](ctx)
+        run_elementwise[.float32, log](ctx)
+        run_elementwise[.float32, log10](ctx)
+        run_elementwise[.float32, log2](ctx)
+        run_elementwise[.float16, log](ctx)
+        run_elementwise[.float16, log10](ctx)
+        run_elementwise[.float16, log2](ctx)
+        run_elementwise[.bfloat16, log](ctx)
+        run_elementwise[.bfloat16, log10](ctx)
+        run_elementwise[.bfloat16, log2](ctx)
 
 
 def main() raises:

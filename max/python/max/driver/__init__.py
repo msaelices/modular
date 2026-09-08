@@ -19,6 +19,7 @@ from max._core.driver import (
     CompletionFlag,
     DeviceEvent,
     LaunchTraceEntry,
+    Usage,
     __unsafe_pack_py_host_func,
     begin_launch_trace,
     enable_all_peer_access,
@@ -46,7 +47,6 @@ from .buffer import (
 )
 from .driver import (
     CPU,
-    NPU,
     Accelerator,
     Device,
     DeviceQueue,
@@ -96,7 +96,6 @@ def launch_trace() -> Iterator[list[LaunchTraceEntry]]:
 
 __all__ = [
     "CPU",
-    "NPU",
     "Accelerator",
     "Buffer",
     "CompletionFlag",
@@ -107,6 +106,7 @@ __all__ = [
     "DeviceQueue",
     "DeviceSpec",
     "LaunchTraceEntry",
+    "Usage",
     "accelerator_api",
     "accelerator_architecture_name",
     "accelerator_count",

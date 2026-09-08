@@ -16,9 +16,9 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
-from max.driver import Buffer, Device, is_virtual_device_mode
+from max.driver import Device, is_virtual_device_mode
 from max.engine import InferenceSession, Model
-from max.graph import Graph, Module, ops
+from max.graph import Graph, Module
 from max.graph.weights import Weights, WeightsAdapter
 from max.nn.transformer import ReturnHiddenStates, ReturnLogits
 from max.pipelines.context import TextAndVisionContext
@@ -31,6 +31,7 @@ from max.pipelines.lib import (
     SupportsSSMStateWarmup,
 )
 from max.pipelines.lib.log_probabilities import LogProbabilitiesMixin
+from max.pipelines.lib.memory_estimation import MemoryPlan
 from max.pipelines.modeling.types import RequestID
 from typing_extensions import override
 
@@ -64,6 +65,8 @@ class InklingModel(
         devices: list[Device],
         kv_cache_config: KVCacheConfig,
         weights: Weights,
+        *,
+        memory_plan: MemoryPlan,
         adapter: WeightsAdapter | None = None,
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
         return_hidden_states: ReturnHiddenStates = ReturnHiddenStates.NONE,
@@ -75,10 +78,11 @@ class InklingModel(
             devices,
             kv_cache_config,
             weights,
-            adapter,
-            return_logits,
-            return_hidden_states,
+            adapter=adapter,
+            return_logits=return_logits,
+            return_hidden_states=return_hidden_states,
             max_batch_size=max_batch_size,
+            memory_plan=memory_plan,
         )
         self._state_cache: InklingConvStateCache | None = None
         # The vision tower is only ever called through the batch processor,
@@ -105,10 +109,6 @@ class InklingModel(
         assert isinstance(self._batch_processor, InklingBatchProcessor)
         self._batch_processor.bind_runtime_state(self._state_cache, model)
 
-    @property
-    def emits_folded_sampled_tokens(self) -> bool:
-        return self.pipeline_config.runtime.fold_sampler_into_graph
-
     @override
     def _load_state_dict(self) -> dict[str, Any]:
         """Splits the checkpoint between the two graphs the towers compile to."""
@@ -129,7 +129,9 @@ class InklingModel(
     def _create_model_config(self, state_dict: dict[str, Any]) -> InklingConfig:
         # Quantization is read off the loaded weights; the checkpoint config
         # may not declare it.
-        model_config = InklingConfig.initialize(self.pipeline_config)
+        model_config = InklingConfig.initialize(
+            self.pipeline_config, max_seq_len=self.max_seq_len
+        )
         model_config.finalize(self.huggingface_config, state_dict)
         return model_config
 
@@ -170,29 +172,15 @@ class InklingModel(
             "inkling", input_types=nn_model.input_types(), module=module
         ) as graph:
             outputs = nn_model(*nn_model.unpack_inputs(graph.inputs))
-            if self.emits_folded_sampled_tokens:
-                # argmax is a pure device op (no host readback), so folding it
-                # into the captured graph is capture-safe.
-                sampled_tokens = ops.argmax(outputs[0], axis=-1)
-                graph.output(*outputs, sampled_tokens)
-            else:
-                graph.output(*outputs)
+            graph.output(*outputs)
         return graph, nn_model.state_dict()
 
     def execute(self, model_inputs: ModelInputs) -> ModelOutputs:
         assert isinstance(model_inputs, InklingInputs)
         model_outputs = list(self.model.execute(*model_inputs.buffers))
 
-        sampled_tokens: Buffer | None = None
-        if self.emits_folded_sampled_tokens:
-            popped = model_outputs.pop()
-            assert isinstance(popped, Buffer)
-            sampled_tokens = popped
-
         assert self._batch_processor is not None
-        outputs = self._batch_processor.process_outputs(model_outputs)
-        outputs.sampled_tokens = sampled_tokens
-        return outputs
+        return self._batch_processor.process_outputs(model_outputs)
 
     def release(self, request_id: RequestID) -> None:
         """Drops the request's convolution state, freeing its slot."""

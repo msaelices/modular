@@ -29,6 +29,7 @@ from max.driver import (
     Buffer,
     Device,
     DevicePinnedBuffer,
+    Usage,
     is_virtual_device_mode,
     load_devices,
 )
@@ -52,10 +53,7 @@ from max.pipelines.context import (
 from max.pipelines.context.exceptions import (  # noqa: F401 (for docstring)
     InputError,
 )
-from max.pipelines.kv_cache import (
-    PagedKVCacheManagerInterface,
-    load_kv_manager,
-)
+from max.pipelines.kv_cache import PagedKVCacheManagerInterface, load_kv_manager
 from max.pipelines.lib.vision_encoder_cache import (
     SupportsPooledVisionMetrics,
     SupportsVisionEncoding,
@@ -73,10 +71,7 @@ from max.pipelines.modeling.types import (
 from max.profiler import Tracer, traced
 from max.support.algorithm import flatten2d
 
-from .utils import (
-    StructuredOutputHelper,
-    update_context_and_prepare_responses,
-)
+from .utils import StructuredOutputHelper, update_context_and_prepare_responses
 
 if TYPE_CHECKING:
     from ..config import MAXModelConfig, PipelineConfig
@@ -169,8 +164,8 @@ class TextGenerationPipeline(
                 requested without a valid tokenizer delegate.
         """
         self._pipeline_config = pipeline_config
-        self._max_batch_size = memory_plan.max_batch_size
-        max_batch_size = memory_plan.max_batch_size
+        self._max_batch_size = memory_plan.planned_max_batch_size
+        max_batch_size = memory_plan.planned_max_batch_size
         model_config: MAXModelConfig = pipeline_config.model
         huggingface_config = model_config.huggingface_config
         if huggingface_config is None:
@@ -234,6 +229,7 @@ class TextGenerationPipeline(
             if self._pipeline_config.model.enable_echo
             else ReturnLogits.LAST_TOKEN,
             max_batch_size=max_batch_size,
+            memory_plan=memory_plan,
         )
 
         available_cache_memory = memory_plan.available_cache_memory
@@ -244,6 +240,8 @@ class TextGenerationPipeline(
             max_seq_len=self._pipeline_model.max_seq_len,
             session=session,
             available_cache_memory=available_cache_memory,
+            is_di_enabled=pipeline_config.runtime.is_disaggregated,
+            model_name=pipeline_config.model.model_name,
         )
 
         self._encoder_cache: VisionEncoderCache[TextAndVisionContext] | None = (
@@ -602,21 +600,18 @@ class TextGenerationPipeline(
         sampler_device = self._sampler_device
         with Tracer("d2h_generated_tokens"):
             generated_tokens_device = sampling_processor.generated_tokens
-            # Allocate a pinned tensor on the host for faster async d2h transfer
-            # speeds. If the sampler is on host, then fall back to normal
-            # pageable memory.
+            # Staging memory keeps the d2h transfer async on accelerators.
             # Note that we do not want to use `DevicePinnedBuffer` here.
             generated_tokens_host = Buffer(
                 shape=generated_tokens_device.shape,
                 dtype=generated_tokens_device.dtype,
                 device=sampler_device,
-                pinned=not sampler_device.is_host,
+                usage=Usage.STAGING,
             )
             generated_tokens_host.inplace_copy_from(generated_tokens_device)
-            # We assume that the call to `.to_numpy()` will insert a device
-            # synchronize to guarantee that the async d2h transfer is done.
-            # However, if this API changes we will have to add an explicit
-            # sampler_device.synchronize() here.
+            # Staging buffers do not synchronize on host reads, so the copy
+            # above is still in flight here.
+            sampler_device.synchronize()
             generated_tokens_np = generated_tokens_host.to_numpy()
 
         res = update_context_and_prepare_responses(

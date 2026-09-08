@@ -24,7 +24,7 @@ import extensibility
 from extensibility import InputTensor, OutputTensor
 from max.gpu.host import DeviceContext
 from max.gpu.primitives.grid_controls import PDLLevel, pdl_launch_attributes
-from std.gpu.host.info import is_gpu
+from max.gpu.host.info import is_gpu
 
 from attn_res.mix import attn_res_mix_gpu
 
@@ -82,10 +82,10 @@ struct AttnResMix:
             "attn_res_mix: norm_weight width must match hidden",
         )
 
-        var output_tt = output.to_tile_tensor[DType.int64]()
-        var candidates_tt = candidates.to_tile_tensor[DType.int64]()
-        var proj_tt = proj_weight.to_tile_tensor[DType.int64]()
-        var norm_tt = norm_weight.to_tile_tensor[DType.int64]()
+        var output_tt = output.to_tile_tensor[.int64]()
+        var candidates_tt = candidates.to_tile_tensor[.int64]()
+        var proj_tt = proj_weight.to_tile_tensor[.int64]()
+        var norm_tt = norm_weight.to_tile_tensor[.int64]()
 
         comptime BLOCK_SIZE = 256
 
@@ -102,9 +102,13 @@ struct AttnResMix:
                     attn_res_mix_gpu[
                         dtype,
                         output_tt.LayoutType,
+                        output_tt.Engine,
                         candidates_tt.LayoutType,
+                        candidates_tt.Engine,
                         proj_tt.LayoutType,
+                        proj_tt.Engine,
                         norm_tt.LayoutType,
+                        norm_tt.Engine,
                         c,
                         BLOCK_SIZE,
                     ]

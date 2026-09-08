@@ -66,10 +66,14 @@ from max.pipelines.lib import (
 from max.pipelines.lib.interfaces.batch_processor import (
     modulev3_ragged_kv_symbolic_inputs,
 )
+from max.pipelines.lib.memory_estimation import MemoryPlan
 from max.pipelines.lib.vision_encoder_cache import VisionEncodeResult
 from max.pipelines.weights.quant import parse_quant_config
 from transformers import AutoConfig
 
+from ..deepseekV3_modulev3.layers.quant_ops import (
+    routed_weight_dtype,
+)
 from .batch_processor import KimiK2_5BatchProcessor
 from .context import KimiK2_5TextAndVisionContext
 from .kimi_nvfp4_policy import infer_kimi_nvfp4_weight_flags
@@ -152,6 +156,8 @@ class KimiK2_5Model(
         devices: list[Device],
         kv_cache_config: KVCacheConfig,
         weights: Weights,
+        *,
+        memory_plan: MemoryPlan,
         adapter: WeightsAdapter | None = None,
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
         max_batch_size: int = 1,
@@ -168,9 +174,10 @@ class KimiK2_5Model(
             devices,
             kv_cache_config,
             weights,
-            adapter,
-            return_logits,
+            adapter=adapter,
+            return_logits=return_logits,
             max_batch_size=max_batch_size,
+            memory_plan=memory_plan,
         )
 
         # The base hook is typed loosely (``Callable``); both towers here come
@@ -221,14 +228,6 @@ class KimiK2_5Model(
         )
 
     @classmethod
-    def calculate_max_seq_len(
-        cls, pipeline_config: PipelineConfig, huggingface_config: AutoConfig
-    ) -> int:
-        return KimiK2_5TextConfig.calculate_max_seq_len(
-            pipeline_config, huggingface_config.text_config
-        )
-
-    @classmethod
     def get_num_layers(cls, huggingface_config: AutoConfig) -> int:
         return KimiK2_5Config.get_num_layers(huggingface_config)
 
@@ -264,7 +263,10 @@ class KimiK2_5Model(
         model_config = KimiK2_5Config.initialize_from_config(
             pipeline_config=self.pipeline_config,
             huggingface_config=self.huggingface_config,
-            llm_config=KimiK2_5TextConfig.initialize(self.pipeline_config),
+            max_seq_len=self.max_seq_len,
+            llm_config=KimiK2_5TextConfig.initialize(
+                self.pipeline_config, max_seq_len=self.max_seq_len
+            ),
         )
         llm = model_config.llm_config
 
@@ -282,10 +284,12 @@ class KimiK2_5Model(
             quant_config = parse_quant_config(
                 self.huggingface_config.text_config, state_dict, self.dtype
             )
-            shared_experts_weight_dtype, _ = infer_kimi_nvfp4_weight_flags(
-                state_dict,
-                first_k_dense_replace=llm.first_k_dense_replace,
-                quant_config=quant_config,
+            shared_experts_weight_dtype, dense_mlp_layers_without_quant = (
+                infer_kimi_nvfp4_weight_flags(
+                    state_dict,
+                    first_k_dense_replace=llm.first_k_dense_replace,
+                    quant_config=quant_config,
+                )
             )
             if (
                 quant_config is not None
@@ -295,6 +299,7 @@ class KimiK2_5Model(
                     quant_config,
                     shared_experts_weight_dtype=shared_experts_weight_dtype,
                 )
+            llm.dense_mlp_layers_without_quant = dense_mlp_layers_without_quant
         llm.quant_config = quant_config
         # Kimi K2.5 keeps the entire attention block (including o_proj) in bf16
         # (the checkpoint's modelopt ``ignore`` list covers all ``self_attn``),
@@ -302,8 +307,7 @@ class KimiK2_5Model(
         llm.mla_o_proj_quantized = False
 
         llm.max_batch_context_length = (
-            self.pipeline_config.runtime.max_batch_total_tokens
-            or llm.max_batch_context_length
+            self.planned_max_batch_total_tokens or llm.max_batch_context_length
         )
 
         if llm.topk_method == "noaux_tc":
@@ -355,6 +359,13 @@ class KimiK2_5Model(
         quantized_dispatch = quant_config is not None and (
             self.dtype.is_float8() or quant_config.is_nvfp4
         )
+        fused_shared_expert = llm.n_shared_experts == 1
+        if quant_config is not None:
+            fused_shared_expert = fused_shared_expert and (
+                quant_config.shared_experts_use_quant(
+                    routed_weight_dtype(quant_config)
+                )
+            )
         ep_config = EPConfig(
             dispatch_dtype=(
                 self.dtype if quantized_dispatch else DType.bfloat16
@@ -374,7 +385,7 @@ class KimiK2_5Model(
             ),
             n_gpus_per_node=n_devices,
             n_nodes=ep_size // n_devices,
-            fused_shared_expert=llm.n_shared_experts == 1,
+            fused_shared_expert=fused_shared_expert,
             use_allreduce=self.pipeline_config.runtime.ep_use_allreduce,
         )
         llm.ep_config = ep_config

@@ -227,6 +227,126 @@ SERVE_METRICS: dict[str, SupportedInstruments] = {
         unit="ms",
         description="Distribution of batch execution time",
     ),  # type: ignore
+    "maxserve.di.decode_admission_queue_wait_time": _meter.create_histogram(
+        "maxserve.di.decode_admission_queue_wait_time",
+        unit="ms",
+        description=(
+            "Decode-local time a request spends in decode's own admission "
+            "queue (self.pending_reqs) before being admitted into the "
+            "in-flight set and dispatched to prefill. Decode-clock only, "
+            "single process. Added after the dispatch-latency breakdown "
+            "(di.dispatch_rtt/prefill_span/reply_rtt) showed the "
+            "decode-prefill pipeline staying flat while TTFT still grew "
+            "sharply past mc=40 -- this covers the one remaining segment "
+            "upstream of dispatch that had no wait-time instrumentation."
+        ),
+    ),  # type: ignore
+    "maxserve.di.decode_send_time": _meter.create_histogram(
+        "maxserve.di.decode_send_time",
+        unit="ms",
+        description=(
+            "Decode-side time to build and send a PrefillRequest (struct "
+            "construction, msgspec serialization, ZMQ enqueue). Decode-local; "
+            "does not include network transit. Part of the DI dispatch "
+            "latency breakdown."
+        ),
+    ),  # type: ignore
+    "maxserve.di.dispatch_rtt": _meter.create_histogram(
+        "maxserve.di.dispatch_rtt",
+        unit="ms",
+        description=(
+            "Decode-clock round trip from sending a PrefillRequest to "
+            "receiving prefill's 'arrived' ack ping. Covers the outbound ZMQ "
+            "hop, prefill's negligible ack-send overhead, and the ack's "
+            "return hop combined -- a one-way network leg is not measurable "
+            "without synchronized clocks, so this is reported as a round "
+            "trip rather than split. Part of the DI dispatch latency "
+            "breakdown."
+        ),
+    ),  # type: ignore
+    "maxserve.di.prefill_span": _meter.create_histogram(
+        "maxserve.di.prefill_span",
+        unit="ms",
+        description=(
+            "Decode-clock time between prefill's 'arrived' and 'ce_done' "
+            "ack pings for a request: prefill's queue wait + CE execution + "
+            "the second ping's return hop. Cross-check this against "
+            "'maxserve.di.prefill_queue_wait_time' + "
+            "'maxserve.batch_execution_time' (batch_type=CE), which measure "
+            "the same work on prefill's own clock without the ping transit. "
+            "Part of the DI dispatch latency breakdown."
+        ),
+    ),  # type: ignore
+    "maxserve.di.reply_rtt": _meter.create_histogram(
+        "maxserve.di.reply_rtt",
+        unit="ms",
+        description=(
+            "Decode-clock time from prefill's 'ce_done' ack ping to the "
+            "real PrefillResponse arriving: KV-transfer initiation, reply "
+            "construction/serialization on prefill, and its network transit. "
+            "Part of the DI dispatch latency breakdown."
+        ),
+    ),  # type: ignore
+    "maxserve.di.prefill_queue_wait_time": _meter.create_histogram(
+        "maxserve.di.prefill_queue_wait_time",
+        unit="ms",
+        description=(
+            "Prefill-local time a request spends enqueued before its first "
+            "CE batch executes. Prefill-clock only, single process -- tests "
+            "whether TTFT growth at high concurrency is queue saturation "
+            "rather than dispatch/network overhead."
+        ),
+    ),  # type: ignore
+    "maxserve.di.decode_postprocess_time": _meter.create_histogram(
+        "maxserve.di.decode_postprocess_time",
+        unit="ms",
+        description=(
+            "Decode-local time from receiving a PrefillResponse to handing "
+            "the result off to the response queue. Decode-clock only; does "
+            "not include the API-process hop after the response queue (see "
+            "'maxserve.response_queue_time' for the API-side tail). Part of "
+            "the DI dispatch latency breakdown."
+        ),
+    ),  # type: ignore
+    "maxserve.di.early_sync_time": _meter.create_histogram(
+        "maxserve.di.early_sync_time",
+        unit="ms",
+        description=(
+            "Duration of the early-sync guard's blocking commit of the "
+            "previous batch's structured-output FSM state, when it fired "
+            "(see '_should_early_sync_prev_batch')."
+        ),
+    ),  # type: ignore
+    "maxserve.di.ce_preempted_tg_iteration_count": _meter.create_counter(
+        "maxserve.di.ce_preempted_tg_iteration_count",
+        description=(
+            "Counter: incremented once per scheduling iteration in which a "
+            "CE batch was admitted while TG requests were pending, so those "
+            "TG requests got zero progress this iteration -- how often this "
+            "preemption pattern occurs."
+        ),
+    ),  # type: ignore
+    "maxserve.di.ce_preempted_tg_pending_count": _meter.create_histogram(
+        "maxserve.di.ce_preempted_tg_pending_count",
+        description=(
+            "Histogram: the number of TG requests pending at the moment of "
+            "one such preemption (paired with "
+            "'maxserve.di.ce_preempted_tg_iteration_count', which counts how "
+            "often it happens; this measures how large each occurrence is)."
+        ),
+    ),  # type: ignore
+    "maxserve.di.handoff_to_first_token_time": _meter.create_histogram(
+        "maxserve.di.handoff_to_first_token_time",
+        unit="ms",
+        description=(
+            "Wall-clock time from a prefill-to-decode handoff landing (its "
+            "token discarded, re-queued as a one-token chunked-CE "
+            "continuation) to decode's own re-forward actually sending "
+            "token 1 to the API process. A TTFT contribution specific to "
+            "the handoff path; the ordinary path's token already arrives "
+            "with the 'PrefillResponse', so it has no equivalent wait."
+        ),
+    ),  # type: ignore
     "maxserve.cache.num_used_blocks": _meter.create_gauge(
         "maxserve.cache.num_used_blocks",
         unit="blocks",
@@ -257,7 +377,12 @@ SERVE_METRICS: dict[str, SupportedInstruments] = {
         unit="tokens",
         description=(
             "Cumulative KV cache hit tokens across all CE batches "
-            "(prompt tokens served from prefix cache)."
+            "(prompt tokens served from prefix cache). Tagged with the tier "
+            "that served each token: g0 for the on-device prefix cache, "
+            "external for the KV connector. The tiers sum to the untagged "
+            "total. g0 includes cross-replica device-to-device copies, and "
+            "counts first admissions only, so it does not match "
+            "maxserve.cache.device_blocks_served scaled by the page size."
         ),
     ),  # type: ignore
     "maxserve.cache.misses": _meter.create_counter(
@@ -297,6 +422,11 @@ SERVE_METRICS: dict[str, SupportedInstruments] = {
         "maxserve.dkv.rpc_read_latency",
         unit="ms",
         description="dKV read_blocks RPC latency",
+    ),  # type: ignore
+    "maxserve.dkv.read_blocks": _meter.create_counter(
+        "maxserve.dkv.read_blocks",
+        unit="blocks",
+        description="Cache blocks LANDED in device memory from the dKV tier, over both the remote NIXL path and same-host device copies. Only confirmed-complete transfers count, so this is delivered reuse and not an upper bound on it: blocks dKV holds but cannot serve as a contiguous prefix are dropped before a transfer is ever built, and never reach this counter. For any load that lands it is proportional to maxserve.cache.hits{tier=external}; a persistent shortfall means transfers are failing.",
     ),  # type: ignore
     "maxserve.dkv.connected_clients": _meter.create_gauge(
         "maxserve.dkv.connected_clients",
@@ -407,7 +537,7 @@ SERVE_METRICS: dict[str, SupportedInstruments] = {
     "maxserve.cache.used_host_kv_pct": _meter.create_histogram(
         "maxserve.cache.used_host_kv_pct",
         unit="percent",
-        description="Percentage of host KV cache blocks in use (0-100%), sampled once per scheduler batch when host paging is enabled.",
+        description="Percentage of the host KV tier's bytes in use (0-100%), sampled once per scheduler batch when host paging is enabled.",
     ),  # type: ignore
     "maxserve.cache.device_blocks_served": _meter.create_counter(
         "maxserve.cache.device_blocks_served",
@@ -418,10 +548,13 @@ SERVE_METRICS: dict[str, SupportedInstruments] = {
             "copy needed."
         ),
     ),  # type: ignore
-    "maxserve.cache.h2d_blocks_copied": _meter.create_counter(
-        "maxserve.cache.h2d_blocks_copied",
-        unit="blocks",
-        description="Cumulative host->device KV block copies.",
+    "maxserve.cache.h2d_bytes_copied": _meter.create_counter(
+        "maxserve.cache.h2d_bytes_copied",
+        unit="bytes",
+        description=(
+            "Cumulative KV bytes copied from the connector's host tier to "
+            "device. Rate this to see the PCIe bandwidth host paging consumes."
+        ),
     ),  # type: ignore
     "maxserve.cache.cross_replica_blocks_copied": _meter.create_counter(
         "maxserve.cache.cross_replica_blocks_copied",
@@ -441,20 +574,23 @@ SERVE_METRICS: dict[str, SupportedInstruments] = {
             "bandwidth consumed by cross-replica prefix reuse."
         ),
     ),  # type: ignore
-    "maxserve.cache.d2h_blocks_copied": _meter.create_counter(
-        "maxserve.cache.d2h_blocks_copied",
-        unit="blocks",
-        description="Cumulative device->host KV block copies.",
+    "maxserve.cache.d2h_bytes_copied": _meter.create_counter(
+        "maxserve.cache.d2h_bytes_copied",
+        unit="bytes",
+        description=(
+            "Cumulative KV bytes copied from device to the connector's host "
+            "tier."
+        ),
     ),  # type: ignore
-    "maxserve.cache.disk_blocks_read": _meter.create_counter(
-        "maxserve.cache.disk_blocks_read",
-        unit="blocks",
-        description="Cumulative KV blocks read from the disk cache tier.",
+    "maxserve.cache.disk_bytes_read": _meter.create_counter(
+        "maxserve.cache.disk_bytes_read",
+        unit="bytes",
+        description="Cumulative KV bytes read from the disk cache tier.",
     ),  # type: ignore
-    "maxserve.cache.disk_blocks_written": _meter.create_counter(
-        "maxserve.cache.disk_blocks_written",
-        unit="blocks",
-        description="Cumulative KV blocks written to the disk cache tier.",
+    "maxserve.cache.disk_bytes_written": _meter.create_counter(
+        "maxserve.cache.disk_bytes_written",
+        unit="bytes",
+        description="Cumulative KV bytes written to the disk cache tier.",
     ),  # type: ignore
     "maxserve.spec_decode.avg_acceptance_length": _meter.create_histogram(
         "maxserve.spec_decode.avg_acceptance_length",
@@ -474,7 +610,7 @@ SERVE_METRICS: dict[str, SupportedInstruments] = {
     "maxserve.cache.used_disk_kv_pct": _meter.create_histogram(
         "maxserve.cache.used_disk_kv_pct",
         unit="percent",
-        description="Percentage of disk KV cache blocks in use (0-100%), sampled once per scheduler batch when disk paging is enabled.",
+        description="Percentage of the disk KV tier's bytes in use (0-100%), sampled once per scheduler batch when disk paging is enabled.",
     ),  # type: ignore
     "maxserve.vision.images_encoded": _meter.create_counter(
         "maxserve.vision.images_encoded",
@@ -537,6 +673,18 @@ SERVE_METRICS: dict[str, SupportedInstruments] = {
             "Count of structured-output requests rejected at admission "
             "(HTTP 400) because the active grammar backend could not compile "
             "the schema, split by the 'kind' tag (tool_grammar, json_schema)."
+        ),
+    ),  # type: ignore
+    "maxserve.structured_output.grammar_build_time": _meter.create_histogram(
+        "maxserve.structured_output.grammar_build_time",
+        unit="ms",
+        description=(
+            "Wall-clock time of an off-thread grammar-matcher build in "
+            "AsyncGrammarGate, from the start of the backend's compile/create "
+            "call to its completion. For a DI handoff, this build overlaps "
+            "prefill's round trip when submitted at admission time; a build "
+            "that outlasts that round trip can still gate the handoff's "
+            "chunked-CE continuation."
         ),
     ),  # type: ignore
     "maxserve.response_format.conformance_errors": _meter.create_counter(
@@ -997,6 +1145,114 @@ class _AsyncMetrics:
             ),
         )
 
+    def di_decode_admission_queue_wait_time(self, ms: float) -> None:
+        """Decode-local wait in decode's own admission queue before dispatch."""
+        self.client.send_measurement(
+            MaxMeasurement(
+                "maxserve.di.decode_admission_queue_wait_time",
+                ms,
+                self.extra_attributes,
+            ),
+        )
+
+    def di_decode_send_time(self, ms: float) -> None:
+        """Decode-side PrefillRequest build+serialize+send duration."""
+        self.client.send_measurement(
+            MaxMeasurement(
+                "maxserve.di.decode_send_time", ms, self.extra_attributes
+            ),
+        )
+
+    def di_dispatch_rtt(self, ms: float) -> None:
+        """Decode-clock round trip to prefill's 'arrived' ack ping."""
+        self.client.send_measurement(
+            MaxMeasurement(
+                "maxserve.di.dispatch_rtt", ms, self.extra_attributes
+            ),
+        )
+
+    def di_prefill_span(self, ms: float) -> None:
+        """Decode-clock span between prefill's 'arrived' and 'ce_done' pings."""
+        self.client.send_measurement(
+            MaxMeasurement(
+                "maxserve.di.prefill_span", ms, self.extra_attributes
+            ),
+        )
+
+    def di_reply_rtt(self, ms: float) -> None:
+        """Decode-clock span from the 'ce_done' ping to the real reply."""
+        self.client.send_measurement(
+            MaxMeasurement("maxserve.di.reply_rtt", ms, self.extra_attributes),
+        )
+
+    def di_prefill_queue_wait_time(self, ms: float) -> None:
+        """Prefill-local queue wait before a request's first CE batch."""
+        self.client.send_measurement(
+            MaxMeasurement(
+                "maxserve.di.prefill_queue_wait_time",
+                ms,
+                self.extra_attributes,
+            ),
+        )
+
+    def di_decode_postprocess_time(self, ms: float) -> None:
+        """Decode-local time from PrefillResponse receipt to response queue."""
+        self.client.send_measurement(
+            MaxMeasurement(
+                "maxserve.di.decode_postprocess_time",
+                ms,
+                self.extra_attributes,
+            ),
+        )
+
+    def di_early_sync_time(self, ms: float) -> None:
+        """Duration of the early-sync guard's blocking commit of the
+        previous batch's structured-output FSM state, when it fired (see
+        ``_should_early_sync_prev_batch``)."""
+        self.client.send_measurement(
+            MaxMeasurement(
+                "maxserve.di.early_sync_time", ms, self.extra_attributes
+            ),
+        )
+
+    def di_ce_preempted_tg_iteration_count(self) -> None:
+        """Counter: how often a CE batch admits work while TG requests are
+        pending, giving those TG requests zero progress that iteration."""
+        self.client.send_measurement(
+            MaxMeasurement(
+                "maxserve.di.ce_preempted_tg_iteration_count",
+                1,
+                self.extra_attributes,
+            ),
+        )
+
+    def di_ce_preempted_tg_pending_count(self, count: int) -> None:
+        """Histogram: how large each such preemption was -- the number of TG
+        requests pending at the moment (paired with
+        ``di_ce_preempted_tg_iteration_count``, which counts how often)."""
+        self.client.send_measurement(
+            MaxMeasurement(
+                "maxserve.di.ce_preempted_tg_pending_count",
+                count,
+                self.extra_attributes,
+            ),
+        )
+
+    def di_handoff_to_first_token_time(self, ms: float) -> None:
+        """Wall-clock time from a prefill-to-decode handoff landing (its
+        token discarded, re-queued as a one-token chunked-CE continuation)
+        to decode's own re-forward actually sending token 1 to the API
+        process. A TTFT contribution specific to the handoff path; the
+        ordinary path's token already arrives with the ``PrefillResponse``,
+        so it has no equivalent wait."""
+        self.client.send_measurement(
+            MaxMeasurement(
+                "maxserve.di.handoff_to_first_token_time",
+                ms,
+                self.extra_attributes,
+            ),
+        )
+
     def cache_num_used_blocks(self, num_used_blocks: int) -> None:
         self.client.send_measurement(
             MaxMeasurement(
@@ -1024,9 +1280,26 @@ class _AsyncMetrics:
             ),
         )
 
-    def cache_hits(self, hits: int) -> None:
+    def cache_hits(self, hits: int, *, tier: str) -> None:
+        """Records prefix-cache hit tokens served by ``tier``.
+
+        Args:
+            hits: Prompt tokens served from the cache.
+            tier: Which tier served them, one of ``g0`` (device prefix cache) or
+                ``external`` (the KV connector, tier unresolved). Shared with
+                Mach's ``mach.cache.hits`` so one dashboard panel covers both
+                engines; Mach additionally resolves ``g1`` and ``g2``.
+
+        Every hit point carries a ``tier``, so the tiers sum to the counter's
+        untagged total and a query that does not group by ``tier`` reads exactly
+        what it read before the attribute existed.
+        """
         self.client.send_measurement(
-            MaxMeasurement("maxserve.cache.hits", hits, self.extra_attributes),
+            MaxMeasurement(
+                "maxserve.cache.hits",
+                hits,
+                {**self.extra_attributes, "tier": tier},
+            ),
         )
 
     def cache_misses(self, cache_misses: int) -> None:
@@ -1205,6 +1478,15 @@ class _AsyncMetrics:
             ),
         )
 
+    def dkv_read_blocks(self, blocks: int) -> None:
+        self.client.send_measurement(
+            MaxMeasurement(
+                "maxserve.dkv.read_blocks",
+                blocks,
+                self.extra_attributes,
+            ),
+        )
+
     def spec_decode_acceptance_rate_per_position(
         self, position: int, acceptance_rate: float
     ) -> None:
@@ -1346,10 +1628,10 @@ class _AsyncMetrics:
             ),
         )
 
-    def cache_h2d_blocks_copied(self, count: int) -> None:
+    def cache_h2d_bytes_copied(self, count: int) -> None:
         self.client.send_measurement(
             MaxMeasurement(
-                "maxserve.cache.h2d_blocks_copied",
+                "maxserve.cache.h2d_bytes_copied",
                 count,
                 self.extra_attributes,
             ),
@@ -1373,28 +1655,28 @@ class _AsyncMetrics:
             ),
         )
 
-    def cache_d2h_blocks_copied(self, count: int) -> None:
+    def cache_d2h_bytes_copied(self, count: int) -> None:
         self.client.send_measurement(
             MaxMeasurement(
-                "maxserve.cache.d2h_blocks_copied",
+                "maxserve.cache.d2h_bytes_copied",
                 count,
                 self.extra_attributes,
             ),
         )
 
-    def cache_disk_blocks_read(self, count: int) -> None:
+    def cache_disk_bytes_read(self, count: int) -> None:
         self.client.send_measurement(
             MaxMeasurement(
-                "maxserve.cache.disk_blocks_read",
+                "maxserve.cache.disk_bytes_read",
                 count,
                 self.extra_attributes,
             ),
         )
 
-    def cache_disk_blocks_written(self, count: int) -> None:
+    def cache_disk_bytes_written(self, count: int) -> None:
         self.client.send_measurement(
             MaxMeasurement(
-                "maxserve.cache.disk_blocks_written",
+                "maxserve.cache.disk_bytes_written",
                 count,
                 self.extra_attributes,
             ),
@@ -1451,6 +1733,16 @@ class _AsyncMetrics:
                 "maxserve.structured_output.grammar_rejections",
                 1,
                 {**self.extra_attributes, "kind": kind},
+            ),
+        )
+
+    def structured_output_grammar_build_time(self, ms: float) -> None:
+        """Wall-clock time of an off-thread grammar-matcher build."""
+        self.client.send_measurement(
+            MaxMeasurement(
+                "maxserve.structured_output.grammar_build_time",
+                ms,
+                self.extra_attributes,
             ),
         )
 

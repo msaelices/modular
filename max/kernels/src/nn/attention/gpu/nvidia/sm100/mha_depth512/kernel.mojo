@@ -29,14 +29,14 @@ Warp assignment (384 threads = 12 warps, 3 warp groups of 128):
 
 from std.math import align_up, ceildiv, min
 from std.sys import size_of
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     thread_idx,
     warp_id,
 )
-from std.gpu.globals import WARPGROUP_SIZE, WARP_SIZE
+from max.gpu.globals import WARPGROUP_SIZE, WARP_SIZE
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
+from max.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from max.gpu.memory import external_memory, fence_mbarrier_init
 from max.gpu.primitives.cluster import block_rank_in_cluster, cluster_sync
 from max.gpu.compute.arch.tcgen05 import (
@@ -228,7 +228,7 @@ struct SM100MHADepth512[
             Self.MaskType,
             Self.SchedulerType,
             Self.ValidLengthType,
-            NullPointer[DType.float32],  # SinkType (unused for depth512)
+            NullPointer[.float32],  # SinkType (unused for depth512)
             Self.KVRowOffsetsType,
             Self.MaxSeqLenType,
             Self.PartitionType,
@@ -296,9 +296,9 @@ struct SM100MHADepth512[
         # (graph capture) a re-read could observe a stale/pre-alloc slot value
         # -> garbage TMEM base -> invalid `UTCHMMA` operand ->
         # CUDA_ERROR_ILLEGAL_INSTRUCTION. Reading once post-barrier and passing
-        # by register (matches the proven `mha_1q` structure) removes every
-        # in-body slot reload. Value is identical to the old per-warp reads
-        # (same published base), so single-shot is bit-identical.
+        # by register (matches the proven `SM100MHA2Q` FA4 structure) removes
+        # every in-body slot reload. Value is identical to the old per-warp
+        # reads (same published base), so single-shot is bit-identical.
         var tmem_addr: UInt32 = smem.tmem_addr_ptr()[]
 
         # ---- Warp dispatch -----------------------------------------------

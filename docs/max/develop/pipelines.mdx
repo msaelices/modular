@@ -322,14 +322,16 @@ config = PipelineConfig.from_args(
 tokenizer, pipeline = PIPELINE_REGISTRY.retrieve(config)
 
 # Or get a factory for deferred compilation
-tokenizer, pipeline_factory = PIPELINE_REGISTRY.retrieve_factory(config)
-pipeline = pipeline_factory()  # Compile when ready
+retrieved = PIPELINE_REGISTRY.retrieve_factory(config)
+pipeline = retrieved.factory()  # Compile when ready
 ```
 
 In this example, `retrieve()` returns a ready-to-use pipeline, while
-`retrieve_factory()` returns a callable that performs compilation when invoked.
-The factory pattern is useful when you need to pass the pipeline across process
-boundaries, since it avoids serializing the compiled model.
+`retrieve_factory()` returns a `RetrievedPipeline` with the tokenizer, a
+factory that performs compilation when invoked, and the memory plan the
+pipeline was sized against. The factory pattern is useful when you need to
+pass the pipeline across process boundaries, since it avoids serializing the
+compiled model.
 
 ### Supported architecture
 
@@ -469,27 +471,28 @@ pipeline):
 
 #### Delegating input preparation to a batch processor
 
-You can move the batching logic into a
+Every token-generation model needs a batch processor: a
 [`BatchProcessor`](/api/python/generated/max.pipelines.lib.interfaces.BatchProcessor)
-instead of overriding `prepare_initial_token_inputs()` on the model, and
-register it through the `batching` field of
-[`SupportedArchitecture`](/api/python/generated/max.pipelines.lib.registry.SupportedArchitecture).
-At registration, MAX sets the processor as the model's `batch_processor_cls`,
-and the base `PipelineModel.prepare_initial_token_inputs()` delegates to it. For
-ragged batches, subclass
+subclass that builds the tensors for each scheduled batch and parses the model's
+outputs. Register it through the `batching` field of
+[`SupportedArchitecture`](/api/python/generated/max.pipelines.lib.registry.SupportedArchitecture):
+at registration, MAX sets the processor as the model's `batch_processor_cls`,
+and the base `PipelineModel.prepare_initial_token_inputs()` delegates to it. If
+neither the field nor the model class's own `batch_processor_cls` provides a
+processor, preparing the first batch raises `NotImplementedError`. For ragged
+batches, subclass
 [`RaggedBatchProcessor`](/api/python/generated/max.pipelines.lib.interfaces.RaggedBatchProcessor),
 which receives a
 [`BatchProcessorRuntime`](/api/python/generated/max.pipelines.lib.interfaces.BatchProcessorRuntime)
 describing the active devices and KV cache.
 
-Use a batch processor when several architectures share the same batching logic,
-or when you want that logic isolated from the model's graph construction. For
-example, one Llama 3 batch processor backs Llama 3, OLMo, Granite, Qwen 2, and
-Phi-3; see the
+Reuse an existing processor when your model's batching matches a family that MAX
+already supports. One Llama 3 batch processor backs Llama 3, OLMo, Granite, Qwen
+2, and Phi-3, and Qwen 3.5 subclasses it to adjust specific steps; see the
 [`llama3` architecture](https://github.com/modular/modular/tree/main/max/python/max/pipelines/architectures/llama3)
-for a reference implementation. Override `prepare_initial_token_inputs()` on the
-model instead when the batching is specific to one architecture and tightly
-coupled to how it builds inputs.
+for a reference implementation. Create a `batch_processor.py` with your own
+`BatchProcessor` subclass only when your model needs batching logic that no
+existing processor covers.
 
 #### Linking to the architecture config
 
@@ -499,10 +502,13 @@ architecture configuration class. This connection enables the base
 
 The base class delegates the following through `model_config_cls`:
 
-- **Maximum sequence length**: The `calculate_max_seq_len()` method determines
-  the model's sequence length limit. The base class calls
-  `model_config_cls.calculate_max_seq_len()` or initializes the config and
-  calls `get_max_seq_len()`.
+- **Maximum sequence length**: The architecture config's
+  `calculate_max_seq_len()` classmethod is the architecture's sequence-length
+  policy (whether the checkpoint bound is a hard cap or a default).
+  `PipelineConfig.from_args()` runs it once at construction, so
+  `config.model.max_length` carries the resolved value; the pipeline model
+  reads that value (or the memory plan's clamped one) rather than deriving
+  its own.
 
 - **KV cache parameters**: The `get_kv_params()` method constructs the KV cache
   configuration. The base class calls `model_config_cls.construct_kv_params()`
@@ -513,7 +519,8 @@ The base class delegates the following through `model_config_cls`:
   tree instead, which the cache manager consumes through the shared
   [`KVCacheParamInterface`](/api/python/generated/max.nn.kv_cache.KVCacheParamInterface/).
 
-You can override `calculate_max_seq_len()` or `get_kv_params()` if needed.
+You can override `calculate_max_seq_len()` (on the architecture config) or
+`get_kv_params()` if needed.
 
 ### When to customize `ModelInputs`
 

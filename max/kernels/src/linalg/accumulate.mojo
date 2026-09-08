@@ -229,15 +229,11 @@ struct _Accumulator[
             var transfer_count = min(
                 c_bound[1] - tile_n_idx, Self.num_cols * Self.simd_width
             )
-            var row_ptrs = Array[
-                UnsafePointer[Scalar[Self.dtype], AnyOrigin[mut=c_ptr.mut]],
-                Self.num_rows,
-            ](uninitialized=True)
-
-            comptime for row in range(Self.num_rows):
-                row_ptrs[row] = (
-                    c_ptr_loc + row * c_stride
-                ).as_unsafe_any_origin()
+            var row_ptrs = Array[_, Self.num_rows](
+                fill_with=lambda (row: Int) -> UnsafePointer[
+                    Scalar[Self.dtype], AnyOrigin[mut=c_ptr.mut]
+                ]: (c_ptr_loc + row * c_stride).as_unsafe_any_origin()
+            )
 
             self._transfer_loop[0, is_load](
                 transfer_count, row_ptrs.unsafe_ptr(), c_stride
@@ -571,7 +567,7 @@ struct _Accumulator[
         mut self,
         length: Int,
         a: UnsafePointer[mut=False, Scalar[a_type], ...],
-        a_base_offsets: TileTensor[mut=False, DType.int32, ...],
+        a_base_offsets: TileTensor[mut=False, .int32, ...],
         a_offset: Int,
         b: UnsafePointer[mut=False, Scalar[b_type], ...],
         b_stride: Int,
@@ -747,7 +743,7 @@ struct _Accumulator[
         mut self,
         length: Int,
         a: UnsafePointer[mut=False, Scalar[a_type], ...],
-        a_base_offsets: TileTensor[mut=False, DType.int32, ...],
+        a_base_offsets: TileTensor[mut=False, .int32, ...],
         a_offset: Int,
         b: UnsafePointer[mut=False, Scalar[b_type], ...],
         b_stride: Int,
@@ -903,7 +899,7 @@ struct _Accumulator[
         mut self,
         length: Int,
         a: UnsafePointer[mut=False, Scalar[a_type], ...],
-        a_base_offsets: TileTensor[mut=False, DType.int32, ...],
+        a_base_offsets: TileTensor[mut=False, .int32, ...],
         a_offset: Int,
         b: UnsafePointer[mut=False, Scalar[b_type], ...],
         b_stride: Int,

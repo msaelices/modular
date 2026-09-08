@@ -43,7 +43,7 @@ from std.math import ceildiv
 from std.memory import Pointer
 from std.sys import size_of
 
-from std.gpu import WARP_SIZE
+from max.gpu import WARP_SIZE
 from max.gpu.primitives.cluster import (
     cluster_sync,
     elect_one_sync,
@@ -930,8 +930,8 @@ struct BlackwellBlockScaledMatmulKernel[
 
         # ===== Shared Memory Setup (structured pattern with typed accessors) =====
         ref smem = external_memory[
-            Scalar[DType.uint8],
-            address_space=AddressSpace.SHARED,
+            UInt8,
+            address_space=.SHARED,
             alignment=128,
         ]().bitcast[Self.SmemType]()[]
 

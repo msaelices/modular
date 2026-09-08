@@ -20,7 +20,7 @@ consecutive elements.
 """
 
 from std.math import ceildiv
-from std.gpu import block_idx, thread_idx, grid_dim, block_dim
+from max.gpu import block_idx, thread_idx, grid_dim, block_dim
 from max.gpu.host import DeviceContext
 from max.gpu.host.info import GPUInfo
 from std.sys.info import _accelerator_arch
@@ -30,8 +30,8 @@ from max.gpu.primitives.grid_controls import (
     pdl_launch_attributes,
 )
 from std.utils import StaticTuple
-from std.gpu import MAX_THREADS_PER_BLOCK_METADATA
-from layout import TensorStorage, TileTensor
+from max.gpu import MAX_THREADS_PER_BLOCK_METADATA
+from layout import TensorEngine, TileTensor
 from layout.coord import Coord
 from layout.tile_layout import TensorLayout
 
@@ -57,16 +57,22 @@ def _dequant_mxfp6_kernel[
     output_layout: TensorLayout,
     scales_layout: TensorLayout,
     input_layout: TensorLayout,
-    output_storage: TensorStorage,
-    scales_storage: TensorStorage,
-    input_storage: TensorStorage,
+    output_engine: TensorEngine,
+    scales_engine: TensorEngine,
+    input_engine: TensorEngine,
     *,
     fmt: FP6Format,
     SF_VECTOR_SIZE: Int = 32,
 ](
-    output: TileTensor[out_dtype, output_layout, MutAnyOrigin],
-    input: TileTensor[in_dtype, input_layout, MutAnyOrigin],
-    scales: TileTensor[scales_dtype, scales_layout, MutAnyOrigin],
+    output: TileTensor[
+        out_dtype, output_layout, MutAnyOrigin, Engine=output_engine
+    ],
+    input: TileTensor[
+        in_dtype, input_layout, MutAnyOrigin, Engine=input_engine
+    ],
+    scales: TileTensor[
+        scales_dtype, scales_layout, MutAnyOrigin, Engine=scales_engine
+    ],
     num_rows: Int32,
     num_cols: Int32,
 ):
@@ -77,6 +83,9 @@ def _dequant_mxfp6_kernel[
     comptime assert output.flat_rank >= 2
     comptime assert input.flat_rank >= 2
     comptime assert scales.flat_rank >= 2
+    comptime assert output.element_size == 1
+    comptime assert input.element_size == 1
+    comptime assert scales.element_size == 1
 
     with PDL():
         for global_row_idx in range(block_idx.x, _num_rows, grid_dim.x):
@@ -91,11 +100,11 @@ def _dequant_mxfp6_kernel[
                     continue
 
                 var packed_byte_col = (global_col_idx * 6) // 8
-                var fragment = SIMD[DType.uint8, 32](0)
+                var fragment = SIMD[.uint8, 32](0)
 
                 comptime for chunk in range(BYTES_PER_THREAD // 8):
                     fragment = fragment.insert[offset=chunk * 8](
-                        rebind[SIMD[DType.uint8, 8]](
+                        rebind[SIMD[.uint8, 8]](
                             input.load[8](
                                 Coord(
                                     global_row_idx, packed_byte_col + chunk * 8
@@ -112,7 +121,7 @@ def _dequant_mxfp6_kernel[
                 var scale_e8m0 = rebind[Scalar[scales_dtype]](
                     scales.load(Coord(global_row_idx, scale_col))
                 )
-                var scale_f32 = scale_e8m0.cast[DType.float32]()
+                var scale_f32 = scale_e8m0.cast[.float32]()
 
                 output.store[width=ELEMENTS_PER_THREAD](
                     Coord(global_row_idx, global_col_idx),
@@ -159,9 +168,9 @@ def dequant_mxfp6[
         DType.bfloat16,
     ), "output must be float8_e4m3fn or bfloat16"
     comptime assert (
-        scales_dtype == DType.float8_e8m0fnu
+        scales_dtype == .float8_e8m0fnu
     ), "scales must be float8_e8m0fnu"
-    comptime assert in_dtype == DType.uint8, "input must be uint8 (packed FP6)"
+    comptime assert in_dtype == .uint8, "input must be uint8 (packed FP6)"
     comptime assert (
         SF_VECTOR_SIZE == MXFP6_SF_VECTOR_SIZE
     ), "SF_VECTOR_SIZE must be 32 for MXFP6"
@@ -190,7 +199,7 @@ def dequant_mxfp6[
             in_dtype,
             type_of(input).LayoutType,
             MutAnyOrigin,
-            Storage=type_of(input).Storage,
+            Engine=type_of(input).Engine,
         ]
     ](input)
     var scales_tt = rebind[
@@ -198,7 +207,7 @@ def dequant_mxfp6[
             scales_dtype,
             type_of(scales).LayoutType,
             MutAnyOrigin,
-            Storage=type_of(scales).Storage,
+            Engine=type_of(scales).Engine,
         ]
     ](scales)
 
@@ -209,9 +218,9 @@ def dequant_mxfp6[
         type_of(output).LayoutType,
         type_of(scales_tt).LayoutType,
         type_of(input_tt).LayoutType,
-        type_of(output).Storage,
-        type_of(scales_tt).Storage,
-        type_of(input_tt).Storage,
+        type_of(output).Engine,
+        type_of(scales_tt).Engine,
+        type_of(input_tt).Engine,
         fmt=fmt,
         SF_VECTOR_SIZE=SF_VECTOR_SIZE,
     ]
