@@ -26,21 +26,20 @@ from max.graph import (
     Weight,
     ops,
 )
+from max.nn.kernels import moe_sink_gate_router
 from max.nn.layer import LayerList
-from max.nn.moe import MoE, MoEGate, MoEQuantized
+from max.nn.moe import MoEGate, MoEQuantized
 from max.nn.quant_config import fp4_packed_k
 from typing_extensions import Self
 
 _ROUTER_DTYPE = DType.float32
 
 
-def _log_sigmoid(x: TensorValue) -> TensorValue:
-    zero = ops.constant(0.0, x.dtype, device=x.device)
-    return ops.min(x, zero) - ops.log1p(ops.exp(-ops.abs(x)))
-
-
 class InklingRouting(NamedTuple):
-    """One token batch's routing decision, including the sink weights."""
+    """One token batch's routing decision, including the sink weights.
+
+    Sinks are shared experts the router weights, not attention sinks.
+    """
 
     expert_ids: TensorValue
     expert_weights: TensorValue
@@ -107,45 +106,21 @@ class InklingGate(MoEGate):
         weight = ops.cast(self.weight, hidden_states.dtype).to(device)
         logits = ops.cast(hidden_states @ weight.T, _ROUTER_DTYPE)
 
-        routed = logits[:, : self.n_routed_experts]
-        _, expert_ids = ops.top_k(
-            ops.sigmoid(routed) + self.bias.to(device),
-            k=self.num_experts_per_token,
-            axis=-1,
-        )
-
-        # Weights renormalize the raw logits: the selection bias must not
-        # leak into them.
-        selected = ops.gather_nd(
-            routed, ops.unsqueeze(expert_ids, axis=-1), batch_dims=1
-        )
-        sinks = logits[:, self.n_routed_experts :]
-
-        # Softmax over log-sigmoids = sigmoid(z_i) / sum_j sigmoid(z_j),
-        # stable where the sigmoids themselves would underflow.
-        selected_log = _log_sigmoid(selected)
-        sinks_log = _log_sigmoid(sinks)
-        shift = ops.max(
-            ops.max(selected_log, axis=-1), ops.max(sinks_log, axis=-1)
-        )
-        selected_exp = ops.exp(selected_log - shift)
-        sinks_exp = ops.exp(sinks_log - shift)
-        factor = (
-            ops.constant(self.route_scale, _ROUTER_DTYPE, device=device)
-            * self.global_scale.to(device)
-        ) / (ops.sum(selected_exp, axis=-1) + ops.sum(sinks_exp, axis=-1))
         return InklingRouting(
-            expert_ids=expert_ids,
-            expert_weights=selected_exp * factor,
-            sink_weights=sinks_exp * factor,
+            *moe_sink_gate_router(
+                logits,
+                self.bias.to(device),
+                self.global_scale.to(device),
+                n_routed_experts=self.n_routed_experts,
+                n_experts_per_tok=self.num_experts_per_token,
+                n_shared_experts=self.n_shared_experts,
+                route_scale=self.route_scale,
+            )
         )
 
-    @property
-    def sharding_strategy(self) -> ShardingStrategy | None:
-        return self._sharding_strategy
-
-    @sharding_strategy.setter
-    def sharding_strategy(self, strategy: ShardingStrategy) -> None:
+    def _set_sharding_strategy(self, strategy: ShardingStrategy) -> None:
+        # Deliberately no super() call: this gate skips MoEGate's gate_score
+        # Linear, which the base implementation would try to shard.
         if not strategy.is_replicate:
             raise ValueError(
                 "Only replicate sharding strategy is supported for InklingGate."
@@ -305,23 +280,14 @@ class InklingMoE(MoEQuantized):
             }
         return axes
 
-    @property
-    def sharding_strategy(self) -> ShardingStrategy | None:
-        return self._sharding_strategy
-
-    @sharding_strategy.setter
-    def sharding_strategy(self, strategy: ShardingStrategy) -> None:
+    def _set_sharding_strategy(self, strategy: ShardingStrategy) -> None:
         """Splits the expert intermediate: an equal split of ``w13``'s
         interleaved output axis keeps each rank's gate/up rows paired."""
         if not strategy.is_tensor_parallel:
             raise ValueError(
                 "Only tensor parallel sharding is supported for InklingMoE."
             )
-        # Class-dict lookup: attribute access would run the getter, not
-        # yield the property.
-        base_property: property = MoE.__dict__["sharding_strategy"]
-        assert base_property.fset is not None
-        base_property.fset(self, strategy)
+        super()._set_sharding_strategy(strategy)
         for name, axis in self._routed_weight_axes().items():
             weight: Weight = getattr(self, name)
             weight.sharding_strategy = (
@@ -371,15 +337,26 @@ class InklingMoE(MoEQuantized):
         """Runs every sink expert on every token, weighted by its gate value,
         applied to the intermediate as the reference fuses it."""
         mlp = self.shared_experts
-        hidden = ops.silu(mlp.gate_proj(x)) * mlp.up_proj(x)
+        ffl = mlp.gate_proj.weight.shape[0]
+        gate_up = ops.concat((mlp.gate_proj.weight, mlp.up_proj.weight))
+        gate, up = ops.split(x @ gate_up.T, [ffl, ffl], axis=-1)
+        hidden = ops.silu(gate) * up
         sinks_here = self._sink_ids_on_this_shard()
         if len(sinks_here) != int(sink_weights.shape[1]):
             # A TP shard sees only the sinks its column range falls in.
             sink_weights = sink_weights[:, sinks_here.start : sinks_here.stop]
-        weighted = ops.reshape(
-            hidden, [hidden.shape[0], len(sinks_here), -1]
-        ) * ops.unsqueeze(ops.cast(sink_weights, hidden.dtype), axis=-1)
-        return mlp.down_proj(ops.reshape(weighted, hidden.shape))
+        weights = ops.cast(sink_weights, hidden.dtype)
+        if len(sinks_here) == 1:
+            # Rank-2 saves a kernel launch here: the rank-3 reshape stops
+            # folding once the intermediate comes from split slices.
+            weighted = hidden * weights
+        else:
+            weighted = ops.reshape(
+                ops.reshape(hidden, [hidden.shape[0], len(sinks_here), -1])
+                * ops.unsqueeze(weights, axis=-1),
+                hidden.shape,
+            )
+        return mlp.down_proj(weighted)
 
     def _sink_ids_on_this_shard(self) -> range:
         """Which sink experts this shard's intermediate columns belong to."""

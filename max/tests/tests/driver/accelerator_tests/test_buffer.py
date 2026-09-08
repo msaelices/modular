@@ -19,7 +19,8 @@ from max.driver import (
     Accelerator,
     Buffer,
     DevicePinnedBuffer,
-    DeviceStream,
+    DeviceQueue,
+    Usage,
     accelerator_api,
     batch_inplace_copy,
 )
@@ -291,14 +292,17 @@ def test_zero_copy_on_to_stream_on_same_device(is_pinned: bool) -> None:
     gpu = Accelerator()
     data = np.arange(24).reshape(2, 3, 4).astype(np.int32)
     tensor = Buffer(
-        shape=data.shape, dtype=DType.int32, device=gpu, pinned=is_pinned
+        shape=data.shape,
+        dtype=DType.int32,
+        device=gpu,
+        usage=Usage.STAGING if is_pinned else Usage.DEFAULT,
     )
     tensor.inplace_copy_from(Buffer.from_numpy(data))
     stream1 = tensor.stream
     tensor1 = tensor.to(stream1)
     assert tensor1 is tensor
     assert tensor1.stream is stream1
-    stream2 = DeviceStream(gpu)
+    stream2 = DeviceQueue(gpu)
     assert stream2 != stream1
     tensor2 = tensor.to(stream2)
     assert tensor2 is not tensor

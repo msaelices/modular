@@ -48,10 +48,11 @@ from layout.tma_async import (
     TMATensorTile,
     _gather4_box_width,
     create_split_tma,
+    create_tensor_tile,
     create_tma_tile_gather4,
 )
 from layout.tile_layout import RowMajorLayout, Layout as InternalLayout
-from layout.coord import DynamicCoord
+from layout.coord import Coord, DynamicCoord, Idx
 
 from std.collections import OptionalReg
 from std.utils import Index, IndexList
@@ -60,7 +61,7 @@ from std.sys import size_of
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.math import ceildiv
 
-from std.gpu import thread_idx
+from max.gpu import thread_idx
 
 
 @always_inline
@@ -79,6 +80,87 @@ def swizzle_granularity[dtype: DType, swizzle_mode: TensorMapSwizzle]() -> Int:
     """
     comptime sg = swizzle_mode.bytes() // size_of[dtype]()
     return sg
+
+
+@always_inline
+def scale_align_elems[dtype: DType]() -> Int:
+    """Scales per 16-byte unit, and so the granularity a flat scale TMA may
+    START a copy at.
+
+    A TMA's global start address must be 16-byte aligned. In a flat `1 x N`
+    scale view a key index IS the innermost coordinate, so that requirement
+    lands on the key index itself -- unlike a K tile, whose row is a whole
+    `depth`-wide key and is therefore always aligned.
+
+    Parameters:
+        dtype: Scale element type.
+
+    Returns:
+        Number of scales per 16-byte unit.
+    """
+    return 16 // size_of[Scalar[dtype]]()
+
+
+@always_inline
+def flat_scale_window[dtype: DType, TILE: Int]() -> Int:
+    """Scales a flat scale TMA box STAGES for a `TILE`-key tile.
+
+    One alignment unit wider than the tile, because a caller whose tile base is
+    not 16-byte aligned rounds it down and skips the residual. One unit
+    suffices -- the residual is strictly less than one.
+
+    Parameters:
+        dtype: Scale element type.
+        TILE: Keys per tile.
+
+    Returns:
+        Scales staged per box.
+    """
+    return TILE + scale_align_elems[dtype]()
+
+
+@always_inline
+def create_flat_scale_tma_tile[
+    dtype: DType, BOX: Int
+](
+    ctx: DeviceContext,
+    ptr: UnsafePointer[mut=_, Scalar[dtype], _],
+    rows: Int,
+) raises -> TMATensorTile[dtype, 2, Index(1, BOX), Index(1, BOX)]:
+    """Builds a flat `1 x rows` TMA descriptor with a `BOX`-wide box.
+
+    A TMA descriptor's global strides must be 16-byte multiples, which for a
+    row-major `1 x rows` view means `rows % 4 == 0` -- not something a
+    block-strided pool or a ragged key total guarantees. Pads the OUTER stride
+    rather than the extent: a dimension of extent 1 never uses its stride to
+    address, so the pad is free, where padding the extent would declare rows
+    the allocation does not own and let TMA read past it. The extent stays
+    exact, so TMA still zero-fills past the last real scale.
+
+    Parameters:
+        dtype: Scale element type.
+        BOX: Scales per box.
+
+    Args:
+        ctx: Device context used to create the TMA descriptor.
+        ptr: Base of the scale pool.
+        rows: Exact number of addressable scales.
+
+    Returns:
+        The TMA descriptor.
+    """
+    comptime pad = scale_align_elems[dtype]()
+    var scale_tensor = TileTensor(
+        ptr,
+        InternalLayout(
+            Coord(Idx[1], rows), Coord(ceildiv(rows, pad) * pad, Idx[1])
+        ),
+    )
+    return create_tensor_tile[
+        Index(1, BOX),
+        swizzle_mode=TensorMapSwizzle.SWIZZLE_NONE,
+        __desc_shape=Index(1, BOX),
+    ](ctx, scale_tensor)
 
 
 @always_inline
@@ -135,11 +217,11 @@ def _kv_cache_out_slot[
 def _compute_kv_cache_dynamic_shape_strides[
     dtype: DType, //, kv_cache_rank: Int, drop_list: Tuple
 ](blocks: TileTensor[dtype, ...]) -> Tuple[
-    DynamicCoord[DType.int64, kv_cache_rank],
-    DynamicCoord[DType.int64, kv_cache_rank],
+    DynamicCoord[.int64, kv_cache_rank],
+    DynamicCoord[.int64, kv_cache_rank],
 ]:
-    var kv_cache_shape = DynamicCoord[DType.int64, kv_cache_rank]()
-    var kv_cache_strides = DynamicCoord[DType.int64, kv_cache_rank]()
+    var kv_cache_shape = DynamicCoord[.int64, kv_cache_rank]()
+    var kv_cache_strides = DynamicCoord[.int64, kv_cache_rank]()
     var stride = 1
 
     comptime for i in reversed(range(blocks.flat_rank)):
@@ -152,10 +234,10 @@ def _compute_kv_cache_dynamic_shape_strides[
             ]()
             kv_cache_shape[out_index] = rebind[
                 kv_cache_shape.element_types[out_index]
-            ](Scalar[DType.int64](dim))
+            ](Int64(dim))
             kv_cache_strides[out_index] = rebind[
                 kv_cache_strides.element_types[out_index]
-            ](Scalar[DType.int64](stride))
+            ](Int64(stride))
 
         stride *= dim
 
@@ -169,8 +251,8 @@ def _make_cache_tt[
     rank: Int,
 ](
     ptr: UnsafePointer[mut=_, Scalar[dtype], _],
-    shape: DynamicCoord[DType.int64, rank],
-    strides: DynamicCoord[DType.int64, rank],
+    shape: DynamicCoord[.int64, rank],
+    strides: DynamicCoord[.int64, rank],
 ) -> TileTensor[
     dtype,
     InternalLayout[
@@ -193,11 +275,11 @@ def _make_cache_tt[
     comptime for i in range(rank):
         comptime if not shape_c.element_types[i].is_static_value:
             shape_c[i] = rebind[shape_c.element_types[i]](
-                rebind[Scalar[DType.int64]](shape[i])
+                rebind[Int64](shape[i])
             )
         comptime if not stride_c.element_types[i].is_static_value:
             stride_c[i] = rebind[stride_c.element_types[i]](
-                rebind[Scalar[DType.int64]](strides[i])
+                rebind[Int64](strides[i])
             )
     return TileTensor[dtype, ConcLayout](
         ptr=ptr, layout=ConcLayout(shape_c, stride_c)
@@ -441,6 +523,7 @@ struct PagedRowIndices[
 
         For sub-tile loads: `get_row(sub_tile_idx * eff_page)`.
         For depth-512 V: `get_row(pv_stage * BK1)` avoids re-reading the LUT.
+        To carve a whole sub-range LUT rather than one row, use `sub_rows`.
         Requires the base `kv_row` that was passed to `populate` to be
         page-aligned (guaranteed by mask alignment).
 
@@ -450,9 +533,65 @@ struct PagedRowIndices[
         comptime if Self.num_pages == 1:
             return self.rows[0] + offset
         else:
-            return self.rows[Int(offset) // Self.eff_page] + UInt32(
-                Int(offset) % Self.eff_page
-            )
+            # Select with a comptime-indexed chain rather than
+            # `self.rows[<runtime>]`. A dynamic index into the inline array
+            # forces it to addressable memory, which in a warp-specialized
+            # kernel materializes as a `.local` stack frame in the load warp
+            # (measured: a 32-byte `__local_depot` with 16 `st.local` in the
+            # SM100 FA4 shared-key kernels). `num_pages` is `BN / page_size`
+            # -- 2 at the shipping `page_size=128` -- so the chain is a couple
+            # of `selp`s, and it folds away entirely when the caller's offset
+            # is comptime, which every sub-tile call site's is.
+            var page = offset // UInt32(Self.eff_page)
+            var row = self.rows[0]
+            comptime for i in range(1, Self.num_pages):
+                row = self.rows[i] if page == UInt32(i) else row
+            return row + (offset % UInt32(Self.eff_page))
+
+    @always_inline
+    def sub_rows[
+        SubBN: Int
+    ](self, offset: UInt32) -> PagedRowIndices[
+        SubBN, Self.page_size, False, True
+    ]:
+        """A `SubBN`-row sub-range LUT carved from this tile's rows.
+
+        Replaces a second `populate` for any sub-tile the caller already
+        covered with one: a global lookup-table read plus, when the sub-range
+        base is not page-aligned, the `row_idx` divmod that `populate`'s
+        general arm carries.
+
+        The sub-range base need NOT be page-aligned -- `get_row` supplies the
+        intra-page `tok_in_block` term itself. The only requirement is the one
+        the parent `populate` already ran under: its own base must be
+        `eff_page`-aligned, which `base_alignment` promises. That is what makes
+        this safe where a fresh `populate` at a `SubBN`-strided base is not:
+        such a base inherits no alignment promise from the tile, so it needs a
+        `gcd(base_alignment, SubBN)` walk-alignment to stay off `populate`'s
+        page-aligned fast arm.
+
+        The result is always single-CTA (`pair_cta=False`): a sub-range is a
+        V-side object, and `pair_cta`'s K-half selection belongs to the parent,
+        whose `rows[]` already spans V's full `BN` range either way.
+
+        Parameters:
+            SubBN: Row count of the sub-range; must divide `BN`.
+
+        Args:
+            offset: Row offset of the sub-range within the `BN`-row tile.
+        """
+        comptime assert (
+            Self.BN % SubBN == 0
+        ), "sub_rows: SubBN must divide the parent tile's BN"
+        comptime Sub = PagedRowIndices[SubBN, Self.page_size, False, True]
+        debug_assert(
+            Int(offset) + SubBN <= Self.BN,
+            "sub_rows: sub-range runs past the parent tile's BN rows",
+        )
+        var out = Sub()
+        comptime for p in range(Sub.num_pages):
+            out.rows[p] = self.get_row(offset + UInt32(p * Sub.eff_page))
+        return out^
 
     @always_inline
     def _tma_copy_kv_impl[
@@ -475,7 +614,7 @@ struct PagedRowIndices[
         self,
         tma_op: TMATensorTile[dtype, 3, tile_shape, desc_shape, True],
         stage_base: UnsafePointer[
-            mut=True, Scalar[dtype], _, address_space=AddressSpace.SHARED
+            mut=True, Scalar[dtype], _, address_space=.SHARED
         ],
         ref[AddressSpace.SHARED] mbar: SharedMemBarrier,
         *,
@@ -501,7 +640,7 @@ struct PagedRowIndices[
         dispatch deliberately out-of-bounds TMAs for the remaining
         `[valid_pages, pages_per_iter)` page slots. With `OOBFill.NONE`
         (the default for our descriptors, see
-        `mojo/stdlib/std/gpu/host/nvidia/tma.mojo:431`), OOB coordinates
+        `max/mojo/max/gpu/host/nvidia/tma.mojo:431`), OOB coordinates
         return 0, so the corresponding SMEM rows are zero-initialized.
         This is required by callers whose downstream MMA reads the full
         `pages_per_iter` row range regardless of mask, e.g. depth-512
@@ -823,7 +962,7 @@ struct PagedRowIndices[
         self,
         tma_op: TMATensorTile[dtype, 3, tile_shape, desc_shape, True],
         stage_base: UnsafePointer[
-            mut=True, Scalar[dtype], _, address_space=AddressSpace.SHARED
+            mut=True, Scalar[dtype], _, address_space=.SHARED
         ],
         ref[AddressSpace.SHARED] mbar: SharedMemBarrier,
         *,
@@ -983,7 +1122,7 @@ struct PagedRowIndices[
         self,
         tma_op: TMATensorTile[dtype, 3, tile_shape, desc_shape, True],
         stage_base: UnsafePointer[
-            mut=True, Scalar[dtype], _, address_space=AddressSpace.SHARED
+            mut=True, Scalar[dtype], _, address_space=.SHARED
         ],
         ref[AddressSpace.SHARED] mbar: SharedMemBarrier,
         *,
@@ -1104,10 +1243,10 @@ def _populate_via_row_idx[
     page_size: Int,
     pair_cta: Bool,
     is_leader: Bool,
-    row_idx_fn: def(UInt32, UInt32) capturing -> UInt32,
-](batch_idx: UInt32, base_kv_row: UInt32) -> PagedRowIndices[
-    BN, page_size, pair_cta, is_leader
-]:
+    FuncType: def(UInt32, UInt32) -> UInt32,
+](
+    batch_idx: UInt32, base_kv_row: UInt32, row_idx_fn: FuncType
+) -> PagedRowIndices[BN, page_size, pair_cta, is_leader]:
     """Scalar-loop fallback shared by `MHAOperand.populate` and
     `KVCacheT.populate`. Calls `row_idx_fn` once per sub-tile page,
     populating the full `num_pages` range so V (and pair-CTA peers) can
@@ -1139,7 +1278,7 @@ trait KVCacheT(DevicePassable, TrivialRegisterPassable):
 
     def cache_lengths_nd(
         self,
-    ) -> TileTensor[DType.uint32, _1d_tt_layout, ImmutAnyOrigin,]:
+    ) -> TileTensor[.uint32, _1d_tt_layout, ImmutAnyOrigin]:
         """Returns the cache lengths as a TileTensor."""
         ...
 
@@ -1283,6 +1422,18 @@ trait KVCacheT(DevicePassable, TrivialRegisterPassable):
         ...
 
     @always_inline
+    def scale_row_idx(self, batch_idx: UInt32, start_tok_idx: UInt32) -> UInt32:
+        """Returns the row idx of a token's scale in the SCALE pool.
+
+        Deliberately not derivable from `row_idx`: a paged cache indexes its
+        scales through `scales_lookup_table`, a separate member that only
+        DEFAULTS to `lookup_table`, and the scale pool carries its own block
+        stride. Reusing `row_idx` reads the wrong block whenever a caller
+        supplies a distinct scales LUT.
+        """
+        ...
+
+    @always_inline
     def populate[
         BN: Int,
         base_alignment: Int,
@@ -1305,13 +1456,12 @@ trait KVCacheT(DevicePassable, TrivialRegisterPassable):
         SIMD load against the lookup table.
         """
 
-        @__parameter
-        def _row(batch_idx: UInt32, start_tok_idx: UInt32) -> UInt32:
+        def _row(batch_idx: UInt32, start_tok_idx: UInt32) {imm} -> UInt32:
             return self.row_idx(batch_idx, start_tok_idx)
 
-        return _populate_via_row_idx[
-            BN, Self.page_size_, pair_cta, is_leader, _row
-        ](batch_idx, base_kv_row)
+        return _populate_via_row_idx[BN, Self.page_size_, pair_cta, is_leader](
+            batch_idx, base_kv_row, _row
+        )
 
     @always_inline
     def get_tma_row(self, encoded_index: Int32) -> Int32:
@@ -1347,6 +1497,24 @@ trait KVCacheT(DevicePassable, TrivialRegisterPassable):
         (default) keeps the original 3D descriptor. `row_major=True` (with
         `fold_chunks >= 2`) builds the rank-5 chunk-inner box (one TMA per
         multi-atom-row page); `False` builds the rank-4 chunk-outer box."""
+        ...
+
+    @always_inline
+    def create_index_scale_tma_tile[
+        TILE: Int
+    ](self, ctx: DeviceContext) raises -> TMATensorTile[
+        Self.scale_dtype,
+        2,
+        Index(1, flat_scale_window[Self.scale_dtype, TILE]()),
+        Index(1, flat_scale_window[Self.scale_dtype, TILE]()),
+    ]:
+        """Creates a flat TMA descriptor over the SCALE pool.
+
+        The box is `TILE` scales plus one 16-byte alignment unit of slack, and
+        is only well defined when a token owns exactly one scale --
+        implementations assert that. The caller's obligation is that `TILE`
+        divides `page_size`, the same one the K descriptor already carries.
+        """
         ...
 
     @always_inline
@@ -1445,11 +1613,11 @@ trait KVCacheT(DevicePassable, TrivialRegisterPassable):
         2,
         tile_shape=IndexList[2](
             tile_height,
-            _gather4_box_width[DType.bfloat16, tile_width, swizzle_mode](),
+            _gather4_box_width[.bfloat16, tile_width, swizzle_mode](),
         ),
         desc_shape=IndexList[2](
             1,
-            _gather4_box_width[DType.bfloat16, tile_width, swizzle_mode](),
+            _gather4_box_width[.bfloat16, tile_width, swizzle_mode](),
         ),
     ]:
         """Creates a BF16 gather4 TMA descriptor for the rope portion of the
@@ -1540,12 +1708,12 @@ struct ContinuousBatchingKVCache[
 
     comptime cache_lengths_tt_layout = _1d_tt_layout
     comptime cache_lengths_tt_type = TileTensor[
-        DType.uint32, Self.cache_lengths_tt_layout, Self.cache_lengths_origin
+        .uint32, Self.cache_lengths_tt_layout, Self.cache_lengths_origin
     ]
 
     comptime lookup_table_tt_layout = _1d_tt_layout
     comptime lookup_table_tt_type = TileTensor[
-        DType.uint32, Self.lookup_table_tt_layout, Self.lookup_table_origin
+        .uint32, Self.lookup_table_tt_layout, Self.lookup_table_origin
     ]
 
     var blocks: Self.blocks_tt_type
@@ -1575,7 +1743,7 @@ struct ContinuousBatchingKVCache[
     @always_inline
     def _get_idx_tuple(
         self, block_idx: Int, head_idx: Int, tok_idx: Int, head_dim_idx: Int
-    ) -> DynamicCoord[DType.int64, 4]:
+    ) -> DynamicCoord[.int64, 4]:
         assert (
             head_idx < Self.kv_params.num_heads
         ), "KVCache head_idx out of range"
@@ -1585,7 +1753,7 @@ struct ContinuousBatchingKVCache[
         assert tok_idx < Int(
             self.blocks.dim[1]()
         ), "KVCache tok_idx out of range"
-        return dyn_coord[DType.int64](
+        return dyn_coord[.int64](
             (
                 block_idx,
                 tok_idx,
@@ -1791,6 +1959,29 @@ struct ContinuousBatchingKVCache[
         return block_idx * self._stride() + tok_idx
 
     @always_inline
+    def scale_row_idx(self, batch_idx: UInt32, start_tok_idx: UInt32) -> UInt32:
+        """Not supported: this cache carries no quantization scales."""
+        comptime assert False, (
+            "scale_row_idx requires a quantized cache;"
+            " ContinuousBatchingKVCache has no scale pool"
+        )
+
+    @always_inline
+    def create_index_scale_tma_tile[
+        TILE: Int
+    ](self, ctx: DeviceContext) raises -> TMATensorTile[
+        Self.scale_dtype,
+        2,
+        Index(1, flat_scale_window[Self.scale_dtype, TILE]()),
+        Index(1, flat_scale_window[Self.scale_dtype, TILE]()),
+    ]:
+        """Not supported: this cache carries no quantization scales."""
+        comptime assert False, (
+            "create_index_scale_tma_tile requires a quantized cache;"
+            " ContinuousBatchingKVCache has no scale pool"
+        )
+
+    @always_inline
     def create_tma_tile[
         swizzle_mode: TensorMapSwizzle,
         *,
@@ -1963,11 +2154,11 @@ struct ContinuousBatchingKVCache[
         2,
         tile_shape=IndexList[2](
             tile_height,
-            _gather4_box_width[DType.bfloat16, tile_width, swizzle_mode](),
+            _gather4_box_width[.bfloat16, tile_width, swizzle_mode](),
         ),
         desc_shape=IndexList[2](
             1,
-            _gather4_box_width[DType.bfloat16, tile_width, swizzle_mode](),
+            _gather4_box_width[.bfloat16, tile_width, swizzle_mode](),
         ),
     ]:
         """Not supported for ContinuousBatchingKVCache."""
@@ -2110,12 +2301,12 @@ struct PagedKVCache[
 
     comptime cache_lengths_tt_layout = _1d_tt_layout
     comptime cache_lengths_tt_type = TileTensor[
-        DType.uint32, Self.cache_lengths_tt_layout, Self.cache_lengths_origin
+        .uint32, Self.cache_lengths_tt_layout, Self.cache_lengths_origin
     ]
 
     comptime lookup_table_tt_layout = _2d_row_major_tt_layout
     comptime lookup_table_tt_type = TileTensor[
-        DType.uint32, Self.lookup_table_tt_layout, Self.lookup_table_origin
+        .uint32, Self.lookup_table_tt_layout, Self.lookup_table_origin
     ]
 
     var blocks: Self.blocks_tt_type
@@ -2263,6 +2454,58 @@ struct PagedKVCache[
         return Int(
             UInt32(total_blocks - 1) * self._stride() + UInt32(Self.page_size)
         )
+
+    @always_inline
+    def _scale_stride(self) -> UInt32:
+        """Rows between consecutive physical blocks in the SCALE pool.
+
+        Mirrors `_stride()`, but the divisor is the scale pool's own inner
+        extent: `stride[0]` on `scales_tt_layout` is a runtime Int64 because
+        the parent 6-D scales tensor interleaves kv_idx and layer_idx, so it
+        cannot be recomputed from `page_size` alone.
+        """
+        return UInt32(self.scales.value().layout.stride[0]().value()) // UInt32(
+            Self.kv_params.num_heads * Self.head_dim_granularity
+        )
+
+    @always_inline
+    def num_scale_rows(self) -> Int:
+        """Total virtual rows in the scale pool, as `num_kv_rows` is for values.
+        """
+        var total_blocks = Int(self.scales.value().dim[0]())
+        return Int(
+            UInt32(total_blocks - 1) * self._scale_stride()
+            + UInt32(Self.page_size)
+        )
+
+    @always_inline
+    def scale_row_idx(self, batch_idx: UInt32, start_tok_idx: UInt32) -> UInt32:
+        """Returns the row idx of a token's scale in the scale pool.
+
+        NOT `row_idx`: the block comes from `scales_lookup_table` and the
+        stride from the scale pool, both of which may differ from the value
+        pool's -- see the `scales_lookup_table` field comment.
+        """
+        comptime assert (
+            Self.quantization_enabled
+        ), "scale_row_idx requires quantization to be enabled"
+        var lut_block_index, tok_in_block_idx = divmod(
+            Int(start_tok_idx), Self.page_size
+        )
+        assert batch_idx < UInt32(
+            self.cache_lengths.num_elements()
+        ), "batch_idx is oob"
+        debug_assert(
+            lut_block_index < Int(self.scales_lookup_table.dim[1]()),
+            "lut_block_index is OOB. Attempted to access scales LUT column ",
+            lut_block_index,
+            " with scales_lookup_table inner dim ",
+            Int(self.scales_lookup_table.dim[1]()),
+        )
+        var block_idx = self.scales_lookup_table[
+            Int(batch_idx), lut_block_index
+        ]
+        return block_idx * self._scale_stride() + UInt32(tok_in_block_idx)
 
     @always_inline
     def row_idx(self, batch_idx: UInt32, tok_idx: UInt32) -> UInt32:
@@ -2464,7 +2707,7 @@ struct PagedKVCache[
                 var simd = lut_row_ptr.load[width=chunk, alignment=4 * chunk](
                     c * chunk
                 )
-                var rows_simd = simd * SIMD[DType.uint32, chunk](stride)
+                var rows_simd = simd * SIMD[.uint32, chunk](stride)
                 comptime for i in range(chunk):
                     result.rows[c * chunk + i] = rows_simd[i]
         return result^
@@ -2517,6 +2760,56 @@ struct PagedKVCache[
             fold_chunks=fold_chunks,
             row_major=row_major,
         ](ctx, self.blocks._storage, Int(rows))
+
+    @always_inline
+    def create_index_scale_tma_tile[
+        TILE: Int
+    ](self, ctx: DeviceContext) raises -> TMATensorTile[
+        Self.scale_dtype,
+        2,
+        Index(1, flat_scale_window[Self.scale_dtype, TILE]()),
+        Index(1, flat_scale_window[Self.scale_dtype, TILE]()),
+    ]:
+        """Creates a flat TMA descriptor over the scale pool."""
+        comptime assert (
+            Self.quantization_enabled
+        ), "create_index_scale_tma_tile requires quantization to be enabled"
+        # A flat 1-D window means consecutive tokens are consecutive elements,
+        # which holds only when a token owns exactly one scale: the scale
+        # layout's inner extents are [num_heads, head_dim_granularity], so
+        # their product is the token-to-token stride.
+        comptime assert (
+            Self.kv_params.num_heads * Self.head_dim_granularity == 1
+        ), (
+            "the flat scale window needs exactly one scale per token; this"
+            " cache stores num_heads * head_dim_granularity of them"
+        )
+        # `scale_row_idx` is block-relative, so a box straddles two physical
+        # blocks -- which are NOT adjacent in the pool -- unless a page holds a
+        # whole number of them. The slack past the tile is staged and discarded,
+        # so it may run into the next block; the tile must not.
+        comptime assert Self.page_size % TILE == 0, (
+            "a scale box's key tile must not straddle a page; page_size must be"
+            " a multiple of TILE"
+        )
+        # The caller reads the base's alignment residual ONCE and reuses it on
+        # every tile, which holds only if the per-tile term never shifts it.
+        # `tok_in_block` moves in multiples of TILE (aligned by the assert
+        # above), so the block stride is the remaining term.
+        comptime align = scale_align_elems[Self.scale_dtype]()
+        debug_assert(
+            self._scale_stride() % UInt32(align) == 0,
+            (
+                "scale pool block stride must be 16-byte aligned, or a tile's"
+                " scale base shifts residue between blocks"
+            ),
+        )
+        # Row extent, not `num_elements()`: `_scale_stride` exceeds `page_size`
+        # whenever the parent tensor interleaves kv_idx/layer_idx, and a short
+        # descriptor would silently zero-fill live rows.
+        return create_flat_scale_tma_tile[
+            Self.scale_dtype, flat_scale_window[Self.scale_dtype, TILE]()
+        ](ctx, self.scales_raw_ptr(), self.num_scale_rows())
 
     @always_inline
     def create_gather4_tma_tile[
@@ -2612,7 +2905,7 @@ struct PagedKVCache[
         expressed in BF16 units: (padded_depth + BK * 2) // 2.
         """
         comptime assert (
-            BK % swizzle_granularity[DType.bfloat16, swizzle_mode]()
+            BK % swizzle_granularity[.bfloat16, swizzle_mode]()
         ) == 0, "BK must be a multiple of swizzle granularity for BF16"
         # Compute the total row width in BF16 elements:
         #   padded_depth FP8 bytes + BK BF16 elements
@@ -2626,9 +2919,7 @@ struct PagedKVCache[
         )
         # Offset past the FP8 content to reach the BF16 rope data,
         # then reinterpret the pointer as BF16.
-        var rope_ptr = (self.blocks._storage + padded_depth).bitcast[
-            Scalar[DType.bfloat16]
-        ]()
+        var rope_ptr = (self.blocks._storage + padded_depth).bitcast[BFloat16]()
         comptime smem_dim = IndexList[3](BN, 1, BK)
         comptime gmem_dim = IndexList[3](
             UNKNOWN_VALUE,
@@ -2652,11 +2943,11 @@ struct PagedKVCache[
         2,
         tile_shape=IndexList[2](
             tile_height,
-            _gather4_box_width[DType.bfloat16, tile_width, swizzle_mode](),
+            _gather4_box_width[.bfloat16, tile_width, swizzle_mode](),
         ),
         desc_shape=IndexList[2](
             1,
-            _gather4_box_width[DType.bfloat16, tile_width, swizzle_mode](),
+            _gather4_box_width[.bfloat16, tile_width, swizzle_mode](),
         ),
     ]:
         """Creates a BF16 gather4 TMA descriptor for the rope portion of the
@@ -2671,9 +2962,7 @@ struct PagedKVCache[
         reinterprets as BF16, and creates a gather4 TMA descriptor whose row
         stride is the full row width in BF16 elements.
         """
-        var rope_ptr = (self.blocks._storage + padded_depth).bitcast[
-            Scalar[DType.bfloat16]
-        ]()
+        var rope_ptr = (self.blocks._storage + padded_depth).bitcast[BFloat16]()
         return create_tma_tile_gather4[
             DType.bfloat16,
             tile_height=tile_height,
@@ -2685,7 +2974,7 @@ struct PagedKVCache[
     @always_inline
     def _get_idx(
         self, bs: Int, head_idx: Int, tok_idx: Int, head_dim_idx: Int
-    ) -> DynamicCoord[DType.int64, 4]:
+    ) -> DynamicCoord[.int64, 4]:
         debug_assert(
             head_idx < Self.kv_params.num_heads,
             "KVCache head_idx out of range (",
@@ -2711,7 +3000,7 @@ struct PagedKVCache[
             Int(self.lookup_table.dim[1]()),
         )
         var block_idx = Int(self.lookup_table[bs, lut_block_idx])
-        return dyn_coord[DType.int64](
+        return dyn_coord[.int64](
             (
                 block_idx,
                 tok_in_block_idx,
@@ -2727,7 +3016,7 @@ struct PagedKVCache[
         head_idx: Int,
         tok_idx: Int,
         head_dim_idx: Int,
-    ) -> DynamicCoord[DType.int64, 4]:
+    ) -> DynamicCoord[.int64, 4]:
         debug_assert(
             head_idx < Self.kv_params.num_heads,
             "KVCache head_idx out of range (",
@@ -2756,7 +3045,7 @@ struct PagedKVCache[
         # (wrong — element 63 is still in block 0). floordiv correctly maps
         # any element at position d to block d // granularity.
         var scale_block_idx = head_dim_idx // Self.quantization_granularity
-        return dyn_coord[DType.int64](
+        return dyn_coord[.int64](
             (
                 block_idx,
                 tok_in_block_idx,
@@ -3113,8 +3402,8 @@ struct ContinuousBatchingKVCacheCollection[
     var lookup_table: Self.CacheType.lookup_table_tt_type
     var max_seq_length: UInt32
     var max_cache_length: UInt32
-    var kv_cache_dynamic_shape: DynamicCoord[DType.int64, 4]
-    var kv_cache_dynamic_strides: DynamicCoord[DType.int64, 4]
+    var kv_cache_dynamic_shape: DynamicCoord[.int64, 4]
+    var kv_cache_dynamic_strides: DynamicCoord[.int64, 4]
 
     def __init__(
         out self,
@@ -3122,10 +3411,10 @@ struct ContinuousBatchingKVCacheCollection[
             Self.dtype, Layout.row_major[6](), Self.blocks_origin
         ],
         cache_lengths: LayoutTensor[
-            DType.uint32, Layout(UNKNOWN_VALUE), Self.cache_lengths_origin
+            .uint32, Layout(UNKNOWN_VALUE), Self.cache_lengths_origin
         ],
         lookup_table: LayoutTensor[
-            DType.uint32, Layout(UNKNOWN_VALUE), Self.lookup_table_origin
+            .uint32, Layout(UNKNOWN_VALUE), Self.lookup_table_origin
         ],
         max_seq_length: UInt32,
         max_cache_length: UInt32,
@@ -3178,7 +3467,7 @@ struct ContinuousBatchingKVCacheCollection[
         ), "invalid kv_idx for MLA cache"
         var offset = Int(
             self.blocks.layout(
-                dyn_coord[DType.int64](
+                dyn_coord[.int64](
                     (
                         0,
                         kv_idx,
@@ -3332,8 +3621,8 @@ struct PagedKVCacheCollection[
     ]
 
     var scales: OptionalReg[Self.scales_tt_type]
-    var kv_cache_scales_dynamic_shape: DynamicCoord[DType.int64, 4]
-    var kv_cache_scales_dynamic_strides: DynamicCoord[DType.int64, 4]
+    var kv_cache_scales_dynamic_shape: DynamicCoord[.int64, 4]
+    var kv_cache_scales_dynamic_strides: DynamicCoord[.int64, 4]
     var blocks: Self.blocks_tt_type
     var cache_lengths: Self.CacheType.cache_lengths_tt_type
     var lookup_table: Self.CacheType.lookup_table_tt_type
@@ -3343,8 +3632,8 @@ struct PagedKVCacheCollection[
     var scales_lookup_table: Self.CacheType.lookup_table_tt_type
     var max_seq_length: UInt32
     var max_cache_length: UInt32
-    var kv_cache_dynamic_shape: DynamicCoord[DType.int64, 4]
-    var kv_cache_dynamic_strides: DynamicCoord[DType.int64, 4]
+    var kv_cache_dynamic_shape: DynamicCoord[.int64, 4]
+    var kv_cache_dynamic_strides: DynamicCoord[.int64, 4]
 
     def __init__[
         scales_dtype: DType = Self.scale_dtype
@@ -3354,10 +3643,10 @@ struct PagedKVCacheCollection[
             Self.dtype, Layout.row_major[6](), Self.blocks_origin
         ],
         cache_lengths: LayoutTensor[
-            DType.uint32, Layout(UNKNOWN_VALUE), Self.cache_lengths_origin
+            .uint32, Layout(UNKNOWN_VALUE), Self.cache_lengths_origin
         ],
         lookup_table: LayoutTensor[
-            DType.uint32, Layout.row_major[2](), Self.lookup_table_origin
+            .uint32, Layout.row_major[2](), Self.lookup_table_origin
         ],
         max_seq_length: UInt32,
         max_cache_length: UInt32,
@@ -3380,7 +3669,7 @@ struct PagedKVCacheCollection[
         # `lookup_table` (values/scales share one block-id space today).
         scales_lookup_table: OptionalReg[
             LayoutTensor[
-                DType.uint32, Layout.row_major[2](), Self.lookup_table_origin
+                .uint32, Layout.row_major[2](), Self.lookup_table_origin
             ]
         ] = None,
     ):
@@ -3428,7 +3717,7 @@ struct PagedKVCacheCollection[
             )
         else:
             self.scales = None
-            self.kv_cache_scales_dynamic_shape = DynamicCoord[DType.int64, 4]()
+            self.kv_cache_scales_dynamic_shape = DynamicCoord[.int64, 4]()
             self.kv_cache_scales_dynamic_strides = DynamicCoord[
                 DType.int64, 4
             ]()
@@ -3468,7 +3757,7 @@ struct PagedKVCacheCollection[
             )
         else:
             self.scales = None
-            self.kv_cache_scales_dynamic_shape = DynamicCoord[DType.int64, 4]()
+            self.kv_cache_scales_dynamic_shape = DynamicCoord[.int64, 4]()
             self.kv_cache_scales_dynamic_strides = DynamicCoord[
                 DType.int64, 4
             ]()
@@ -3490,7 +3779,7 @@ struct PagedKVCacheCollection[
             kv_idx >= 0 and kv_idx < 2
         ), "Invalid kv_idx for KV cache"
 
-        var kv_layer_coord = dyn_coord[DType.int64](
+        var kv_layer_coord = dyn_coord[.int64](
             (
                 0,
                 kv_idx,
