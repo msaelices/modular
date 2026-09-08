@@ -39,16 +39,19 @@ from .tokenizer import TextTokenizer
 if TYPE_CHECKING:
     from max.graph.weights import WeightsAdapter, WeightsFormat
     from max.pipelines.context import (
+        AudioContext,
         PixelContext,
         TextAndVisionContext,
         TextContext,
     )
+    from max.pipelines.diffusion.config import TaylorSeerDefaults
     from max.pipelines.kv_cache.memory_planner import MemoryPlanner
     from max.pipelines.modeling.config_enums import SupportedEncoding
     from max.pipelines.modeling.types import (
         EmbeddingsContext,
         PipelineTokenizer,
     )
+    from max.pipelines.speculative import SpeculativeConfig
     from max.pipelines.weights.hf_utils import HuggingFaceRepo
 
     from .config import PipelineConfig
@@ -152,11 +155,16 @@ class SupportedArchitecture:
     default_weights_format: WeightsFormat
     """The weights format expected by the `pipeline_model`."""
 
-    context_type: type[TextContext | EmbeddingsContext]
+    context_type: type[
+        TextContext | EmbeddingsContext | PixelContext | AudioContext
+    ]
     """The context class type that this architecture uses for managing request state and inputs.
 
-    This should be a class (not an instance) that implements either the `TextContext`
-    or `EmbeddingsContext` protocol, defining how the pipeline processes and tracks requests.
+    This should be a class (not an instance) carrying the state and inputs of
+    one request, in whichever form the architecture's task calls for: a
+    `TextContext` or `EmbeddingsContext` protocol implementation for token and
+    embedding models, or a `PixelContext` or `AudioContext` subclass for the
+    media tasks.
     """
 
     config: type[ArchConfig]
@@ -259,6 +267,39 @@ class SupportedArchitecture:
     registration time via :attr:`~max.pipelines.lib.interfaces.pipeline_model.PipelineModel.batch_processor_cls`.
     Ragged text models should subclass
     :class:`~max.pipelines.lib.interfaces.batch_processor.RaggedBatchProcessor`.
+
+    Every token-generation model needs a batch processor. It's easiest to
+    use or subclass an existing one (for example,
+    ``batching=Llama3BatchProcessor``).
+
+    .. code-block:: python
+
+        from max.pipelines.lib.interfaces.batch_processor import (
+            SingleReplicaRaggedBatchProcessor,
+        )
+
+        class MyBatchProcessor(SingleReplicaRaggedBatchProcessor):
+            def _make_inputs(
+                self,
+                *,
+                tokens,
+                input_row_offsets,
+                return_n_logits,
+                kv_cache_inputs,
+                signal_buffers,
+            ):
+                ...  # Build the ModelInputs.
+
+        # Pass ``batching=MyBatchProcessor`` to ``SupportedArchitecture``
+        # when registering the architecture.
+
+    .. invisible-code-block: python
+
+        from max.pipelines.lib.interfaces.batch_processor import (
+            BatchProcessor,
+        )
+
+        assert issubclass(MyBatchProcessor, BatchProcessor)
     """
 
     reasoning_parser: str | None = None
@@ -300,6 +341,17 @@ class SupportedArchitecture:
     If None, the global default (compact JSON) is used.
     """
 
+    denoising_cache_defaults: TaylorSeerDefaults | None = None
+    """TaylorSeer tuning for this architecture. User-set fields always win."""
+
+    checkpoint_draft_width: (
+        Callable[[SpeculativeConfig, Any, Any], int] | None
+    ) = None
+    """Returns the draft width this checkpoint was trained for.
+
+    Set it when the checkpoint fixes the width rather than the user.
+    """
+
     supports_overlap_scheduler: bool = True
     """Whether this architecture supports auto-enabling the overlap scheduler.
 
@@ -321,13 +373,39 @@ class SupportedArchitecture:
     this architecture.
 
     When set, ``PipelineConfig`` uses the planner to estimate weight size,
-    activation memory, signal-buffer memory, and vision cache entry bytes.
+    activation memory, and signal-buffer memory.
     Autoregressive text-generation models should set this to
     :class:`~max.pipelines.kv_cache.PagedMemoryPlanner` (or a subclass with
     architecture-specific overrides).
 
-    ``None`` means the architecture manages its own memory estimation (e.g.
-    diffusion pipelines that skip KV cache estimation entirely).
+    ``None`` means the architecture manages its own memory estimation (for
+    example, diffusion pipelines that skip KV cache estimation entirely).
+    Without a planner, memory estimation budgets no activation memory and
+    does not infer ``max_batch_size``, so architectures that use a KV cache
+    should always set this field.
+
+    To reserve a fixed chunk of activation memory (vision headroom, for
+    example) without writing a planner subclass, register the class returned
+    by
+    :meth:`~max.pipelines.kv_cache.PagedMemoryPlanner.with_activation_reservation`.
+
+    .. code-block:: python
+
+        from max.pipelines.kv_cache.memory_planner import PagedMemoryPlanner
+
+        # Most architectures register the planner class directly:
+        #     SupportedArchitecture(..., memory_planner=PagedMemoryPlanner)
+        # A configured subclass reserves activation memory:
+        planner = PagedMemoryPlanner.with_activation_reservation(
+            15 * 1024**3  # 15 GiB
+        )
+
+    .. invisible-code-block: python
+
+        from max.pipelines.kv_cache.memory_planner import MemoryPlanner
+
+        assert issubclass(PagedMemoryPlanner, MemoryPlanner)
+        assert issubclass(planner, PagedMemoryPlanner)
     """
 
     cascade_pipeline_factory: Callable[[PipelineConfig], object] | None = None
@@ -486,7 +564,20 @@ class ArchLookup:
             return
         for module, symbol, package in entries:
             imported = importlib.import_module(module, package)
-            self.register(getattr(imported, symbol))
+            architecture = getattr(imported, symbol)
+            existing = self.architectures.get(architecture.name)
+            if existing is not None and existing.task == architecture.task:
+                # An architecture registered eagerly under this name (e.g. via
+                # --custom-architectures) takes precedence over the deferred
+                # built-in.
+                logger.debug(
+                    "Skipping lazy registration of built-in architecture "
+                    "'%s': an architecture with that name is already "
+                    "registered.",
+                    architecture.name,
+                )
+                continue
+            self.register(architecture)
 
     def import_custom_architectures(
         self, custom_architectures: list[str]

@@ -26,7 +26,6 @@ Devices
    DeviceEvent
    DeviceQueue
    DeviceSpec
-   NPU
 
 Buffers
 -------
@@ -39,6 +38,7 @@ Buffers
    Buffer
    DevicePinnedBuffer
    DLPackArray
+   Usage
 
 .. autosummary::
    :nosignatures:

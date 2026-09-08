@@ -22,10 +22,11 @@ from std.python.numpy import copy_to_numpy_tensor, from_numpy_tensor
 from .coord import DynamicCoord
 from .tile_layout import RowMajorLayout, TensorLayout, row_major
 from .tile_tensor import TileTensor
+from .tensor_engine import TensorEngine
 
 
 comptime _NumPyLayout[rank: Int] = RowMajorLayout[
-    *DynamicCoord[DType.int, rank].element_types
+    *DynamicCoord[.int, rank].element_types
 ]
 """The layout of a `TileTensor` borrowed from a NumPy array: row-major with
 one runtime extent per axis."""
@@ -52,7 +53,7 @@ def from_numpy[
 
     var np = Python.import_module("numpy")
     var array = np.arange(6, dtype="float64").reshape(2, 3)
-    var tensor = from_numpy[DType.float64, 2](array)
+    var tensor = from_numpy[.float64, 2](array)
     var value = tensor[1, 2]
     ```
 
@@ -78,9 +79,18 @@ def from_numpy[
 
 
 def _is_row_major_contiguous[
-    dtype: DType, LayoutType: TensorLayout, origin: Origin
-](tensor: TileTensor[dtype, LayoutType, origin]) -> Bool:
+    dtype: DType,
+    LayoutType: TensorLayout,
+    origin: Origin,
+    Engine: TensorEngine,
+](tensor: TileTensor[dtype, LayoutType, origin, Engine=Engine]) -> Bool:
     """Reports whether the tensor covers its buffer in C order without gaps.
+
+    Parameters:
+        dtype: The element dtype of the tensor.
+        LayoutType: The layout of the tensor.
+        origin: The origin of the tensor.
+        Engine: The engine of the tensor.
 
     Args:
         tensor: The tensor to inspect.
@@ -100,8 +110,13 @@ def _is_row_major_contiguous[
 
 
 def to_numpy[
-    dtype: DType, LayoutType: TensorLayout, origin: Origin
-](tensor: TileTensor[dtype, LayoutType, origin]) raises -> PythonObject:
+    dtype: DType,
+    LayoutType: TensorLayout,
+    origin: Origin,
+    Engine: TensorEngine,
+](
+    tensor: TileTensor[dtype, LayoutType, origin, Engine=Engine]
+) raises -> PythonObject:
     """Copies a `TileTensor` into a new NumPy array of the same shape.
 
     Tensors whose layout is row-major and gap-free are copied with a single
@@ -124,6 +139,7 @@ def to_numpy[
         dtype: The element dtype of the tensor.
         LayoutType: The layout of the tensor.
         origin: The origin of the tensor.
+        Engine: The engine of the tensor.
 
     Args:
         tensor: The tensor to copy.
@@ -143,11 +159,11 @@ def to_numpy[
         " copying."
     )
 
-    var shape = DynamicCoord[DType.int, LayoutType.rank]()
+    var shape = DynamicCoord[.int, LayoutType.rank]()
 
     comptime for i in range(LayoutType.rank):
         shape[i] = rebind[type_of(shape[i])](
-            Scalar[DType.int](Int(tensor.layout.shape[i]().value()))
+            Int(Int(tensor.layout.shape[i]().value()))
         )
 
     var n = tensor.layout.size()
@@ -160,10 +176,10 @@ def to_numpy[
     # Gather into a contiguous buffer in C order, following the strides, then
     # hand that to the flat copy.
     var gathered = List[Scalar[dtype]](capacity=n)
-    var read_coord = DynamicCoord[DType.int, LayoutType.rank]()
+    var read_coord = DynamicCoord[.int, LayoutType.rank]()
 
     for _ in range(n):
-        gathered.append(tensor[read_coord])
+        gathered.append(Scalar[dtype](tensor.load[width=1](read_coord)))
         var carry = True
 
         comptime for i in reversed(range(LayoutType.rank)):

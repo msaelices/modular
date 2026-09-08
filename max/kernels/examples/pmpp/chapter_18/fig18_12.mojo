@@ -22,7 +22,7 @@ as Mojo's atomic API differs. The level array stores if visited; races
 on unvisited vertices are harmless as they all write the same level.
 """
 
-from std.gpu import block_idx, thread_idx, block_dim, grid_dim
+from max.gpu import block_idx, thread_idx, block_dim, grid_dim
 from max.gpu.host import DeviceContext
 from std.atomic import Atomic
 from std.collections import List
@@ -89,17 +89,13 @@ def main() raises:
     var start_vertex = 0
     h_level[start_vertex] = 0
 
-    var d_src_ptrs = ctx.enqueue_create_buffer[DType.uint32](NUM_VERTICES + 1)
-    var d_dst = ctx.enqueue_create_buffer[DType.uint32](num_edges)
-    var d_level = ctx.enqueue_create_buffer[DType.uint32](NUM_VERTICES)
+    var d_src_ptrs = ctx.enqueue_create_buffer[.uint32](NUM_VERTICES + 1)
+    var d_dst = ctx.enqueue_create_buffer[.uint32](num_edges)
+    var d_level = ctx.enqueue_create_buffer[.uint32](NUM_VERTICES)
     # Allocate larger frontier buffers to handle potential duplicates
-    var d_prev_frontier = ctx.enqueue_create_buffer[DType.uint32](
-        NUM_VERTICES * 2
-    )
-    var d_curr_frontier = ctx.enqueue_create_buffer[DType.uint32](
-        NUM_VERTICES * 2
-    )
-    var d_num_curr_frontier = ctx.enqueue_create_buffer[DType.uint32](1)
+    var d_prev_frontier = ctx.enqueue_create_buffer[.uint32](NUM_VERTICES * 2)
+    var d_curr_frontier = ctx.enqueue_create_buffer[.uint32](NUM_VERTICES * 2)
+    var d_num_curr_frontier = ctx.enqueue_create_buffer[.uint32](1)
 
     var h_src_ptrs = alloc[UInt32](NUM_VERTICES + 1)
     var h_dst = alloc[UInt32](num_edges)

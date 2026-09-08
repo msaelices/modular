@@ -35,7 +35,7 @@ from max.pipelines.kv_cache.config import KVConnectorConfig
 from max.pipelines.kv_cache.paged_kv_cache.transfer_engine import (
     KVTransferEngineMetadata,
 )
-from max.pipelines.lib import OverlapTextGenerationPipeline
+from max.pipelines.lib import MemoryPlan, OverlapTextGenerationPipeline
 from max.pipelines.lib.pipeline_variants.utils import (
     update_spec_decode_context_and_prepare_responses,
 )
@@ -49,6 +49,9 @@ from max.serve.scheduler.base import (
     PrefillRequest,
     PrefillResponse,
     SchedulerProgress,
+)
+from max.serve.scheduler.batch_constructor.text_batch_constructor import (
+    TextBatchConstructor,
 )
 from max.serve.scheduler.decode_scheduler import (
     DecodeRequestPhase,
@@ -873,6 +876,324 @@ def test_cancel_after_prefill_response_defers_release_until_transfer_completes()
     )
 
 
+def test_cancel_after_prefill_response_releases_deferred_grammar_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deferred-cancellation path in ``check_for_completed_transfers``
+    must release an outstanding grammar build too, not just KV blocks and
+    ``_handoff_landed_at`` -- a request cancelled while its transfer is
+    still in flight can have a grammar build running from admission time.
+    """
+    decode, prefill, server_addr, q = create_di_scheduler()
+    ctx = create_text_context(
+        target_endpoint=server_addr, prompt_len=100, output_len=5
+    )
+    req_id = ctx.request_id
+
+    released_ids: list[RequestID] = []
+    monkeypatch.setattr(
+        decode.batch_constructor,
+        "release_grammar_build",
+        lambda rid: released_ids.append(rid),
+    )
+
+    q.request_queue.put(ctx)
+    decode.run_iteration()
+    prefill.run_iteration()
+    run_until(lambda: in_transfer(decode, req_id), decode, prefill)
+
+    q.cancel_queue.put([req_id])
+    with patch.object(
+        decode.transfer_engine, "is_complete", return_value=False
+    ):
+        decode.run_iteration()
+
+    assert released_ids == [], (
+        "release_grammar_build must not fire before the transfer completes"
+    )
+
+    run_until(lambda: req_id not in decode.requests, decode, prefill)
+
+    assert released_ids == [req_id]
+
+
+def test_cancel_before_prefill_response_with_onload_in_flight_defers_release() -> (
+    None
+):
+    """Cancelling while ``AWAITING_PREFILL`` with the onload in flight,
+    then receiving the ``PrefillResponse``, must not emit a second
+    (generation) result, and block release must wait for both the onload
+    and the transfer to land.
+
+    Drives the real ``DecodeScheduler``, KV cache manager, and batch
+    constructor through the full lifecycle -- the sibling mocked-self unit
+    test only covers the immediate no-second-result effect.
+
+    Injects the response directly via ``handle_prefill_response`` rather
+    than through a real ``PrefillScheduler``: prefill's own
+    cancel-vs-respond race (``initiate_transfer_and_send_reply``'s
+    ``outstanding_cancelled_requests`` check) is a separate,
+    timing-dependent concern, not reliably reproducible via deterministic
+    ``run_iteration()`` calls.
+    """
+    decode, _prefill, server_addr, q = create_di_scheduler()
+    ctx = create_text_context(
+        target_endpoint=server_addr, prompt_len=100, output_len=5
+    )
+    req_id = ctx.request_id
+    pages_before = decode.kv_cache.block_count(replica_idx=0).used
+
+    q.request_queue.put(ctx)
+    decode.run_iteration()  # allocs (onload_event) and sends to prefill
+    assert req_id in decode.requests
+    pending = decode.requests[req_id]
+    assert pending.phase is DecodeRequestPhase.AWAITING_PREFILL
+
+    q.cancel_queue.put([req_id])
+    with patch.object(pending.onload_event, "is_complete", return_value=False):
+        decode.run_iteration()  # cancellation: deferred, onload in flight
+        assert req_id in decode.requests
+        assert is_cancelled(decode, req_id)
+        pages_while_deferred = decode.kv_cache.block_count(replica_idx=0).used
+        assert pages_while_deferred > pages_before, (
+            "Blocks must not be released while the onload is still in flight"
+        )
+
+        transfer_metadata = MagicMock()
+        decode.handle_prefill_response(
+            PrefillResponse(
+                id=req_id,
+                generated_token_id=5,
+                transfer_metadata=transfer_metadata,
+            )
+        )
+
+        assert in_transfer(decode, req_id)
+        assert is_cancelled(decode, req_id)
+        assert decode.requests[req_id].transfer is transfer_metadata
+        assert response_count(q, req_id) == 1, (
+            "Expected only the original cancelled() result, got a second "
+            "response after the PrefillResponse landed"
+        )
+
+    # Onload now reports complete again. The synthetic transfer_metadata
+    # isn't a real NIXL transfer the engine knows about, so drive its
+    # completion the same way the sibling TRANSFERRING-cancel test drives
+    # the onload: patch is_complete/cleanup_transfer directly.
+    with (
+        patch.object(decode.transfer_engine, "is_complete", return_value=True),
+        patch.object(decode.transfer_engine, "cleanup_transfer"),
+    ):
+        decode.check_for_completed_transfers()
+
+    assert req_id not in decode.requests
+    assert not decode.batch_constructor.contains(req_id)
+    pages_after_completion = decode.kv_cache.block_count(replica_idx=0).used
+    assert pages_after_completion == pages_before, (
+        f"KV blocks leaked after deferred cancel cleanup: had "
+        f"{pages_before} before, {pages_after_completion} after "
+        f"(expected {pages_before})."
+    )
+    assert response_count(q, req_id) == 1, (
+        "Expected exactly one response for the whole lifecycle"
+    )
+
+
+def test_structured_output_handoff_discards_prefill_token_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the DI prefill-to-decode handoff on by default, a constrained
+    request's prefill token is discarded and the handoff is treated as a
+    one-token chunked-CE continuation instead of a completed generation
+    step.
+    """
+    monkeypatch.setattr(
+        TextBatchConstructor,
+        "structured_output_enabled",
+        property(lambda self: True),
+    )
+
+    decode, _prefill, server_addr, q = create_di_scheduler()
+    ctx = create_text_context(
+        target_endpoint=server_addr, prompt_len=100, output_len=5
+    )
+    ctx.json_schema = '{"type": "object"}'
+    req_id = ctx.request_id
+
+    q.request_queue.put(ctx)
+    decode.run_iteration()  # allocs and sends to prefill
+    assert req_id in decode.requests
+
+    decode.handle_prefill_response(
+        PrefillResponse(
+            id=req_id,
+            generated_token_id=5,
+            transfer_metadata=MagicMock(),
+        )
+    )
+
+    pending = decode.requests[req_id]
+    assert pending.phase is DecodeRequestPhase.TRANSFERRING
+    assert pending.context.tokens.generated_length == 0, (
+        "The handoff must not apply prefill's discarded token"
+    )
+    assert pending.context.tokens.active_length == 1, (
+        "Exactly one token (the last prompt token) must remain active for "
+        "decode's own re-forward"
+    )
+    assert response_count(q, req_id) == 0, (
+        "No output is produced until decode's own forward samples token 1"
+    )
+
+
+def test_handoff_to_first_token_metric_recorded_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The handoff-to-first-token metric is a new TTFT contribution: time
+    from the handoff landing (prefill's token discarded) to decode's own
+    re-forward actually sending token 1. Drives a real end-to-end flow
+    (real prefill scheduler, real KV transfer) rather than injecting a
+    ``PrefillResponse`` directly, since the metric is only emitted once
+    decode's own CE step for the handoff actually completes.
+    """
+    monkeypatch.setattr(
+        TextBatchConstructor,
+        "structured_output_enabled",
+        property(lambda self: True),
+    )
+
+    decode, prefill, server_addr, q = create_di_scheduler()
+    ctx = create_text_context(
+        target_endpoint=server_addr, prompt_len=100, output_len=5
+    )
+    ctx.json_schema = '{"type": "object"}'
+    req_id = ctx.request_id
+    q.request_queue.put(ctx)
+
+    decode.run_iteration()
+    prefill.run_iteration()
+
+    with patch("max.serve.scheduler.decode_scheduler.METRICS") as mock_metrics:
+        run_until(lambda: req_id in done_request_ids(q), decode, prefill)
+
+    mock_metrics.di_handoff_to_first_token_time.assert_called_once()
+    assert req_id not in decode._handoff_landed_at, (
+        "the tracked landing time must be popped once read back, not leaked"
+    )
+
+
+def test_structured_output_handoff_completes_multi_token_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The handoff's chunked-CE continuation must hand off cleanly into
+    ordinary TG scheduling for the rest of the sequence -- not just sample
+    token 1 and stall. Drives a real end-to-end flow through completion.
+    """
+    monkeypatch.setattr(
+        TextBatchConstructor,
+        "structured_output_enabled",
+        property(lambda self: True),
+    )
+
+    output_len = 8
+    decode, prefill, server_addr, q = create_di_scheduler()
+    ctx = create_text_context(
+        target_endpoint=server_addr, prompt_len=100, output_len=output_len
+    )
+    ctx.json_schema = '{"type": "object"}'
+    req_id = ctx.request_id
+    q.request_queue.put(ctx)
+
+    decode.run_iteration()
+    prefill.run_iteration()
+    run_until(lambda: req_id in done_request_ids(q), decode, prefill)
+
+    assert response_count(q, req_id) == output_len, (
+        f"expected exactly {output_len} responses (one per generated "
+        "token) -- the handoff must hand off into ordinary TG scheduling "
+        "for the rest of the sequence, not stall after token 1"
+    )
+
+
+def test_structured_output_handoff_discards_draft_tokens_with_spec_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Speculative decoding's draft tokens must not survive the handoff for
+    a constrained request: prefill ran fully unconstrained, so its draft
+    tokens (verified against an unconstrained target distribution) can't
+    be trusted to satisfy the grammar either. Decode's spec-decode state
+    cold-starts like any other fresh context, same as the sampled token.
+    """
+    monkeypatch.setattr(
+        TextBatchConstructor,
+        "structured_output_enabled",
+        property(lambda self: True),
+    )
+
+    num_spec_tokens = 3
+    decode, prefill, server_addr, q = create_di_scheduler(
+        spec_decode_prefill=True,
+        num_speculative_tokens=num_spec_tokens,
+    )
+    ctx = create_text_context(
+        target_endpoint=server_addr, prompt_len=100, output_len=5
+    )
+    ctx.json_schema = '{"type": "object"}'
+    req_id = ctx.request_id
+    q.request_queue.put(ctx)
+
+    decode.run_iteration()
+    prefill.run_iteration()
+
+    prefill_metadata = decode.dispatcher.recv_reply_nowait()
+    assert isinstance(prefill_metadata, KVTransferEngineMetadata)
+    prefill_response = decode.dispatcher.recv_reply_nowait()
+    assert isinstance(prefill_response, PrefillResponse)
+    assert prefill_response.draft_tokens is not None
+    assert len(prefill_response.draft_tokens) == num_spec_tokens
+
+    decode.handle_prefill_response(prefill_response)
+
+    pending = decode.requests[req_id]
+    assert pending.context.spec_decoding_state.draft_tokens_to_verify == [], (
+        "prefill's draft tokens must be discarded for a constrained "
+        "handoff, not applied to decode's spec-decode state"
+    )
+    assert pending.context.tokens.generated_length == 0
+    assert pending.context.tokens.active_length == 1
+
+
+def test_grammar_build_failure_is_forwarded_to_response_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request whose admission-time grammar build fails must reach the
+    client as a failed response instead of hanging -- run_iteration must
+    drain ``batch_constructor.take_grammar_failed()``, same as the
+    aggregated scheduler already does. If the request's handoff had
+    already landed, its tracked landing time must be popped alongside
+    the failure, not leaked.
+    """
+    decode, _prefill, q, ctx = (
+        create_default_di_scheduler_and_submit_one_request()
+    )
+    req_id = ctx.request_id
+    error = "Grammar provided in request cannot be compiled: bad schema"
+    monkeypatch.setattr(
+        decode.batch_constructor,
+        "take_grammar_failed",
+        lambda: [(req_id, error)],
+    )
+    # A handoff can fail its grammar build on the same request; the tracked
+    # landing time must be popped alongside the failure, not leaked.
+    decode._handoff_landed_at[req_id] = time.monotonic()
+
+    decode.run_iteration()
+
+    output = q.response_queue.get_nowait()
+    assert output[req_id].error == error
+    assert req_id not in decode._handoff_landed_at
+
+
 def test_stale_prefill_response_after_cancel_does_not_crash() -> None:
     """A PrefillResponse arriving after the request was cancelled must be
     silently discarded, not raise KeyError.
@@ -943,6 +1264,60 @@ def test_prefix_caching_marks_cached_blocks_in_prefill_request() -> None:
     assert dst_ids[:num_cached] == [-1] * num_cached
     # Remaining entries must be valid non-negative block indices
     assert all(idx >= 0 for idx in dst_ids[num_cached:])
+
+
+def test_prefix_caching_marks_cached_blocks_independent_of_decode_dp() -> None:
+    """The number of blocks marked -1 for a cached prefix must not depend
+    on decode's data-parallel degree.
+
+    Regression: the marking loop divided by ``data_parallel_degree``, but
+    no block-count computation in the KV cache manager scales by DP
+    degree. Under-counting the cached prefix at DP>1 let prefill's
+    transfer overwrite blocks decode's own onload was concurrently
+    populating.
+
+    Compares ``decode_dp=1`` against ``decode_dp=2`` instead of asserting
+    an absolute count, since prefix caching doesn't commit every full
+    prompt page to the cache immediately (unrelated to this bug).
+    """
+
+    def num_cached_blocks(decode_dp: int) -> int:
+        page_size = 32
+        prompt_len = 256  # 8 full pages
+        decode, prefill, server_addr, q = create_di_scheduler(
+            page_size=page_size,
+            enable_prefix_caching=True,
+            decode_dp=decode_dp,
+        )
+
+        ctx1 = create_text_context(
+            target_endpoint=server_addr, prompt_len=prompt_len, output_len=5
+        )
+        q.request_queue.put(ctx1)
+        decode.run_iteration()
+        prefill.run_iteration()
+        run_until(
+            lambda: ctx1.request_id in done_request_ids(q), decode, prefill
+        )
+
+        ctx2 = create_text_context(
+            target_endpoint=server_addr, prompt_len=prompt_len, output_len=5
+        )
+        q.request_queue.put(ctx2)
+        decode.reserve_memory_and_send_to_prefill()
+
+        while True:
+            msg, _ = prefill.dispatcher.recv_request_nowait()
+            if isinstance(msg, PrefillRequest):
+                break
+
+        return msg.dst_block_ids.count(-1)
+
+    baseline = num_cached_blocks(decode_dp=1)
+    assert baseline > 0, "Expected some blocks to be prefix-cached"
+    assert num_cached_blocks(decode_dp=2) == baseline, (
+        "Cached-block count must not depend on decode_dp"
+    )
 
 
 def test_prefix_caching_prefill_skips_cached_blocks_in_transfer() -> None:
@@ -2019,12 +2394,12 @@ def test_load_prefill_scheduler_accepts_eagle_spec_decode() -> None:
             return_value=TextContext,
         ),
     ):
-        result = load_prefill_scheduler(pipeline, config, MagicMock())
+        result = load_prefill_scheduler(pipeline, config, MagicMock(), None)
 
     assert result is sentinel
     prefill_scheduler_cls.assert_called_once()
     from_pipeline_config.assert_called_once_with(
-        config, pipeline.max_batch_size
+        config, pipeline.max_batch_size, None
     )
 
 
@@ -2048,7 +2423,7 @@ def test_load_prefill_scheduler_accepts_mtp_spec_decode() -> None:
             return_value=TextContext,
         ),
     ):
-        load_prefill_scheduler(pipeline, config, MagicMock())
+        load_prefill_scheduler(pipeline, config, MagicMock(), None)
 
 
 # Overlap + speculative decoding on the prefill side: CE deferral and
@@ -2454,19 +2829,23 @@ def test_decode_request_ttl_propagates_from_pipeline_config() -> None:
     pipeline_config = MagicMock()
     pipeline_config.runtime.max_batch_size = 1
     pipeline_config.runtime.max_batch_input_tokens = 8192
-    pipeline_config.runtime.max_batch_total_tokens = 8192
     pipeline_config.runtime.enable_chunked_prefill = True
     pipeline_config.runtime.chunked_prefill_min_chunk_size = 0
     pipeline_config.runtime.enable_in_flight_batching = False
     pipeline_config.runtime.dp_ce_balance_threshold = 0.8
     pipeline_config.runtime.decode_stall_timeout_s = None
     pipeline_config.runtime.decode_request_ttl_s = 42.0
-    pipeline_config.model.max_length = 2048
     pipeline_config.model.data_parallel_degree = 1
     pipeline_config.speculative = None
+    memory_plan = MemoryPlan(
+        planned_max_batch_size=1,
+        footprint=0,
+        planned_max_length=2048,
+        planned_max_batch_total_tokens=8192,
+    )
 
     config = TokenGenerationSchedulerConfig.from_pipeline_config(
-        pipeline_config, max_batch_size=1
+        pipeline_config, max_batch_size=1, memory_plan=memory_plan
     )
 
     assert config.decode_request_ttl_s == 42.0

@@ -44,15 +44,19 @@ import numpy.typing as npt
 from llguidance import LLMatcher, LLTokenizer
 from llguidance._tokenizer import TokenizerWrapper
 from max import _xgrammar as xgrammar
+from max._xgrammar.builtin_structural_tag import (
+    get_inkling_response_format_branch,
+)
 from max._xgrammar.structural_tag import (
+    Format,
     JSONSchemaFormat,
     OrFormat,
     StructuralTag,
 )
 from max.pipelines.context import GrammarMatcher
 from max.pipelines.context.exceptions import InputError
+from max.pipelines.lib.json_schema import schema_shape
 from max.pipelines.lib.tool_parsing import get_parser_cls
-from max.pipelines.sampling import DEFAULT_STRUCTURED_OUTPUT_BACKEND
 from transformers import PreTrainedTokenizerBase, PreTrainedTokenizerFast
 
 logger = logging.getLogger("max.pipelines")
@@ -72,19 +76,69 @@ STRUCTURED_OUTPUT_MAX_WHITESPACE_RUN = 16
 _CompileFn = TypeVar("_CompileFn", bound=Callable[..., Any])
 
 
+def _structural_tag_schemas(tag: dict[str, Any]) -> list[Any] | None:
+    """Returns the schemas a structural tag embeds, or None if not a tag.
+
+    A tag's ``format`` is an object where a JSON Schema's is a string, which
+    is what tells the two apart. The scan stops at each ``json_schema``, so
+    the tag and its schemas are walked once each.
+    """
+    if not isinstance(tag.get("format"), dict):
+        return None
+    schemas: list[Any] = []
+    stack: list[Any] = [tag]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "json_schema":
+                    schemas.append(value)
+                elif isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(node, list):
+            stack.extend(v for v in node if isinstance(v, (dict, list)))
+    return schemas
+
+
+def _compiled_shape(body: Any) -> tuple[int, int] | None:
+    """Returns ``(max_depth, total_subschemas)`` of what a compile was handed.
+
+    A tool grammar is a structural tag wrapping one schema per tool, so its
+    shape is the deepest of those schemas and the total across them. Anything
+    else is measured as a schema in its own right.
+    """
+    if isinstance(body, (str, bytes)):
+        try:
+            body = json.loads(body)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(body, dict):
+        return None
+
+    embedded = _structural_tag_schemas(body)
+    if embedded is None:
+        return schema_shape(body)
+    shapes = [s for s in map(schema_shape, embedded) if s is not None]
+    if not shapes:
+        return None
+    return max(d for d, _ in shapes), sum(n for _, n in shapes)
+
+
 def _log_if_slow(fn: _CompileFn) -> _CompileFn:
-    """Time a backend compile method and log when it exceeds the threshold.
+    """Times a compile entry point and logs when it exceeds the threshold.
 
-    Wraps the compile entry points (``create_matcher`` /
-    ``compile_json_schema``) so every caller -- decode-thread setup and
-    admission-time validation alike -- surfaces a slow compile without
-    per-call-site timing. Logs the backend name, method, and duration only;
-    the schema/grammar body is never logged (may be large or sensitive).
+    Duration, method, backend and schema shape ride along as ``extra`` so they
+    are queryable; the schema body never does, being large and possibly
+    sensitive. Shape is walked only past the threshold and is linear in
+    subschema count, so the warm path is unaffected.
 
-    The same three values are attached as ``extra`` so structured log
-    backends can facet and aggregate on them (a duration that lives only in
-    the message text is not queryable). ``grammar_backend`` rather than
-    ``name`` because ``LogRecord`` reserves the latter for the logger name.
+    Typical shapes, for recognizing an outlier: a ``response_format`` schema or
+    a single tool's arguments sit at single-digit depth with at most a few dozen
+    subschemas, and a tool grammar holds that depth while its node count scales
+    with the tool count (20 tools of 5 subschemas each reports depth 4, 100
+    nodes). Compile cost grows super-linearly in both depth and breadth, so a
+    schema hundreds deep, or a thousand wide, sits orders of magnitude above
+    typical.
     """
 
     @wraps(fn)
@@ -95,17 +149,29 @@ def _log_if_slow(fn: _CompileFn) -> _CompileFn:
         finally:
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             if elapsed_ms > _GRAMMAR_COMPILE_LOG_MS:
+                extra: dict[str, Any] = {
+                    "event": "grammar_compile_slow",
+                    "grammar_compile_method": fn.__name__,
+                    "grammar_compile_time_ms": elapsed_ms,
+                    "grammar_backend": self.name,
+                }
+                # Both wrapped methods take exactly one argument, so a
+                # keyword call puts the payload in the sole kwargs entry.
+                payload = args[0] if args else next(iter(kwargs.values()), None)
+                # Never let diagnostics break the call they are describing.
+                try:
+                    shape = _compiled_shape(payload)
+                except Exception:
+                    shape = None
+                if shape is not None:
+                    extra["grammar_schema_depth"] = shape[0]
+                    extra["grammar_schema_nodes"] = shape[1]
                 logger.info(
                     "grammar %s took %.1fms (%s backend)",
                     fn.__name__,
                     elapsed_ms,
                     self.name,
-                    extra={
-                        "event": "grammar_compile_slow",
-                        "grammar_compile_method": fn.__name__,
-                        "grammar_compile_time_ms": elapsed_ms,
-                        "grammar_backend": self.name,
-                    },
+                    extra=extra,
                 )
 
     return cast(_CompileFn, wrapper)
@@ -180,34 +246,12 @@ class _TikTokenAdapter:
 GrammarT = TypeVar("GrammarT")
 
 
-class GrammarValidator(Protocol):
-    """Admission-time validation surface for structured output.
-
-    The narrow role the request-admission path (API server) depends on: reject
-    a grammar or JSON schema the active backend cannot compile with an
-    :class:`InputError` (HTTP 400) up front. Deliberately excludes the engine/decode-time entry
-    points (compile handles, matchers, bitmasks) so the admission layer never
-    couples to them.
-
-    :class:`GrammarBackend` extends this and supplies the implementations. The
-    admission layer holds a value typed only as ``GrammarValidator``.
-    """
-
-    def check_tool_grammar(self, grammar: str) -> None:
-        """Raise :class:`InputError` if the tool-call grammar cannot compile."""
-        ...
-
-    def check_json_schema(self, json_schema: str) -> None:
-        """Raise :class:`InputError` if the response_format schema cannot compile."""
-        ...
-
-
-class GrammarBackend(GrammarValidator, Protocol[GrammarT]):
+class GrammarBackend(Protocol[GrammarT]):
     """Engine-level entry points: compile grammars, build matchers, bitmasks.
 
-    Extends :class:`GrammarValidator` and implements its checks in terms of the
-    engine methods below, so every backend is usable as an admission-time
-    validator.
+    Only the model worker holds a backend: it owns the single grammar
+    compile, and rejects what it cannot build with an :class:`InputError`
+    the API server turns into an HTTP 400.
     """
 
     name: str
@@ -246,39 +290,6 @@ class GrammarBackend(GrammarValidator, Protocol[GrammarT]):
     ) -> None:
         """Fill ``bitmask`` row ``index`` with the matcher's allowed tokens."""
         ...
-
-    # ----- GrammarValidator implementation (admission-time checks) ----------
-    # These run the same compile the model worker would (see
-    # StructuredOutputHelper.update_context) up front, in the API process, so a
-    # grammar the backend cannot compile is raised as an InputError (HTTP 400) here.
-    # Concrete on the protocol so every backend inherits them.
-
-    def check_tool_grammar(self, grammar: str) -> None:
-        """Raise :class:`InputError` if the tool-call grammar cannot compile."""
-        try:
-            self.create_matcher(grammar)
-        except Exception as e:
-            raise InputError(
-                f"Tool-call grammar cannot be compiled by the "
-                f"{self.name} backend: {str(e).strip()}"
-            ) from e
-
-    def check_json_schema(self, json_schema: str) -> None:
-        """Raise :class:`InputError` if the response_format schema cannot compile.
-
-        Runs the worker's compile + matcher build, plus a backend-specific
-        grammar validity check that rejects semantically invalid grammars
-        (e.g. unsatisfiable schemas).
-        """
-        try:
-            compiled = self.compile_json_schema(json_schema)
-            self.validate_grammar(compiled)
-            self.create_matcher(compiled)
-        except Exception as e:
-            raise InputError(
-                f"response_format json_schema cannot be compiled by the "
-                f"{self.name} backend: {str(e).strip()}"
-            ) from e
 
 
 class LlguidanceBackend(GrammarBackend[Any]):
@@ -494,12 +505,9 @@ class XgrammarBackend(GrammarBackend[Any]):
     def __init__(
         self,
         compiler: Any,
-        # TODO(CENG-813): remove this Gemma-only scoping once require_object_root and reject_unsupported default on for all models.
-        reject_unsupported: bool = False,
         any_whitespace: bool = False,
     ) -> None:
         self._compiler = compiler
-        self._reject_unsupported = reject_unsupported
         self._any_whitespace = any_whitespace
 
     @classmethod
@@ -507,8 +515,6 @@ class XgrammarBackend(GrammarBackend[Any]):
         cls,
         tokenizer_delegate: PreTrainedTokenizerBase,
         vocab_size: int,
-        # TODO(CENG-813): remove this Gemma-only scoping once require_object_root and reject_unsupported default on for all models.
-        reject_unsupported: bool = False,
         stop_token_ids: Collection[int] | None = None,
         special_token_ids: Collection[int] = (),
         any_whitespace: bool = False,
@@ -538,7 +544,6 @@ class XgrammarBackend(GrammarBackend[Any]):
             xgrammar.GrammarCompiler(
                 tokenizer_info, max_memory_bytes=_xgrammar_cache_limit_bytes()
             ),
-            reject_unsupported=reject_unsupported,
             any_whitespace=any_whitespace,
         )
 
@@ -563,8 +568,9 @@ class XgrammarBackend(GrammarBackend[Any]):
                 if self._any_whitespace
                 else None
             ),
-            # TODO(CENG-813): remove this Gemma-only scoping once require_object_root and reject_unsupported default on for all models.
-            reject_unsupported=self._reject_unsupported,
+            # MAX fails closed: reject schemas the engine cannot faithfully
+            # enforce rather than fall back to unconstrained decoding.
+            reject_unsupported=True,
         )
 
     @_log_if_slow
@@ -605,8 +611,24 @@ class XgrammarBackend(GrammarBackend[Any]):
         bitmask: npt.NDArray[np.int32],
         index: int,
     ) -> None:
-        """Fill ``bitmask`` row ``index`` with the matcher's allowed tokens."""
+        """Fill ``bitmask`` row ``index`` with the matcher's allowed tokens.
+
+        Once ``matcher`` is stopped, xgrammar's own fill raises a fatal C++
+        check rather than returning a mask -- unlike llguidance, which
+        computes a real EOS-only mask in that state. ``stop_token_ids`` is a
+        plain property, safe to read even after termination, so the row is
+        built by hand here instead: only the stop tokens stay allowed,
+        giving xgrammar the same forced termination llguidance already
+        provides rather than leaving the row unconstrained.
+        """
         assert isinstance(matcher, XgrammarMatcher)
+        if matcher.is_stopped():
+            bitmask[index, :] = 0
+            for stop_id in matcher._matcher.stop_token_ids:
+                bitmask[index, stop_id // 32] |= np.int32(1) << np.int32(
+                    stop_id % 32
+                )
+            return
         matcher._matcher.fill_next_token_bitmask(bitmask, index)
 
 
@@ -653,14 +675,16 @@ def build_xgrammar_tool_grammar(
         reasoning=False,
     )
     if response_format_schema is not None:
-        json_branch = JSONSchemaFormat(
+        json_branch: Format = JSONSchemaFormat(
             json_schema=response_format_schema,
             any_whitespace=False,
             separators=(",", ":"),
-            # TODO(CENG-813): drop this per-model scoping once
-            # require_object_root/reject_unsupported default on for all models.
-            reject_unsupported=model_format in ("gemma_4", "glm_4_7"),
+            reject_unsupported=True,
         )
+        if model_format == "inkling":
+            # An Inkling turn is a sequence of framed messages; bare JSON is
+            # not something its parsers can read.
+            json_branch = get_inkling_response_format_branch(json_branch)
         tag = StructuralTag(format=OrFormat(elements=[tag.format, json_branch]))
     return tag.model_dump_json()
 
@@ -700,9 +724,6 @@ def make_grammar_backend(
         return XgrammarBackend.from_tokenizer_delegate(
             tokenizer_delegate,
             vocab_size,
-            # TODO(CENG-813): drop this per-model scoping once
-            # require_object_root/reject_unsupported default on for all models.
-            reject_unsupported=tool_parser_name in ("gemma4", "glm45"),
             stop_token_ids=stop_token_ids,
             special_token_ids=special_token_ids_for(
                 tool_parser_name, tokenizer_delegate
@@ -712,40 +733,4 @@ def make_grammar_backend(
     raise ValueError(
         f"unknown structured output backend: {name!r} "
         f"(supported: 'llguidance', 'xgrammar')"
-    )
-
-
-def make_grammar_validator(
-    backend_name: str | None,
-    tokenizer_delegate: PreTrainedTokenizerBase,
-    vocab_size: int,
-    *,
-    tool_parser_name: str | None = None,
-    any_whitespace: bool | None = None,
-) -> GrammarValidator:
-    """Build the admission-time :class:`GrammarValidator` for a backend.
-
-    Constructs the selected backend (which implements
-    :class:`GrammarValidator`) and hands it back typed only as the narrow
-    validation surface, so the request-admission path never couples to the
-    engine/decode-time API.
-
-    A ``None`` ``backend_name`` (an unresolved config) falls back to
-    ``DEFAULT_STRUCTURED_OUTPUT_BACKEND`` -- the SAME fallback
-    :meth:`StructuredOutputHelper.from_tokenizer` uses -- so admission compiles
-    against the backend the worker will actually build, including when the arch
-    pin was never applied and the worker would otherwise crash on an unhandled
-    grammar.
-
-    Note this builds a backend instance (and thus, for xgrammar, a
-    ``GrammarCompiler``) in the API process; the tokenizer is already loaded
-    there, so this is a bounded, deliberate cost that avoids a worker
-    round-trip.
-    """
-    return make_grammar_backend(
-        backend_name or DEFAULT_STRUCTURED_OUTPUT_BACKEND,
-        tokenizer_delegate,
-        vocab_size,
-        tool_parser_name=tool_parser_name,
-        any_whitespace=bool(any_whitespace),
     )

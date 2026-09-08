@@ -41,6 +41,7 @@ from std.ffi import (
     CStringSlice,
 )
 from std.sys import (
+    align_of,
     bit_width_of,
     get_defined_bool,
     get_defined_string,
@@ -66,7 +67,7 @@ from std.builtin.device_passable import (
 )
 from std.compile.compile import CompiledFunctionInfo
 from std.reflection import reflect, reflect_fn
-from std.memory import unsafe_stack_allocation
+from std.memory import Pointer, unsafe_memcpy, unsafe_stack_allocation
 from std.memory import alloc, dealloc, ThinAllocation, Layout, MaybeUninit
 from std.memory.unsafe import bitcast
 from std.builtin.rebind import downcast
@@ -79,9 +80,10 @@ from std.builtin._coroutine import (
 
 from std.utils import Variant
 from std.utils._serialize import _serialize_elements
+from std.utils.static_tuple import StaticTuple
 
-from std.gpu.host import get_gpu_target
-from std.gpu.host.info import GPUInfo
+from std._gpu.host import get_gpu_target
+from std._gpu.host.info import GPUInfo
 
 from .compile import (
     _compile_code,
@@ -134,6 +136,29 @@ struct _CompletionFlagCpp:
 
 struct _DeviceContextScopeCpp:
     pass
+
+
+# Callable structs parameterized by a capturing function type cannot implement
+# `DevicePassable` in user code: that bound makes every method `capturing thin`.
+# Bit-copy those kernels into a size/alignment bag (no function-type parameter)
+# so the RegisterPassable `enqueue_function` overload can encode the bag.
+@align(alignment)
+@fieldwise_init
+struct _LaunchBits[size: Int, alignment: Int](
+    DevicePassable, ImplicitlyCopyable, RegisterPassable
+):
+    var storage: StaticTuple[UInt8, Self.size]
+
+    comptime device_type: AnyType = Self
+
+    def _to_device_type(
+        self, mut encoder: Some[DeviceTypeEncoder], target: MutOpaquePointer[_]
+    ):
+        encoder.encode(self, target)
+
+    @staticmethod
+    def get_type_name() -> String:
+        return "_LaunchBits"
 
 
 comptime _DeviceContextPtr[
@@ -2121,8 +2146,8 @@ struct DeviceBuffer[dtype: DType](
 
         var ctx = DeviceContext()
         var length = 1024
-        var in_dev = ctx.enqueue_create_buffer[DType.float32](length)
-        var out_dev = ctx.enqueue_create_buffer[DType.float32](length)
+        var in_dev = ctx.enqueue_create_buffer[.float32](length)
+        var out_dev = ctx.enqueue_create_buffer[.float32](length)
 
         # Initialize the input and output with known values.
         with in_dev.map_to_host() as in_host, out_dev.map_to_host() as out_host:
@@ -3317,40 +3342,21 @@ struct DeviceFunction[
                 else:
                     return reflect[declared_arg_type].name()
 
-            # Now we'll check if the given argument's device_type is
-            # what the kernel expects.
-
-            # First, check if they're handing in a device dtype, in other
-            # words, a dtype that can be passed directly and doesn't need to
-            # be mapped. For example, Int, IndexList, etc.
-            comptime is_convertible: Bool = actual_arg_type._is_convertible_to_device_type[
+            # Check that the given argument can occupy the kernel's declared
+            # argument slot after device encoding.
+            comptime is_convertible: Bool = actual_arg_type._is_implicitly_encodable_to[
                 declared_arg_type
             ]()
 
-            comptime if actual_arg_type == actual_arg_type.device_type:
-                # Now check if they handed in the *correct* device dtype.
-                comptime assert is_convertible, String(
-                    "argument #",
-                    i,
-                    " of type '",
-                    actual_arg_type.get_type_name(),
-                    "' does not match the declared function argument type '",
-                    declared_arg_type_name(),
-                    "'",
-                )
-            else:
-                # They handed in a host dtype, in other words, a dtype that
-                # needs to be mapped before handing it to the device. In
-                # this case, we use a more informative error message.
-                comptime assert is_convertible, String(
-                    "argument #",
-                    i,
-                    " of type '",
-                    actual_arg_type.get_type_name(),
-                    "' (which became device of type '",
-                    declared_arg_type_name(),
-                    "') does not match the declared function argument type",
-                )
+            comptime assert is_convertible, String(
+                "argument #",
+                i,
+                " of type '",
+                actual_arg_type.get_type_name(),
+                "' is not encodable as the declared function argument type '",
+                declared_arg_type_name(),
+                "'",
+            )
             var aligned_type_size = align_up(
                 size_of[actual_arg_type.device_type, target=Self.target](),
                 8,
@@ -3659,6 +3665,9 @@ struct DeviceExternalFunction:
     var _handle: _DeviceFunctionPtr[mut=True]
     """Internal handle to the native device function object."""
 
+    var _context: DeviceContext
+    """The device context backing the function."""
+
     def __init__(out self, *, copy: Self):
         """Creates a copy of an existing device function by incrementing its reference count.
 
@@ -3674,6 +3683,7 @@ struct DeviceExternalFunction:
             _DeviceFunctionPtr[mut=True],
         ](copy._handle)
         self._handle = copy._handle
+        self._context = copy._context
 
     def __deinit__(deinit self):
         """Releases resources associated with this device function."""
@@ -3737,6 +3747,8 @@ struct DeviceExternalFunction:
         Raises:
             If function loading fails or if an unsupported attribute is provided.
         """
+        self._context = ctx
+
         var max_dynamic_shared_size_bytes: Int32 = -1
         if func_attribute:
             if (
@@ -3868,7 +3880,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
 
     ```mojo
     from max.gpu.host import DeviceContext
-    from std.gpu import thread_idx
+    from max.gpu import thread_idx
 
     def kernel():
         print("hello from thread:", thread_idx.x, thread_idx.y, thread_idx.z)
@@ -4337,7 +4349,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
 
         with DeviceContext() as ctx:
             # Allocate host memory accessible by the device
-            var host_buffer = ctx.enqueue_create_host_buffer[DType.float32](1024)
+            var host_buffer = ctx.enqueue_create_host_buffer[.float32](1024)
 
             # Use the host buffer for device operations
             # ...
@@ -4655,7 +4667,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
 
     @always_inline
     def enqueue_function[
-        FuncType: def() -> None,
+        FuncType: DevicePassable & def() -> None,
         //,
         dump_asm: _DumpPath = False,
         dump_llvm: _DumpPath = False,
@@ -4673,12 +4685,12 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
         func_attribute: OptionalReg[FuncAttribute] = None,
         location: Optional[SourceLocation] = None,
     ) raises:
-        """Compiles and enqueues a capturing kernel for execution on this device with type checking.
+        """Compiles and enqueues a capturing kernel for execution on this device.
 
-        This overload is for kernels that capture variables from their enclosing scope.
-        The `capturing` annotation on the signature function indicates that the kernel
-        can access variables from the surrounding context. Like the non-capturing overload,
-        both `func` and `signature_func` should typically be the same kernel function.
+        This overload is for kernels that capture variables from their enclosing
+        scope. The closure is encoded through `DevicePassable` before launch so
+        host handles such as `DevicePointer` become device addresses, matching
+        explicit kernel arguments.
 
         Parameters:
             FuncType: The type of the function to launch (usually inferred).
@@ -4708,7 +4720,8 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
         your kernel captures variables from its surrounding scope:
 
         ```text
-        from std.gpu import DeviceContext, global_idx
+        from max.gpu import global_idx
+        from max.gpu.host import DeviceContext
         from layout import TileTensor, row_major
 
 
@@ -4716,7 +4729,7 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
             with DeviceContext() as ctx:
                 var scale_factor: Float32 = 2.0
 
-                var data_buffer = ctx.enqueue_create_buffer[DType.float32](100)
+                var data_buffer = ctx.enqueue_create_buffer[.float32](100)
                 var data = TileTensor(data_buffer, row_major[100]())
                 with data_buffer.map_to_host() as h:
                     for i in range(data.num_elements()):
@@ -4746,21 +4759,145 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
             block_dim, location=call_location()
         )
 
+        # The compiled kernel is FuncType.__call__; the launch argument is the
+        # encoded FuncType.device_type instance. Layout punning is only safe
+        # while those sizes and alignments coincide on the launch target.
+        comptime launch_target = Self.default_device_info.target()
+        comptime host_size = size_of[FuncType, target=launch_target]()
+        comptime device_size = size_of[
+            FuncType.device_type, target=launch_target
+        ]()
+        comptime host_align = align_of[FuncType, target=launch_target]()
+        comptime device_align = align_of[
+            FuncType.device_type, target=launch_target
+        ]()
+        comptime assert host_size == device_size, String(
+            "capturing enqueue_function requires size_of[FuncType] to match",
+            " size_of[FuncType.device_type] on the launch target; host=",
+            host_size,
+            " device=",
+            device_size,
+        )
+        comptime assert host_align == device_align, String(
+            "capturing enqueue_function requires align_of[FuncType] to match",
+            " align_of[FuncType.device_type] on the launch target; host=",
+            host_align,
+            " device=",
+            device_align,
+        )
+
         var gpu_kernel = DeviceFunction[
             FuncType.__call__,
-            TypeList.of[Trait=AnyType](),
-            target=Self.default_device_info.target(),
+            TypeList.of[Trait=AnyType, FuncType.device_type](),
+            target=launch_target,
             _ptxas_info_verbose=_ptxas_info_verbose,
-        ](self)
+        ](self, func_attribute=func_attribute)
         gpu_kernel.dump_rep[
             dump_asm=dump_asm,
             dump_llvm=dump_llvm,
             _dump_sass=_dump_sass,
         ]()
 
-        gpu_kernel._call_with_pack(
+        gpu_kernel._call_with_pack_checked(
             self,
             func,
+            grid_dim=grid_dim,
+            block_dim=block_dim,
+            cluster_dim=cluster_dim,
+            shared_mem_bytes=shared_mem_bytes,
+            attributes=attributes^,
+            constant_memory=constant_memory^,
+            location=location.or_else(call_location()),
+        )
+
+    @always_inline
+    def enqueue_function[
+        FuncType: RegisterPassable & def() -> None,
+        //,
+        dump_asm: _DumpPath = False,
+        dump_llvm: _DumpPath = False,
+        _dump_sass: _DumpPath = False,
+        _ptxas_info_verbose: Bool = False,
+    ](
+        self,
+        func: FuncType,
+        grid_dim: Dim,
+        block_dim: Dim,
+        cluster_dim: OptionalReg[Dim] = None,
+        shared_mem_bytes: OptionalReg[Int] = None,
+        var attributes: List[LaunchAttribute] = [],
+        var constant_memory: List[ConstantMemoryMapping] = [],
+        func_attribute: OptionalReg[FuncAttribute] = None,
+        location: Optional[SourceLocation] = None,
+    ) raises where not conforms_to(FuncType, DevicePassable):
+        """Compiles and enqueues a register-passable callable kernel.
+
+        Callable structs that store a capturing function value cannot implement
+        `DevicePassable` (that generic bound makes every method `capturing
+        thin`). This overload bit-copies the kernel into a `DevicePassable` bag
+        and compiles `FuncType.__call__`, matching the previous raw-bytes
+        launch. Capturing closures that do conform to `DevicePassable` use the
+        encoding overload instead.
+
+        Parameters:
+            FuncType: The type of the function to launch (usually inferred).
+            dump_asm: To dump the compiled assembly, pass `True`, or a file
+                path to dump to, or a function returning a file path.
+            dump_llvm: To dump the generated LLVM code, pass `True`, or a file
+                path to dump to, or a function returning a file path.
+            _dump_sass: Only runs on NVIDIA targets, and requires CUDA Toolkit
+                to be installed. Pass `True`, or a file path to dump to, or a
+                function returning a file path.
+            _ptxas_info_verbose: Only runs on NVIDIA targets, and requires CUDA
+                Toolkit to be installed. Changes `dump_asm` to output verbose
+                PTX assembly (default `False`).
+
+        Args:
+            func: The register-passable kernel to compile and launch.
+            grid_dim: The grid dimensions.
+            block_dim: The block dimensions.
+            cluster_dim: The cluster dimensions.
+            shared_mem_bytes: Per-block memory shared between blocks.
+            attributes: A `List` of launch attributes.
+            constant_memory: A `List` of constant memory mappings.
+            func_attribute: `CUfunction_attribute` enum.
+            location: Source location for the function call.
+
+        Raises:
+            If the operation fails.
+        """
+        _check_dim["DeviceContext.enqueue_function", "grid_dim"](
+            grid_dim, location=call_location()
+        )
+        _check_dim["DeviceContext.enqueue_function", "block_dim"](
+            block_dim, location=call_location()
+        )
+
+        comptime launch_target = Self.default_device_info.target()
+        comptime n = size_of[FuncType, target=launch_target]()
+        comptime a = align_of[FuncType, target=launch_target]()
+        var bits = _LaunchBits[n, a](StaticTuple[UInt8, n]())
+        unsafe_memcpy(
+            dest=Pointer(to=bits.storage).unsafe_bitcast[FuncType](),
+            src=Pointer(to=func),
+            count=1,
+        )
+
+        var gpu_kernel = DeviceFunction[
+            FuncType.__call__,
+            TypeList.of[Trait=AnyType, _LaunchBits[n, a]](),
+            target=launch_target,
+            _ptxas_info_verbose=_ptxas_info_verbose,
+        ](self, func_attribute=func_attribute)
+        gpu_kernel.dump_rep[
+            dump_asm=dump_asm,
+            dump_llvm=dump_llvm,
+            _dump_sass=_dump_sass,
+        ]()
+
+        gpu_kernel._call_with_pack_checked(
+            self,
+            bits,
             grid_dim=grid_dim,
             block_dim=block_dim,
             cluster_dim=cluster_dim,
@@ -4900,41 +5037,6 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
 
     @always_inline
     def enqueue_cpu_function[
-        func: def() capturing -> None,
-    ](self) raises:
-        """Enqueues a function for execution on CPU.
-
-        Parameters:
-            func: The function to execute.
-
-        Raises:
-            If the operation fails.
-            If self is not a CPU DeviceContext.
-        """
-        if self.api() != "cpu":
-            raise Error(
-                "enqueue_cpu_function is only supported on CPU DeviceContexts"
-            )
-
-        async def wrapper() capturing -> None:
-            func()
-
-        var coro = wrapper()
-        coro._set_noop_callback()
-        _checked(
-            external_call[
-                "AsyncRT_DeviceContext_enqueueHostFunction",
-                _CString[],
-            ](
-                self._handle,
-                _coro_resume_fn,
-                _coro_destroy_fn,
-                coro^._take_handle(),
-            )
-        )
-
-    @always_inline
-    def enqueue_cpu_function[
         FuncType: def() -> None,
     ](self, func: FuncType) raises:
         """Enqueues a function for execution on CPU.
@@ -5021,59 +5123,15 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
             )
         )
 
-    @__parameter
-    @always_inline
-    def execution_time[
-        func: def(Self) raises capturing[_] -> None
-    ](self, num_iters: Int) raises -> Int:
-        """Measures the execution time of a function that takes a DeviceContext parameter.
-
-        This method times the execution of a provided function that requires the
-        DeviceContext as a parameter. It runs the function for the specified number
-        of iterations and returns the total elapsed time in nanoseconds.
-
-        Parameters:
-            func: A function that takes a DeviceContext parameter to execute and time.
-
-        Args:
-            num_iters: The number of iterations to run the function.
-
-        Returns:
-            The total elapsed time in nanoseconds for all iterations.
-
-        Raises:
-            If the timer operations fail or if the function raises an exception.
-
-        Example:
-
-        ```text
-        from max.gpu.host import DeviceContext
-
-        def gpu_operation(ctx: DeviceContext) raises -> None:
-            # Perform some GPU operation using ctx
-            pass
-
-        with DeviceContext() as ctx:
-            # Measure execution time of a function that uses the context
-            var time_ns = ctx.execution_time[gpu_operation](10)
-            print("Execution time for 10 iterations:", time_ns, "ns")
-        ```
-        """
-
-        @always_inline
-        def func_unified(ctx: Self):
-            try:
-                func(ctx)
-            except e:
-                abort(String(e))
-
-        return self.execution_time(func_unified, num_iters)
-
     @always_inline
     def execution_time[
         FuncType: def(Self) raises -> None,
     ](self, func: FuncType, num_iters: Int) raises -> Int:
         """Measures the execution time of a function that takes a DeviceContext parameter.
+
+        This method times the execution of a provided function that requires the
+        DeviceContext as a parameter. It runs the function for the specified number
+        of iterations and returns the total elapsed time in nanoseconds.
 
         Parameters:
             FuncType: The body function type.
@@ -5087,6 +5145,21 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
 
         Raises:
             If the timer operations fail.
+
+        Example:
+
+        ```text
+        from max.gpu.host import DeviceContext
+
+        def gpu_operation(ctx: DeviceContext) raises -> None:
+            # Perform some GPU operation using ctx
+            pass
+
+        with DeviceContext() as ctx:
+            # Measure execution time of a function that uses the context
+            var time_ns = ctx.execution_time(gpu_operation, 10)
+            print("Execution time for 10 iterations:", time_ns, "ns")
+        ```
         """
         var timer_ptr: _DeviceTimerPtr[mut=True] = {}
         _checked(
@@ -5169,56 +5242,13 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
 
     @always_inline
     def execution_time[
-        func: def() raises capturing[_] -> None
-    ](self, num_iters: Int) raises -> Int:
+        FuncType: def() raises -> None,
+    ](self, func: FuncType, num_iters: Int) raises -> Int:
         """Measures the execution time of a function over multiple iterations.
 
         This method times the execution of a provided function that doesn't require
         the DeviceContext as a parameter. It runs the function for the specified
         number of iterations and returns the total elapsed time in nanoseconds.
-
-        Parameters:
-            func: A function with no parameters to execute and time.
-
-        Args:
-            num_iters: The number of iterations to run the function.
-
-        Returns:
-            The total elapsed time in nanoseconds for all iterations.
-
-        Raises:
-            If the timer operations fail or if the function raises an exception.
-
-        Example:
-
-        ```text
-        from max.gpu.host import DeviceContext
-
-        def some_gpu_operation() raises -> None:
-            # Perform some GPU operation
-            pass
-
-        with DeviceContext() as ctx:
-            # Measure execution time of a function
-            var time_ns = ctx.execution_time[some_gpu_operation](10)
-            print("Execution time:", time_ns, "ns")
-        ```
-        """
-
-        @always_inline
-        def func_unified():
-            try:
-                func()
-            except e:
-                abort(String(e))
-
-        return self.execution_time(func_unified, num_iters)
-
-    @always_inline
-    def execution_time[
-        FuncType: def() raises -> None,
-    ](self, func: FuncType, num_iters: Int) raises -> Int:
-        """Measures the execution time of a function over multiple iterations.
 
         Parameters:
             FuncType: The body function type.
@@ -5232,6 +5262,21 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
 
         Raises:
             If the timer operations fail.
+
+        Example:
+
+        ```text
+        from max.gpu.host import DeviceContext
+
+        def some_gpu_operation() raises -> None:
+            # Perform some GPU operation
+            pass
+
+        with DeviceContext() as ctx:
+            # Measure execution time of a function
+            var time_ns = ctx.execution_time(some_gpu_operation, 10)
+            print("Execution time:", time_ns, "ns")
+        ```
         """
         var timer_ptr: _DeviceTimerPtr[mut=True] = {}
         _checked(
@@ -5261,57 +5306,14 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
 
     @always_inline
     def execution_time_iter[
-        func: def(Self, Int) raises capturing[_] -> None
-    ](self, num_iters: Int) raises -> Int:
+        FuncType: def(Self, Int) raises -> None,
+    ](self, func: FuncType, num_iters: Int) raises -> Int:
         """Measures the execution time of a function that takes iteration index as input.
 
         This method times the execution of a provided function that requires both the
         DeviceContext and the current iteration index as parameters. It runs the function
         for the specified number of iterations, passing the iteration index to each call,
         and returns the total elapsed time in nanoseconds.
-
-        Parameters:
-            func: A function that takes the DeviceContext and an iteration index.
-
-        Args:
-            num_iters: The number of iterations to run the function.
-
-        Returns:
-            The total elapsed time in nanoseconds for all iterations.
-
-        Raises:
-            If the timer operations fail or if the function raises an exception.
-
-        Example:
-
-        ```text
-        from max.gpu.host import DeviceContext
-
-        def benchmark_kernel(ctx: DeviceContext, i: Int) raises -> None:
-            # Perform GPU operations using ctx, potentially varying by iteration
-            pass
-
-        with DeviceContext() as ctx:
-            # Measure execution time with iteration awareness
-            var time_ns = ctx.execution_time_iter[benchmark_kernel](10)
-            print("Total execution time:", time_ns, "ns")
-        ```
-        """
-
-        @always_inline
-        def func_unified(ctx: Self, i: Int):
-            try:
-                func(ctx, i)
-            except e:
-                abort(String(e))
-
-        return self.execution_time_iter(func_unified, num_iters)
-
-    @always_inline
-    def execution_time_iter[
-        FuncType: def(Self, Int) raises -> None,
-    ](self, func: FuncType, num_iters: Int) raises -> Int:
-        """Measures the execution time of a function that takes iteration index as input.
 
         Parameters:
             FuncType: The body function type.
@@ -5325,6 +5327,21 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
 
         Raises:
             If the timer operations fail.
+
+        Example:
+
+        ```text
+        from max.gpu.host import DeviceContext
+
+        def benchmark_kernel(ctx: DeviceContext, i: Int) raises -> None:
+            # Perform GPU operations using ctx, potentially varying by iteration
+            pass
+
+        with DeviceContext() as ctx:
+            # Measure execution time with iteration awareness
+            var time_ns = ctx.execution_time_iter(benchmark_kernel, 10)
+            print("Total execution time:", time_ns, "ns")
+        ```
         """
         var timer_ptr: _DeviceTimerPtr[mut=True] = {}
         _checked(
@@ -5865,13 +5882,13 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
         var value: UInt64
 
         comptime if bitwidth == 8:
-            value = UInt64(Int(bitcast[DType.uint8, 1](val)))
+            value = UInt64(Int(bitcast[.uint8, 1](val)))
         elif bitwidth == 16:
-            value = UInt64(Int(bitcast[DType.uint16, 1](val)))
+            value = UInt64(Int(bitcast[.uint16, 1](val)))
         elif bitwidth == 32:
-            value = UInt64(bitcast[DType.uint32, 1](val))
+            value = UInt64(bitcast[.uint32, 1](val))
         else:
-            value = bitcast[DType.uint64, 1](val)
+            value = bitcast[.uint64, 1](val)
 
         # const char *AsyncRT_DeviceContext_setMemory_async(const DeviceContext *ctx, const DeviceBuffer *dst, uint64_t val, size_t val_size)
         _checked(
@@ -5913,13 +5930,13 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
         var value: UInt64
 
         comptime if bitwidth == 8:
-            value = UInt64(Int(bitcast[DType.uint8, 1](val)))
+            value = UInt64(Int(bitcast[.uint8, 1](val)))
         elif bitwidth == 16:
-            value = UInt64(Int(bitcast[DType.uint16, 1](val)))
+            value = UInt64(Int(bitcast[.uint16, 1](val)))
         elif bitwidth == 32:
-            value = UInt64(bitcast[DType.uint32, 1](val))
+            value = UInt64(bitcast[.uint32, 1](val))
         else:
-            value = bitcast[DType.uint64, 1](val)
+            value = bitcast[.uint64, 1](val)
 
         # const char *AsyncRT_DeviceContext_setMemory_async(const DeviceContext *ctx, const DeviceBuffer *dst, uint64_t val, size_t val_size)
         _checked(
@@ -6664,6 +6681,36 @@ struct DeviceContext(ImplicitlyCopyable, RegisterPassable, _FunctionEnqueuer):
         )
         return result
 
+    @always_inline
+    def is_host_unified(self) raises -> Bool:
+        """Returns True if this device and the host share one physical memory
+        pool.
+
+        Reports hardware topology, so it does not predict whether
+        `DeviceBuffer.unsafe_host_ptr()` succeeds for any particular buffer.
+
+        Returns:
+            True if device and host memory are one physical pool.
+
+        Raises:
+            If there's an error querying the device.
+        """
+        var result: Bool = False
+        # const char *AsyncRT_DeviceContext_isHostUnified(bool *result, const DeviceContext *ctx)
+        _checked(
+            external_call[
+                "AsyncRT_DeviceContext_isHostUnified",
+                _CString[],
+                Pointer[Bool, origin_of(result)],
+                _DeviceContextPtr[mut=True],
+            ](
+                Pointer(to=result),
+                self._handle,
+            ),
+            location=call_location(),
+        )
+        return result
+
     @staticmethod
     @always_inline
     def number_of_devices(
@@ -6847,12 +6894,15 @@ struct DeviceContextArray[length: Int](Copyable, Sized):
             __list_literal__: Marker that lets this constructor accept
                 list-literal syntax (`var l: DeviceContextArray[N] = [c0, c1]`).
         """
-        assert (
-            len(device_contexts) == Self.length
-        ), "mismatch in the number of elements"
-        self.device_contexts = Array[
-            DeviceContext, __literal_size__
-        ]._from_variadic(*device_contexts^)
+        self.device_contexts = {uninitialized = True}
+        var ptr = self.device_contexts.unsafe_ptr()
+        comptime for i in range(__literal_size__):
+            ptr.unsafe_offset(i).unsafe_write_move_from(
+                Pointer(to=device_contexts[i])
+            )
+
+        # Do not destroy the elements when their backing storage goes away.
+        device_contexts^._annihilate()
 
     def __getitem_param__[index: Int](self) -> DeviceContext:
         """Access a `DeviceContext` at a compile-time known index.

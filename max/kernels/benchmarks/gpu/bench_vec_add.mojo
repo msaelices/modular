@@ -22,16 +22,16 @@ from std.benchmark import (
     ThroughputMeasure,
 )
 from std.builtin._closure import __ownership_keepalive
-from std.gpu import global_idx
+from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from internal_utils import update_bench_config_args
 from std.testing import assert_equal
 
 
 def vec_func(
-    in0: UnsafePointer[Float32, ImmutAnyOrigin],
-    in1: UnsafePointer[Float32, ImmutAnyOrigin],
-    output: UnsafePointer[Float32, MutAnyOrigin],
+    in0: ImmPointer[Float32, ImmutAnyOrigin],
+    in1: ImmPointer[Float32, ImmutAnyOrigin],
+    output: MutPointer[Float32, MutAnyOrigin],
     len: Int32,
 ):
     var tid = global_idx.x

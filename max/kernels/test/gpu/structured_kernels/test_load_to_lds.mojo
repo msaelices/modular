@@ -12,11 +12,11 @@
 # ===----------------------------------------------------------------------=== #
 """Tests alias-scoped raw-buffer DMA into LDS."""
 
-from std.gpu import lane_id, WARP_SIZE
+from max.gpu import lane_id, WARP_SIZE
 from max.gpu.host import DeviceContext
 from max.gpu.memory import CacheOperation
 from max.gpu.sync import s_waitcnt
-from std.gpu.intrinsics import AMDBufferResource
+from max.gpu.intrinsics import AMDBufferResource
 from std.memory import AddressSpace, unsafe_stack_allocation
 from std.testing import assert_equal
 
@@ -27,15 +27,15 @@ def _copy_through_lds[
     dtype: DType,
     width: Int,
 ](
-    src: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dst: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    src: MutPointer[Scalar[dtype], MutAnyOrigin],
+    dst: MutPointer[Scalar[dtype], MutAnyOrigin],
     valid_elements: Int32,
 ):
     var smem = unsafe_stack_allocation[
         WARP_SIZE * width,
         Scalar[dtype],
         alignment=16,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
     ]()
     var lane = Int(lane_id())
     var offset = lane * width
@@ -77,8 +77,8 @@ def _run_case[dtype: DType, width: Int](ctx: DeviceContext) raises:
     ctx.synchronize()
     for i in range(count):
         assert_equal(
-            host_out[i].cast[DType.float32](),
-            _value[dtype](i).cast[DType.float32](),
+            host_out[i].cast[.float32](),
+            _value[dtype](i).cast[.float32](),
         )
 
     comptime valid_elements = count // 2
@@ -97,8 +97,8 @@ def _run_case[dtype: DType, width: Int](ctx: DeviceContext) raises:
             dtype
         ](0)
         assert_equal(
-            host_out[i].cast[DType.float32](),
-            expected.cast[DType.float32](),
+            host_out[i].cast[.float32](),
+            expected.cast[.float32](),
         )
 
     _ = dev_in^
@@ -107,5 +107,5 @@ def _run_case[dtype: DType, width: Int](ctx: DeviceContext) raises:
 
 def main() raises:
     with DeviceContext() as ctx:
-        _run_case[DType.bfloat16, 8](ctx)
-        _run_case[DType.float8_e4m3fn, 16](ctx)
+        _run_case[.bfloat16, 8](ctx)
+        _run_case[.float8_e4m3fn, 16](ctx)

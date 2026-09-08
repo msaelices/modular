@@ -14,7 +14,7 @@
 from std.sys import simd_width_of
 
 from max.algorithm.functional import elementwise
-from std.gpu import *
+from max.gpu import *
 from max.gpu.host import DeviceContext, get_gpu_target
 from std.testing import assert_almost_equal, TestSuite
 
@@ -50,17 +50,17 @@ def run_elementwise(exponent: BFloat16, ctx: DeviceContext) raises:
         var val = (
             in_buffer.unsafe_ptr()
             .unsafe_load[width=simd_width](idx)
-            .cast[DType.bfloat16]()
+            .cast[.bfloat16]()
         )
-        var result = val ** SIMD[DType.bfloat16, simd_width](exponent)
+        var result = val ** SIMD[.bfloat16, simd_width](exponent)
         out_buffer.unsafe_ptr().unsafe_store[width=simd_width](
-            idx, result.cast[DType.float32]()
+            idx, result.cast[.float32]()
         )
 
     elementwise[func, pack_size, target="gpu"](Coord(length), ctx)
     with in_device.map_to_host() as in_host, out_device.map_to_host() as out_host:
         for i in range(length):
-            var expected_value = in_host[i] ** exponent.cast[DType.float32]()
+            var expected_value = in_host[i] ** exponent.cast[.float32]()
             assert_almost_equal(
                 out_host[i],
                 expected_value,

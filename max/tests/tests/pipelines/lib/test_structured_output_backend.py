@@ -23,6 +23,7 @@ import pytest
 from max.pipelines.lib.pipeline_variants import structured_output_backend
 from max.pipelines.lib.pipeline_variants.structured_output_backend import (
     STRUCTURED_OUTPUT_MAX_WHITESPACE_RUN,
+    _compiled_shape,
     _log_if_slow,
 )
 from max.pipelines.lib.pipeline_variants.utils import StructuredOutputHelper
@@ -138,6 +139,93 @@ def test_xgrammar_stop_tokens_cover_runtime_eos_set(
         "a completed grammar must permit exactly the runtime EOS set: a "
         "missing terminator forces an unnatural declared-EOS ending, an "
         "extra token would leak unconstrained output"
+    )
+
+
+def test_fill_slot_after_stop_token_accepted_forces_eos_without_crashing() -> (
+    None
+):
+    """Once the matcher actually consumes its stop token (not merely reaching
+    the "ready to stop" accepting state exercised above), xgrammar's native
+    fill raises a fatal C++ check rather than returning a mask. This drives a
+    real matcher through that exact transition and confirms
+    ``fill_next_token_bitmask`` still forces the same stop-token-only mask
+    instead of crashing -- built by hand from ``stop_token_ids`` rather than
+    delegated to xgrammar's own (crashing) fill.
+    """
+    delegate = _FakeTikTokenTokenizer()
+    pipeline_tokenizer = MagicMock()
+    pipeline_tokenizer.delegate = delegate
+    pipeline_tokenizer.eos_token_ids = {delegate.eos_token_id}
+
+    helper = StructuredOutputHelper.from_tokenizer(
+        cast("PipelineTokenizer[Any, Any, Any]", pipeline_tokenizer),
+        enable_structured_output=True,
+        backend_name="xgrammar",
+    )
+    assert helper.backend is not None
+
+    schema = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+    matcher = helper.backend.create_matcher(
+        helper.backend.compile_json_schema(json.dumps(schema))
+    )
+    for char in "{}":
+        assert matcher.try_consume_tokens([ord(char)]) == 1
+    assert matcher.is_accepting()
+    assert not matcher.is_stopped()
+
+    assert matcher.try_consume_tokens([delegate.eos_token_id]) == 1
+    assert matcher.is_stopped()
+    assert matcher.is_accepting()
+
+    allowed = set(np.flatnonzero(_allowed_tokens(helper.backend, matcher)))
+    assert allowed == {delegate.eos_token_id}, (
+        "a stopped-and-accepted xgrammar matcher must force exactly its "
+        f"stop token set, not {allowed} -- xgrammar's own fill crashes here, "
+        "so the mask is built by hand from stop_token_ids"
+    )
+
+
+def test_llguidance_completed_matcher_still_gets_eos_mask() -> None:
+    """llguidance's ``is_stopped()`` becomes true the moment the grammar is
+    satisfied -- before the stop token is even consumed -- so a completed
+    grammar is llguidance's normal, frequent end-of-request state, not a
+    rare corner case. It computes a real EOS-only mask here without
+    crashing, matching xgrammar's hand-built one above.
+    """
+    delegate = _FakeTikTokenTokenizer()
+    pipeline_tokenizer = MagicMock()
+    pipeline_tokenizer.delegate = delegate
+    pipeline_tokenizer.eos_token_ids = {delegate.eos_token_id}
+
+    helper = StructuredOutputHelper.from_tokenizer(
+        cast("PipelineTokenizer[Any, Any, Any]", pipeline_tokenizer),
+        enable_structured_output=True,
+        backend_name="llguidance",
+    )
+    assert helper.backend is not None
+
+    schema = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+    matcher = helper.backend.create_matcher(
+        helper.backend.compile_json_schema(json.dumps(schema))
+    )
+    for char in "{}":
+        assert matcher.try_consume_tokens([ord(char)]) == 1
+    assert matcher.is_accepting()
+    assert matcher.is_stopped()
+
+    allowed = set(np.flatnonzero(_allowed_tokens(helper.backend, matcher)))
+    assert allowed == {delegate.eos_token_id}, (
+        f"a completed llguidance matcher must force exactly its stop token "
+        f"set, not {allowed}"
     )
 
 
@@ -284,3 +372,156 @@ def test_fast_grammar_compile_logs_nothing(
     with caplog.at_level(logging.INFO, logger="max.pipelines"):
         _SlowBackend().compile_json_schema("{}")
     assert not [r for r in caplog.records if r.msg.startswith("grammar %s")]
+
+
+class _ShapeBackend:
+    """Stand-in whose compile entry point takes any of the wire forms."""
+
+    name = "fake"
+
+    @_log_if_slow
+    def create_matcher(self, grammar: Any) -> Any:
+        return grammar
+
+
+def _slow_log(
+    arg: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, Any]:
+    """Force the slow path for ``arg`` and return the emitted record's fields."""
+    monkeypatch.setattr(
+        structured_output_backend, "_GRAMMAR_COMPILE_LOG_MS", -1.0
+    )
+    with caplog.at_level(logging.INFO, logger="max.pipelines"):
+        _ShapeBackend().create_matcher(arg)
+    return vars(
+        next(r for r in caplog.records if r.msg.startswith("grammar %s took"))
+    )
+
+
+def test_slow_compile_log_carries_schema_shape(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Depth and node count are attached to the slow-compile record."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "a": {"type": "object", "properties": {"b": {"type": "string"}}}
+        },
+    }
+    fields = _slow_log(json.dumps(schema), caplog, monkeypatch)
+    # root -> a -> b
+    assert fields["grammar_schema_depth"] == 3
+    assert fields["grammar_schema_nodes"] == 3
+
+
+def test_slow_compile_log_omits_shape_for_non_schema_arguments(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A compiled handle has no shape; the duration is still logged."""
+    fields = _slow_log(object(), caplog, monkeypatch)
+    assert fields["grammar_compile_time_ms"] > 0.0
+    assert "grammar_schema_depth" not in fields
+    assert "grammar_schema_nodes" not in fields
+
+
+def _tool(name: str) -> dict[str, Any]:
+    """An OpenAI tool whose arguments schema is 5 subschemas, 4 deep."""
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "filters": {
+                        "type": "object",
+                        "properties": {
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            }
+                        },
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    }
+
+
+def test_compiled_shape_aggregates_schemas_inside_a_tool_grammar() -> None:
+    """A tool grammar's shape is its embedded schemas, not its envelope.
+
+    Depth is the deepest of them; node count is their sum.
+    """
+    one_tool = _compiled_shape(
+        structured_output_backend.build_xgrammar_tool_grammar(
+            "kimi", [_tool("a")], "auto"
+        )
+    )
+    assert one_tool is not None
+    depth, nodes = one_tool
+    assert depth == 4, "root -> filters -> tags -> items"
+    assert nodes == 5
+
+    five_tools = _compiled_shape(
+        structured_output_backend.build_xgrammar_tool_grammar(
+            "kimi", [_tool(f"t{i}") for i in range(5)], "auto"
+        )
+    )
+    assert five_tools is not None
+    assert five_tools == (depth, nodes * 5), (
+        "depth is the deepest tool's, node count the sum across tools"
+    )
+
+
+def test_slow_compile_log_carries_tool_grammar_shape(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The logged fields carry a tool grammar's aggregated shape."""
+    grammar = structured_output_backend.build_xgrammar_tool_grammar(
+        "kimi", [_tool(f"t{i}") for i in range(5)], "auto"
+    )
+    fields = _slow_log(grammar, caplog, monkeypatch)
+    assert fields["grammar_schema_depth"] == 4
+    assert fields["grammar_schema_nodes"] == 25, (
+        "expected 5 tool schemas of 5 subschemas each"
+    )
+
+
+def test_slow_compile_log_carries_shape_for_a_keyword_call(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The payload is found whether it arrives positionally or by keyword."""
+    monkeypatch.setattr(
+        structured_output_backend, "_GRAMMAR_COMPILE_LOG_MS", -1.0
+    )
+    schema = _tool("a")["function"]["parameters"]
+    with caplog.at_level(logging.INFO, logger="max.pipelines"):
+        _ShapeBackend().create_matcher(grammar=json.dumps(schema))
+    fields = vars(
+        next(r for r in caplog.records if r.msg.startswith("grammar %s took"))
+    )
+    assert fields["grammar_schema_depth"] == 4
+    assert fields["grammar_schema_nodes"] == 5
+
+
+def test_compiled_shape_reads_a_bare_schema_directly() -> None:
+    """The response_format path hands over a schema, not a tag."""
+    schema = _tool("a")["function"]["parameters"]
+    assert _compiled_shape(json.dumps(schema)) == (4, 5)
+
+
+def test_compiled_shape_ignores_a_lark_grammar() -> None:
+    """A Lark grammar is not JSON, so no shape is reported."""
+    assert _compiled_shape("start: /[a-z]+/\n") is None
+
+
+def test_slow_compile_log_survives_malformed_json(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unparseable input omits the shape fields rather than raising."""
+    fields = _slow_log("{not json", caplog, monkeypatch)
+    assert fields["grammar_compile_time_ms"] > 0.0
+    assert "grammar_schema_depth" not in fields

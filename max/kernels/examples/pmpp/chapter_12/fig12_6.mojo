@@ -11,7 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu import block_idx, thread_idx
+from max.gpu import block_idx, thread_idx
 from max.gpu.sync import barrier
 from max.gpu.host import DeviceContext
 from std.memory import unsafe_stack_allocation
@@ -55,12 +55,12 @@ def filter_kernel(
     var output_s = unsafe_stack_allocation[
         BLOCK_DIM,
         UInt32,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
     ]()
     var output_size_s = unsafe_stack_allocation[
         1,
         UInt32,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
     ]()
 
     if thread_idx.x == 0:
@@ -83,7 +83,7 @@ def filter_kernel(
     var j_shared = unsafe_stack_allocation[
         1,
         UInt32,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
     ]()
     if thread_idx.x == 0:
         var local_size = output_size_s[0]

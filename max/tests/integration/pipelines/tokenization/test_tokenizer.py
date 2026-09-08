@@ -206,7 +206,7 @@ def test_tokenizer__truncates_to_max_length(
         model_name=llama_3_1_8b_instruct_local_path,
         prompt="Longer message with lots of text with more words than max length for sure.",
     )
-    with pytest.raises(ValueError, match="max length"):
+    with pytest.raises(ValueError, match="maximum context length"):
         _ = asyncio.run(tokenizer.new_context(long_request))
 
 
@@ -338,6 +338,47 @@ def test_tokenizer__propagates_cache_salt(
         tokenizer.new_context(request_without_salt)
     )
     assert context_without_salt.cache_salt is None
+
+
+def test_tokenizer__propagates_dkv_cache_hint(
+    llama_3_1_8b_instruct_local_path: str,
+) -> None:
+    """`tokenizer.new_context` must re-serialize `request.dkv_cache_hint` onto
+    `context.dkv_cache_hint`. The dKV connector parses those bytes to route a
+    load at its peers, so dropping them here silently disables remote reads."""
+
+    pipeline_config = _create_mock_pipeline_config(
+        llama_3_1_8b_instruct_local_path
+    )
+    tokenizer = TextTokenizer(
+        llama_3_1_8b_instruct_local_path,
+        pipeline_config=pipeline_config,
+    )
+    hint = {"version": 2, "instances": [{"instance_name": "dkv-peer"}]}
+
+    context = asyncio.run(
+        tokenizer.new_context(
+            TextGenerationRequest(
+                request_id=RequestID(),
+                model_name=llama_3_1_8b_instruct_local_path,
+                prompt="Hello world!",
+                dkv_cache_hint=hint,
+            )
+        )
+    )
+    assert context.dkv_cache_hint is not None
+    assert json.loads(context.dkv_cache_hint) == hint
+
+    context_without_hint = asyncio.run(
+        tokenizer.new_context(
+            TextGenerationRequest(
+                request_id=RequestID(),
+                model_name=llama_3_1_8b_instruct_local_path,
+                prompt="Hello world!",
+            )
+        )
+    )
+    assert context_without_hint.dkv_cache_hint is None
 
 
 def test_tokenizer__with_context_validation(
@@ -858,6 +899,41 @@ ASSISTANT: {% endif %}"""
         f"Custom: {generated_prompt}\n"
         f"Default: {default_prompt}"
     )
+
+
+@pytest.mark.asyncio
+async def test_custom_prompt_template_beats_tokenizer_override() -> None:
+    """A tokenizer that renders its own format must not defeat --chat-template.
+
+    ``trust_remote_code`` tokenizers (e.g. Kimi's ``TikTokenTokenizer``)
+    override ``apply_chat_template`` with a format hardcoded in Python and
+    never read the ``chat_template`` attribute, which silently discarded the
+    override.
+    """
+    model_name = "HuggingFaceTB/SmolLM2-135M-Instruct"
+    custom_template = (
+        "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+    )
+
+    pipeline_config = _create_mock_pipeline_config(model_name)
+    tokenizer = TextTokenizer(
+        model_path=model_name,
+        pipeline_config=pipeline_config,
+        trust_remote_code=True,
+        chat_template=custom_template,
+    )
+    tokenizer.delegate.apply_chat_template = lambda *args, **kwargs: (
+        "HARDCODED FORMAT"
+    )
+
+    prompt = tokenizer.apply_chat_template(
+        messages=[
+            TextGenerationRequestMessage(role="user", content="Hello there")
+        ],
+        tools=None,
+    )
+
+    assert prompt == "Hello there"
 
 
 @pytest.mark.asyncio

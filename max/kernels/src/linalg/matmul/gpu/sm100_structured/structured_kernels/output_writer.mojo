@@ -24,8 +24,8 @@ from std.collections import Optional
 from std.memory import Pointer, UnsafePointer
 from std.sys import simd_width_of, size_of, align_of
 
-from std.gpu import WARP_SIZE, thread_idx
-from std.gpu import lane_id, warp_id as get_warp_id
+from max.gpu import WARP_SIZE, thread_idx
+from max.gpu import lane_id, warp_id as get_warp_id
 from max.gpu.memory import fence_async_view_proxy
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from layout import (
@@ -56,6 +56,7 @@ from std.utils.index import IndexList
 from structured_kernels.tile_types import SMemTileArray2DRowMajor
 
 from structured_kernels.barriers import WarpGroupBarrier
+from structured_kernels.kernel_common import WarpRole1D1D
 from .config import OutputPipelineConfig
 from .tile_pipeline import OutputStage
 from .output_writer_trait import OutputWriter
@@ -195,6 +196,11 @@ struct TileWriter[
     comptime stageN = Self.c_smem_dim0 if Self.transpose_c else Self.c_smem_dim1
     comptime stage_contiguous_size = Self.c_smem_dim1
 
+    # Warp-role table used only for `epilogue_role_index()`, which depends
+    # on `EPILOGUE_WARP_START` alone — identical under either `has_sfb`
+    # setting, so the default instantiation is exact for every caller.
+    comptime WarpRole = WarpRole1D1D[num_epi_warps=Self.num_output_warps]
+
     # EpilogueConfig bundles common epilogue parameters
     comptime epc = EpilogueConfig.create(
         MMA_M=Self.MMA_M,
@@ -260,8 +266,8 @@ struct TileWriter[
     @always_inline
     @staticmethod
     def get_epilogue_dtype() -> DType:
-        if (Self.a_type == Self.c_type == DType.bfloat16) or (
-            Self.a_type == DType.uint8 and Self.c_type == DType.bfloat16
+        if (Self.a_type == Self.c_type == .bfloat16) or (
+            Self.a_type == .uint8 and Self.c_type == .bfloat16
         ):
             return DType.bfloat16
         else:
@@ -353,7 +359,9 @@ struct TileWriter[
         n_abs: UInt32,
         m_end: UInt32,
         expert_scale: Float32,
-        c_tensor: TileTensor[Self.c_type, c_tensor_layout, MutAnyOrigin],
+        c_tensor: TileTensor[
+            mut=True, Self.c_type, LayoutType=c_tensor_layout, ...
+        ],
     ):
         """Write with absolute coordinates and bounds checking.
 
@@ -594,10 +602,7 @@ struct TileWriter[
             Scalar[Self.epilogue_dtype], Self.rep_frag_size
         ],
         c_smem_tile: TileTensor[
-            Self.c_type,
-            c_tile_layout,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
+            Self.c_type, c_tile_layout, MutAnyOrigin, address_space=.SHARED
         ],
         warp_id: UInt32,
         lane: UInt32,
@@ -649,10 +654,7 @@ struct TileWriter[
     ](
         self,
         c_smem_tile: TileTensor[
-            Self.c_type,
-            c_tile_layout,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
+            Self.c_type, c_tile_layout, MutAnyOrigin, address_space=.SHARED
         ],
         c_coord: Tuple[UInt32, UInt32],
         batch_idx: UInt32,
@@ -919,7 +921,9 @@ struct TileWriter[
         n_abs: UInt32,
         m_end: UInt32,
         expert_scale: Float32,
-        c_tensor: TileTensor[Self.c_type, c_tensor_layout, MutAnyOrigin],
+        c_tensor: TileTensor[
+            mut=True, Self.c_type, LayoutType=c_tensor_layout, ...
+        ],
     ):
         """Internal implementation of write with absolute coordinates and bounds checking.
 
@@ -937,7 +941,11 @@ struct TileWriter[
             c_tensor: C tensor in GMEM (for bounds-checked stores).
         """
         var accum_tiles = Self.AccumTmemArray(output_stage.tmem.offset())
-        var warp_id = get_warp_id()
+        # Role-relative: this path's `warp_id == 0` single-writer election
+        # (TMAStoreCoords, commit_group) means "first EPILOGUE warp", not
+        # "first warp in the block". Identical today (the pool starts at
+        # thread 0) and correct if the pool ever moves.
+        var warp_id = Self.WarpRole.epilogue_role_index()
         var lane = lane_id()
         var scale = expert_scale.cast[Self.accum_type]()
 
@@ -1167,12 +1175,11 @@ struct TileWriter[
         c_smem_layout: TensorLayout,
     ](
         c_smem_tile: TileTensor[
-            Self.c_type,
-            c_smem_layout,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
+            Self.c_type, c_smem_layout, MutAnyOrigin, address_space=.SHARED
         ],
-        c_tensor: TileTensor[Self.c_type, c_tensor_layout, MutAnyOrigin],
+        c_tensor: TileTensor[
+            mut=True, Self.c_type, LayoutType=c_tensor_layout, ...
+        ],
         m_abs: UInt32,
         n_abs: UInt32,
         m_end: UInt32,
@@ -1235,7 +1242,7 @@ struct TileWriter[
             comptime for j in range(zipped.shape[1][0].value()):
                 var input_crd = RuntimeTuple[
                     IntTuple(UNKNOWN_VALUE, j),
-                    element_type=DType.uint32,
+                    element_type=.uint32,
                 ](thread_idx.x, j)
                 var linear_idx = rt_crd2idx[
                     IntTuple(UNKNOWN_VALUE, j),
@@ -1274,25 +1281,19 @@ struct TileWriter[
                         var src = src_ptr.load[
                             width=simd_size, alignment=alignment
                         ]()
-                        var dst_ptr = c_tensor._storage + c_tensor.layout(
-                            Coord(
-                                Int(global_i),
-                                Int(global_j),
-                            )
+                        c_tensor.store[width=simd_size, alignment=alignment](
+                            Coord(Int(global_i), Int(global_j)),
+                            src,
                         )
-                        dst_ptr.store[width=simd_size, alignment=alignment](src)
                     else:
                         var src_ptr = c_smem_split._storage + linear_idx
                         var src = src_ptr.load[
                             width=simd_size, alignment=alignment
                         ]()
-                        var dst_ptr = c_tensor._storage + c_tensor.layout(
-                            Coord(
-                                Int(global_i),
-                                Int(global_j),
-                            )
+                        c_tensor.store[width=simd_size, alignment=alignment](
+                            Coord(Int(global_i), Int(global_j)),
+                            src,
                         )
-                        dst_ptr.store[width=simd_size, alignment=alignment](src)
 
     @staticmethod
     @always_inline
@@ -1300,9 +1301,11 @@ struct TileWriter[
         c_tensor_layout: TensorLayout,
     ](
         c_smem_ptr: UnsafePointer[
-            Scalar[Self.c_type], _, address_space=AddressSpace.SHARED
+            Scalar[Self.c_type], _, address_space=.SHARED
         ],
-        c_tensor: TileTensor[Self.c_type, c_tensor_layout, MutAnyOrigin],
+        c_tensor: TileTensor[
+            mut=True, Self.c_type, LayoutType=c_tensor_layout, ...
+        ],
         m_abs: UInt32,
         n_abs: UInt32,
         m_end: UInt32,
@@ -1363,11 +1366,10 @@ struct TileWriter[
                 chunk_idx * UInt32(vec_chunkM) + vec_chunkM_idx
             ) * UInt32(simd_size)
             if global_token < m_end and global_weight < UInt32(cN):
-                (
-                    c_tensor._storage
-                    + global_token * UInt32(cN)
-                    + global_weight
-                ).store[alignment=smem_alignment](val_vec)
+                c_tensor.store[width=simd_size, alignment=smem_alignment](
+                    Coord(Int(global_token), Int(global_weight)),
+                    val_vec,
+                )
 
     # ========== Residual Add Support ==========
     # Methods for D = lambda(accum) + beta * C residual operations
@@ -1531,24 +1533,22 @@ struct TileWriter[
                 and c_col + UInt32(Self.MMA_N) <= c_shape[1]
             )
 
-        var upper_frag_casted = Array[
-            Scalar[Self.epilogue_dtype], Self.rep_frag_size
-        ](uninitialized=True)
-        var lower_frag_casted = Array[
-            Scalar[Self.epilogue_dtype], Self.rep_frag_size
-        ](uninitialized=True)
-
         comptime for stage in range(Self.num_stages):
             # 1. Load fragments from TMEM tile
             var frags = accum_tiles[stage].load_fragments[Self.rep]()
             Self.AccumTmemArray.Tile.wait_load()
             var casted = frags.cast[Self.epilogue_dtype]()
 
-            comptime for _i in range(Self.rep_frag_size):
-                upper_frag_casted[_i] = casted.upper[_i]
-
-            comptime for _i in range(Self.rep_frag_size):
-                lower_frag_casted[_i] = casted.lower[_i]
+            var upper_frag_casted = Array[_, Self.rep_frag_size](
+                fill_with_unrolled=lambda [i: Int]() -> Scalar[
+                    Self.epilogue_dtype
+                ]: casted.upper[i]
+            )
+            var lower_frag_casted = Array[_, Self.rep_frag_size](
+                fill_with_unrolled=lambda [i: Int]() -> Scalar[
+                    Self.epilogue_dtype
+                ]: casted.lower[i]
+            )
 
             comptime if stage == Self.num_stages - 1:
                 AccumBarrier[Self.cta_group].arrive(
@@ -1714,10 +1714,7 @@ struct TileWriter[
         c_tiles: Self.CTileArray,
         output_stage: Self.Stage,
         epilogue_tile: TileTensor[
-            Self.c_type,
-            epilogue_layout,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
+            Self.c_type, epilogue_layout, MutAnyOrigin, address_space=.SHARED
         ],
         tile_coord: Tuple[UInt32, UInt32, UInt32],
         c_shape: Tuple[UInt32, UInt32],
@@ -1991,10 +1988,7 @@ struct TileWriter[
         c_tiles: Self.CTileArray,
         output_stage: Self.Stage,
         epilogue_tile: TileTensor[
-            Self.c_type,
-            epilogue_layout,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
+            Self.c_type, epilogue_layout, MutAnyOrigin, address_space=.SHARED
         ],
         tile_coord: Tuple[UInt32, UInt32, UInt32],
         c_shape: Tuple[UInt32, UInt32],
@@ -2200,7 +2194,7 @@ struct TileWriter[
         output_stage: Self.Stage,
         mut epilogue_pipeline: ProducerConsumerPipeline[num_epi_stages],
         epilogue_tiles_base: UnsafePointer[
-            Scalar[Self.c_type], MutAnyOrigin, address_space=AddressSpace.SHARED
+            Scalar[Self.c_type], MutAnyOrigin, address_space=.SHARED
         ],
         epilogue_tile_elems: Int,
         tile_coord: Tuple[UInt32, UInt32, UInt32],

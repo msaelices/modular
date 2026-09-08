@@ -38,8 +38,13 @@ from max.experimental.cascade.pipelines.dummy_textgen import (
     DummyTextGenPipeline,
 )
 from max.experimental.cascade.pipelines.echo_textgen import EchoTextGenPipeline
+from max.experimental.cascade.workers.max_tokenizer import MAXTokenizer
 from max.pipelines.architectures import register_all_models
-from max.pipelines.lib import PIPELINE_REGISTRY, PipelineArgs
+from max.pipelines.lib import (
+    PIPELINE_REGISTRY,
+    PipelineArgs,
+    PipelineRuntimeConfig,
+)
 from max.pipelines.lib.config import PipelineConfig
 from max.pipelines.lib.reasoning import get_parser_cls as reasoning_parser_cls
 from max.pipelines.lib.reasoning import register as register_reasoning_parser
@@ -69,9 +74,9 @@ class _HalfDeclaredParser(_StubReasoningParser):
     REASONING_END: ClassVar[str | None] = "</think>"
 
 
-def _args(model_path: str) -> PipelineArgs:
+def _args(model_path: str, tokenizer_impl: str | None = None) -> PipelineArgs:
     """Build raw pipeline args for construction-only (no-download) tests."""
-    return PipelineArgs(model_path=model_path)
+    return PipelineArgs(model_path=model_path, tokenizer_impl=tokenizer_impl)
 
 
 @pytest.mark.asyncio
@@ -98,15 +103,10 @@ async def test_build_pipeline_echo() -> None:
     assert pipeline.tokenizer.model_path == "some-org/some-llm"
 
 
-@pytest.mark.asyncio
-async def test_build_pipeline_uses_arch_factory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Resolve the real Llama architecture (no HF download needed to get the
-    # SupportedArchitecture object) but stub both the model-path -> arch
-    # resolution and retrieve_factory so the test never hits the network. The
-    # dispatcher should build the architecture's declared cascade pipeline class
-    # and bind the (stubbed) model factory onto its model worker.
+def _stub_llama_arch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route dispatch to the real Llama arch, stubbing arch resolution and
+    ``retrieve_factory`` so tests never hit the network.
+    """
     register_all_models()
     arch = PIPELINE_REGISTRY.retrieve_architecture("LlamaForCausalLM")
     assert arch is not None
@@ -119,10 +119,35 @@ async def test_build_pipeline_uses_arch_factory(
         lambda config: SimpleNamespace(
             tokenizer=SimpleNamespace(eos_token_ids=set()),
             factory=lambda: None,
+            memory_plan=None,
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_build_pipeline_uses_arch_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_llama_arch(monkeypatch)
     pipeline = await all_pipelines.build_pipeline(_args("some-org/some-llm"))
     assert isinstance(pipeline, CommonTextGenPipeline)
+
+
+@pytest.mark.asyncio
+async def test_build_pipeline_arch_factory_threads_tokenizer_impl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An explicit tokenizer_impl must survive the registry-factory path
+    # rather than being lost to the constructor default.
+    _stub_llama_arch(monkeypatch)
+    pipeline = await all_pipelines.build_pipeline(
+        _args(
+            "some-org/some-llm",
+            "max.experimental.cascade.workers.max_tokenizer:MAXTokenizer",
+        )
+    )
+    assert isinstance(pipeline, CommonTextGenPipeline)
+    assert isinstance(pipeline.tokenizer, MAXTokenizer)
 
 
 @pytest.mark.asyncio
@@ -189,8 +214,10 @@ def test_every_arch_reasoning_parser_declares_text_delimiters() -> None:
 
 
 def _config_using_reasoning_parser(name: str) -> PipelineConfig:
-    args = _args("some-org/some-llm")
-    args.runtime.reasoning_parser = name
+    args = PipelineArgs(
+        model_path="some-org/some-llm",
+        runtime=PipelineRuntimeConfig(reasoning_parser=name),
+    )
     return PipelineConfig.from_args(args)
 
 
