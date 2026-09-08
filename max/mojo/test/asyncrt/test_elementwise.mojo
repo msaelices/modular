@@ -15,7 +15,7 @@ from std.sys import simd_width_of
 
 from max.algorithm.functional import elementwise
 from asyncrt_test_utils import create_test_device_context
-from std.gpu import *
+from max.gpu import *
 from max.gpu.host import DeviceContext, get_gpu_target
 from std.testing import TestSuite, assert_equal
 
@@ -82,22 +82,22 @@ def run_elementwise[dtype: DType](ctx: DeviceContext) raises:
 
 def test_elementwise_float32() raises:
     var ctx = create_test_device_context()
-    run_elementwise[DType.float32](ctx)
+    run_elementwise[.float32](ctx)
 
 
 def test_elementwise_bfloat16() raises:
     var ctx = create_test_device_context()
-    run_elementwise[DType.bfloat16](ctx)
+    run_elementwise[.bfloat16](ctx)
 
 
 def test_elementwise_float16() raises:
     var ctx = create_test_device_context()
-    run_elementwise[DType.float16](ctx)
+    run_elementwise[.float16](ctx)
 
 
 def test_elementwise_int8() raises:
     var ctx = create_test_device_context()
-    run_elementwise[DType.int8](ctx)
+    run_elementwise[.int8](ctx)
 
 
 def main() raises:

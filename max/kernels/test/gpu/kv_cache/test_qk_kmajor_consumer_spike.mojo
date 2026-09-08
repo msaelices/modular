@@ -42,7 +42,7 @@ chunk-inner ordering observable. B200-only (SM100), single CTA.
 
 from std.sys import size_of, has_nvidia_gpu_accelerator
 
-from std.gpu import WARP_SIZE, thread_idx, warp_id as get_warp_id
+from max.gpu import WARP_SIZE, thread_idx, warp_id as get_warp_id
 from max.gpu.sync import barrier
 from max.gpu.host import DeviceBuffer, DeviceContext, FuncAttribute
 from max.gpu.memory import external_memory
@@ -100,8 +100,8 @@ def cpu_qk_naive(
             var acc: Float32 = 0.0
             for d in range(D):
                 acc += (
-                    Q.ptr.load(m * D + d).cast[DType.float32]()
-                    * K.ptr.load(n * D + d).cast[DType.float32]()
+                    Q.ptr.load(m * D + d).cast[.float32]()
+                    * K.ptr.load(n * D + d).cast[.float32]()
                 )
             O.ptr.store(m * N + n, acc.cast[O.dtype]())
 
@@ -142,15 +142,13 @@ def qk_consumer_kernel[
     ]()
 
     var q_smem = rebind[
-        UnsafePointer[
-            Scalar[ab_type],
-            address_space=AddressSpace.SHARED,
-            UntrackedOrigin[mut=True],
+        MutPointer[
+            Scalar[ab_type], address_space=.SHARED, UntrackedOrigin[mut=True]
         ]
     ](
         external_memory[
             Scalar[ab_type],
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
             alignment=128,
             name="qk_consumer_dynamic_smem",
         ]()
@@ -159,14 +157,14 @@ def qk_consumer_kernel[
         ab_type,
         q_smem_layout,
         MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
         alignment=128,
     ]
     comptime k_smem_tile_t = LayoutTensor[
         ab_type,
         k_smem_layout,
         MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
         alignment=128,
     ]
 
@@ -333,7 +331,7 @@ def run_qk_consumer[
             DeviceBuffer(
                 ctx,
                 k_dev.ptr.unsafe_mut_cast[True]().address_space_cast[
-                    AddressSpace.GENERIC
+                    .GENERIC
                 ](),
                 1,
                 owning=False,

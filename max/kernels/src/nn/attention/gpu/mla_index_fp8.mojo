@@ -12,9 +12,9 @@
 # ===----------------------------------------------------------------------=== #
 """MLA FP8 index kernel for computing attention scores with paged KV cache."""
 
-from std.sys import size_of
+from std.sys import get_defined_int, size_of
 from std.sys.info import _has_blackwell_tcgen05
-from std.math import align_up, ceildiv
+from std.math import align_up, ceildiv, clamp
 
 from layout import (
     Idx,
@@ -23,7 +23,7 @@ from layout import (
     row_major,
 )
 
-from std.gpu import block_dim, block_idx, thread_idx
+from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext, FuncAttribute
 
 from kv_cache.types import KVCollectionT
@@ -46,6 +46,14 @@ from nn.topk import topk_gpu
 from std.utils.index import Index
 
 
+# Peak bytes of the transient score matrix. Matches vLLM's
+# `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB` default (512) so a comparison against
+# their indexer measures the kernels rather than two different memory policies.
+comptime _SCORES_BUDGET_BYTES = (
+    get_defined_int["MLA_INDEX_SCORES_BUDGET_MB", 512]() * 1024 * 1024
+)
+
+
 # ===----------------------------------------------------------------------=== #
 # Mask application kernel
 # ===----------------------------------------------------------------------=== #
@@ -60,9 +68,9 @@ def apply_mask_kernel[
     vl_origin: ImmOrigin,
     CLLayoutType: TensorLayout,
 ](
-    output: TileTensor[DType.float32, ScoresLayoutType, scores_origin],
-    valid_length: TileTensor[DType.uint32, VLLayoutType, vl_origin],
-    cache_lengths: TileTensor[DType.uint32, CLLayoutType, ImmutAnyOrigin],
+    output: TileTensor[.float32, ScoresLayoutType, scores_origin],
+    valid_length: TileTensor[.uint32, VLLayoutType, vl_origin],
+    cache_lengths: TileTensor[.uint32, CLLayoutType, ImmutAnyOrigin],
     mask: mask_t,
     max_num_keys: Int32,
 ):
@@ -114,19 +122,18 @@ def apply_mask_kernel[
     )
 
 
-@__name(t"mla_fill_invalid_topk_{use_causal_mask}")
+@__name(t"mla_fill_invalid_topk_{use_causal_mask}_{kpool}")
 def fill_invalid_topk_kernel[
     IROLayoutType: TensorLayout,
     iro_origin: ImmOrigin,
     cache_lengths_layout: TensorLayout,
     use_causal_mask: Bool,
+    kpool: Int = 1,
 ](
-    output_indices: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
-    topk_indices: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
-    input_row_offsets: TileTensor[DType.uint32, IROLayoutType, iro_origin],
-    cache_lengths: TileTensor[
-        DType.uint32, cache_lengths_layout, ImmutAnyOrigin
-    ],
+    output_indices: UnsafePointer[Int32, MutAnyOrigin],
+    topk_indices: UnsafePointer[Int32, MutAnyOrigin],
+    input_row_offsets: TileTensor[.uint32, IROLayoutType, iro_origin],
+    cache_lengths: TileTensor[.uint32, cache_lengths_layout, ImmutAnyOrigin],
     total_seq_len: Int32,
     top_k: Int32,
     effective_k: Int32,
@@ -155,6 +162,10 @@ def fill_invalid_topk_kernel[
         cache_lengths_layout: Layout of the `cache_lengths` tensor.
         use_causal_mask: Whether each token is restricted to keys up to
             its own position.
+        kpool: Tokens per pooled cache row. `1` scores one row per token;
+            `k > 1` scores one pooled key per `k` consecutive tokens, so
+            every candidate count and the caller's `top_k` are
+            pool-granular.
 
     Args:
         output_indices: Output buffer of shape `[total_seq_len, top_k]`
@@ -199,7 +210,7 @@ def fill_invalid_topk_kernel[
     var cache_len = Int(cache_lengths[batch_idx])
 
     # Compute num_keys based on mask type
-    var num_keys = indexer_key_bound(
+    var num_keys = indexer_key_bound[kpool](
         cache_len + seq_len, seq_len, local_seq_idx, Int(use_causal_mask)
     )
 
@@ -233,18 +244,17 @@ def fill_invalid_topk_kernel[
         k_idx += Int(block_dim.x)
 
 
-@__name(t"mla_topk_row_bounds_{use_causal_mask}")
+@__name(t"mla_topk_row_bounds_{use_causal_mask}_{kpool}")
 def topk_row_bounds_kernel[
     IROLayoutType: TensorLayout,
     iro_origin: ImmOrigin,
     cache_lengths_layout: TensorLayout,
     use_causal_mask: Bool,
+    kpool: Int = 1,
 ](
-    row_bounds: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
-    input_row_offsets: TileTensor[DType.uint32, IROLayoutType, iro_origin],
-    cache_lengths: TileTensor[
-        DType.uint32, cache_lengths_layout, ImmutAnyOrigin
-    ],
+    row_bounds: UnsafePointer[Int32, MutAnyOrigin],
+    input_row_offsets: TileTensor[.uint32, IROLayoutType, iro_origin],
+    cache_lengths: TileTensor[.uint32, cache_lengths_layout, ImmutAnyOrigin],
     total_seq_len: Int32,
     max_num_keys: Int32,
 ):
@@ -266,6 +276,10 @@ def topk_row_bounds_kernel[
         cache_lengths_layout: Layout of the `cache_lengths` tensor.
         use_causal_mask: Whether each token is restricted to keys up to its
             own position.
+        kpool: Tokens per pooled cache row. `1` scores one row per token;
+            `k > 1` scores one pooled key per `k` consecutive tokens, so
+            every candidate count and the caller's `top_k` are
+            pool-granular.
 
     Args:
         row_bounds: Output buffer of shape `[total_seq_len]`.
@@ -296,7 +310,7 @@ def topk_row_bounds_kernel[
     var local_seq_idx = token_idx - q_start
 
     var cache_len = Int(cache_lengths[batch_idx])
-    var num_keys = indexer_key_bound(
+    var num_keys = indexer_key_bound[kpool](
         cache_len + seq_len, seq_len, local_seq_idx, Int(use_causal_mask)
     )
     row_bounds[token_idx] = Int32(min(num_keys, Int(max_num_keys)))
@@ -315,11 +329,13 @@ def mla_indexer_ragged_float8_paged[
     depth: Int,
     top_k: Int,
     mask_str: StaticString,
+    scores_budget_bytes: Int = _SCORES_BUDGET_BYTES,
+    kpool: Int = 1,
 ](
-    output_indices: TileTensor[DType.int32, ...],
+    output_indices: TileTensor[.int32, ...],
     q: TileTensor[mut=False, dtype, ...],
-    q_s: TileTensor[DType.float32, ...],
-    input_row_offsets: TileTensor[mut=False, DType.uint32, ...],
+    q_s: TileTensor[.float32, ...],
+    input_row_offsets: TileTensor[mut=False, .uint32, ...],
     k_collection: KCollectionT,
     layer_idx: UInt32,
     ctx: DeviceContext,
@@ -341,6 +357,14 @@ def mla_indexer_ragged_float8_paged[
             token.
         mask_str: Name of the mask to apply, either `MaskName.NULL` or
             `MaskName.CAUSAL`.
+        scores_budget_bytes: Peak bytes the transient score matrix may occupy.
+            Longer batches are scored a row-window at a time to stay under it
+            (see the chunking below). Exposed so tests can force a window small
+            enough to exercise the multi-chunk path on toy shapes.
+        kpool: Tokens per pooled cache row. `1` scores one row per token;
+            `k > 1` scores one pooled key per `k` consecutive tokens, so
+            every candidate count and the caller's `top_k` are
+            pool-granular.
 
     Args:
         output_indices: Dense output tensor for top-k indices [total_seq_len, top_k].
@@ -382,10 +406,15 @@ def mla_indexer_ragged_float8_paged[
     # max_new_tokens is used for grid dimensions (maximum possible new tokens)
     var max_new_tokens = Int(k_cache.max_prompt_length())
 
-    # An upper bound on the keys per token. Under graph-capture replay this
-    # is the capture-time bound, far above the batch's real lengths, so it
-    # may only size allocations and grid dims -- never per-step work.
-    var max_num_keys = Int(k_cache.max_context_length()) + max_new_tokens
+    # An upper bound on the candidate rows per token. Under graph-capture
+    # replay this holds the capture-time bound, far above the batch's real
+    # lengths, so use it only to size allocations and grid dims, never to size
+    # per-step work. With `kpool > 1` a cache row is a pooled key covering
+    # `kpool` tokens, so counts from here down are pool-granular, `top_k`
+    # included.
+    var max_num_keys = (
+        Int(k_cache.max_context_length()) + max_new_tokens
+    ) // kpool
 
     var effective_k = min(top_k, max_num_keys)
 
@@ -402,158 +431,70 @@ def mla_indexer_ragged_float8_paged[
         )
     )
 
-    # -inf-fill the scores only where a consumer reads past a row's live
-    # range: the scalar scorer's mask pass and the topk_gpu fallback. The
-    # SM100 scorers write every live slot and the bounded top-k reads only
-    # those, so there the fill would be max_num_keys-proportional waste.
-    var scores_size = total_seq_len * max_num_keys
-    var scores_buf = ctx.enqueue_create_buffer[DType.float32](scores_size)
-    comptime if use_sm100_scorer:
-        if effective_k > PERSISTENT_TOPK_MAX_N:
-            scores_buf.enqueue_fill(-Float32.MAX)
-    else:
-        scores_buf.enqueue_fill(-Float32.MAX)
-
-    var scores_tile = TileTensor(
-        scores_buf,
-        row_major(total_seq_len, max_num_keys),
+    comptime assert kpool == 1 or use_sm100_scorer, (
+        "pooled indexing (kpool > 1) is implemented only on the SM100"
+        " tensor-core scorer; the scalar fallback walks token rows"
     )
-    comptime if use_sm100_scorer:
-        fp8_index_score_sm100[
-            dtype,
-            type_of(k_operand),
-            type_of(ks_operand),
-            num_heads,
-            depth,
-            _is_cache_length_accurate=False,
-            # Speculative-decode tile: 3 divides a 6-token MTP step, which the
-            # default 4-token tile at nh=32 covers only by spending 256 MMA
-            # columns on 192 live ones. Inert at every other head count.
-            #
-            # The `max_seq_len` this entry passes is `max_prompt_length()`, the
-            # batch maximum of NEW tokens -- not a context length -- so the
-            # reachability bound is "no request in the batch brings more than 9
-            # new tokens", not "not a prefill". A short prompt, a chunked-prefill
-            # final chunk, or a prefix-cache-hit tail of 3, 6 or 9 tokens does
-            # reach this tile when some entry's cache makes `max_num_keys` deep
-            # enough to open the key-split arm. That is intended: at <= 9 query
-            # tokens against >= 8065 keys the launch is decode-shaped by every
-            # measure the route uses, and it is already on the key-split arm
-            # without this hint -- the tile only makes its MMA columns exact.
-            # What cannot happen is a many-token prefill landing here.
-            N_TOKENS_ALT=SPEC_DECODE_N_TOKENS_ALT,
-        ](
-            scores_tile,
-            q,
-            q_s.as_immut(),
-            k_operand,
-            ks_operand,
-            input_row_offsets,
-            batch_size,
-            max_new_tokens,
-            max_num_keys,
-            mask_str == MaskName.CAUSAL.name,
-            ctx,
-        )
-    else:
-        comptime assert num_heads % 16 == 0, (
-            "the scalar fp8_index_kernel tiles heads by thread_dim_y == 8 and"
-            " is unvalidated below 16 heads; num_heads in {4, 8} requires the"
-            " SM100 tensor-core path"
-        )
-        comptime block_tile_shape: Array[Int, 2] = [512, 128]
-        comptime BM = block_tile_shape[0]
-        comptime BN = block_tile_shape[1]
-        comptime smem_use = size_of[
-            IndexSmemStorage[dtype, num_heads, depth, BN]
-        ]()
-        comptime smem_available = ctx.default_device_info.shared_memory_per_multiprocessor - 1024
 
-        comptime kernel = fp8_index_kernel[
-            dtype,
-            type_of(scores_tile).LayoutType,
-            type_of(q).LayoutType,
-            type_of(q_s).LayoutType,
-            type_of(k_operand),
-            type_of(ks_operand),
-            block_tile_shape,
-            type_of(input_row_offsets.as_immut()).LayoutType,
-            num_heads,
-            depth,
-        ]
-
-        ctx.enqueue_function[kernel](
-            scores_tile,
-            q.as_immut(),
-            q_s,
-            k_operand,
-            ks_operand,
-            input_row_offsets.as_immut(),
-            grid_dim=(
-                batch_size,
-                max_new_tokens,
-                ceildiv(max_num_keys, BM),
-            ),
-            block_dim=(16, 8, 1),
-            shared_mem_bytes=smem_use,
-            func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
-                UInt32(smem_available)
-            ),
-        )
-
-    # Per-batch KV cache lengths (cached-prefix length). Needed both by the
-    # causal mask below (to map local query index → absolute position) and by
-    # fill_invalid_topk below.
+    # Per-batch KV cache lengths (cached-prefix length). Needed by the row-bound
+    # kernel below, by the causal mask pass on the scalar path (to map a local
+    # query index to an absolute position), and by fill_invalid_topk.
     var cache_lengths = k_cache.cache_lengths_nd()
-
-    # Apply mask for prefill (seq_len > 1). The SM100 scorer fuses the causal
-    # mask into its store guard and the top-k reads only written slots, so the
-    # separate full-buffer mask pass only runs for the scalar fallback.
-    comptime if mask_str != MaskName.NULL.name and not use_sm100_scorer:
-        if max_new_tokens > 1:
-
-            @always_inline
-            @__parameter
-            def apply_mask_dispatch[mask_t: MHAMask](mask: mask_t) raises:
-                comptime mask_kernel = apply_mask_kernel[
-                    mask_t,
-                    scores_tile.LayoutType,
-                    scores_tile.origin,
-                    input_row_offsets.LayoutType,
-                    ImmOrigin(input_row_offsets.origin),
-                    type_of(cache_lengths).LayoutType,
-                ]
-
-                ctx.enqueue_function[mask_kernel](
-                    scores_tile,
-                    input_row_offsets.as_immut(),
-                    cache_lengths,
-                    mask,
-                    Int32(max_num_keys),
-                    grid_dim=(
-                        batch_size,
-                        ceildiv(max_new_tokens, 16),
-                        ceildiv(max_num_keys, 16),
-                    ),
-                    block_dim=(16, 16, 1),
-                )
-
-            dispatch_mask[mask_str, apply_mask_dispatch]()
 
     comptime use_causal_mask = mask_str != MaskName.NULL.name
 
-    # Per-row live-key bounds let the top-k scan each row's real length
-    # instead of the full max_num_keys stride.
-    var row_bounds_buf = ctx.enqueue_create_buffer[DType.int32](total_seq_len)
-    var row_bounds_ptr = rebind[
-        UnsafePointer[Scalar[DType.int32], MutAnyOrigin]
-    ](row_bounds_buf.unsafe_ptr())
+    # The score matrix is `total_seq_len x max_num_keys` f32 -- at long context
+    # the largest allocation this op makes by an order of magnitude (~1.2 GB at
+    # 4096 tokens over 76K keys) and what caps `--max-batch-input-tokens`. Score
+    # it one ROW WINDOW at a time into one budget-sized buffer instead: a
+    # chunk's rows are consumed by the top-k before the next overwrites them, so
+    # peak scratch is `rows_per_chunk x max_num_keys` however large the batch
+    # grows.
+    #
+    # Looping on the host is safe because prefill is never under device graph
+    # capture (built at a fixed decode query width; replay rejects any other).
+    # The window is over ROWS, not requests: `input_row_offsets` is device data
+    # the host cannot read without a sync, while row boundaries are host-known
+    # and every stage after the scorer is row-parallel over a base pointer and a
+    # count, so they slice by pointer arithmetic alone.
+    #
+    # Only the SM100 scorers take a window, so the scalar fallback (and its
+    # separate mask pass) stays one whole-batch chunk, and `topk_gpu` below is
+    # unreachable while chunking: `top_k <= PERSISTENT_TOPK_MAX_N` bounds
+    # `effective_k` under its threshold.
+    comptime chunk_scores = use_sm100_scorer and top_k <= PERSISTENT_TOPK_MAX_N
+    var rows_per_chunk = total_seq_len
+    comptime if chunk_scores:
+        var row_bytes = max_num_keys * size_of[DType.float32]()
+        # Largest window the budget allows, remainder to a short final chunk.
+        # Spreading the rows evenly instead -- same chunk count, no runt --
+        # reads better and measured 8% SLOWER at 2048 and 4096 tokens: a chunk's
+        # grid is `batch x ceildiv(min(max_seq_len, chunk_rows), N_TOKENS)`, so
+        # a short final chunk launches a proportionally short grid and costs
+        # almost nothing, while an even split turns that nearly-free tail into a
+        # full-price one.
+        rows_per_chunk = clamp(
+            scores_budget_bytes // row_bytes, 1, total_seq_len
+        )
+
+    var scores_buf = ctx.enqueue_create_buffer[.float32](
+        rows_per_chunk * max_num_keys
+    )
+
+    # Per-row live-key bounds let the top-k scan each row's real length instead
+    # of the full max_num_keys stride. They depend only on the ragged metadata,
+    # so this runs once for the whole batch and each chunk reads its own slice.
+    var row_bounds_buf = ctx.enqueue_create_buffer[.int32](total_seq_len)
+    var row_bounds_ptr = rebind[UnsafePointer[Int32, MutAnyOrigin]](
+        row_bounds_buf.unsafe_ptr()
+    )
     if effective_k <= PERSISTENT_TOPK_MAX_N:
         comptime bounds_kernel = topk_row_bounds_kernel[
             input_row_offsets.LayoutType,
             ImmOrigin(input_row_offsets.origin),
             type_of(cache_lengths).LayoutType,
             use_causal_mask,
+            kpool,
         ]
         ctx.enqueue_function[bounds_kernel](
             row_bounds_ptr,
@@ -568,7 +509,7 @@ def mla_indexer_ragged_float8_paged[
     # topk_gpu strides its index output by effective_k, so when effective_k <
     # top_k we use a compact buffer here and scatter into the top_k-strided
     # output_indices in fill_invalid (writing directly would misplace rows).
-    var topk_vals_buf = ctx.enqueue_create_buffer[DType.float32](
+    var topk_vals_buf = ctx.enqueue_create_buffer[.float32](
         total_seq_len * effective_k
     )
     var topk_vals_tile = TileTensor(
@@ -576,7 +517,7 @@ def mla_indexer_ragged_float8_paged[
         row_major(total_seq_len, effective_k),
     )
 
-    var topk_idxs_buf = ctx.enqueue_create_buffer[DType.int32](
+    var topk_idxs_buf = ctx.enqueue_create_buffer[.int32](
         total_seq_len * effective_k
     )
     var topk_idxs_tile = TileTensor(
@@ -584,34 +525,168 @@ def mla_indexer_ragged_float8_paged[
         row_major(total_seq_len, effective_k),
     )
 
-    # The bitonic path can only select up to the champion width
-    # (PERSISTENT_TOPK_MAX_N); topk_gpu handles the rare k above it.
-    if effective_k <= PERSISTENT_TOPK_MAX_N:
-        persistent_topk_block_split(
-            ctx,
-            rebind[UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]](
-                scores_tile.ptr
-            ),
-            rebind[UnsafePointer[Scalar[DType.int32], MutAnyOrigin]](
-                topk_idxs_tile.ptr
-            ),
-            max_num_keys,
-            effective_k,
-            total_seq_len,
-            Optional(
-                rebind[UnsafePointer[Scalar[DType.int32], ImmutAnyOrigin]](
-                    row_bounds_ptr
-                )
-            ),
+    for chunk_begin in range(0, total_seq_len, rows_per_chunk):
+        var chunk_rows = min(rows_per_chunk, total_seq_len - chunk_begin)
+        var scores_tile = TileTensor(
+            scores_buf,
+            row_major(chunk_rows, max_num_keys),
         )
-    else:
-        topk_gpu[sampling=False, largest=True](
-            ctx,
-            effective_k,
-            scores_tile,
-            topk_vals_tile,
-            topk_idxs_tile,
-        )
+
+        # -inf-fill only where a consumer reads past a row's live range: the
+        # scalar scorer's mask pass and the topk_gpu fallback. The SM100 scorers
+        # write every live slot and the bounded top-k reads only those, so there
+        # the fill would be max_num_keys-proportional waste.
+        if not use_sm100_scorer or effective_k > PERSISTENT_TOPK_MAX_N:
+            scores_buf.enqueue_fill(-Float32.MAX)
+
+        comptime if use_sm100_scorer:
+            fp8_index_score_sm100[
+                dtype,
+                type_of(k_operand),
+                type_of(ks_operand),
+                num_heads,
+                depth,
+                _is_cache_length_accurate=False,
+                # Speculative-decode tile: 3 divides a 6-token MTP step, which
+                # the default 4-token tile at nh=32 covers only by spending 256
+                # MMA columns on 192 live ones. Inert at every other head count.
+                #
+                # The `max_seq_len` this entry passes is `max_prompt_length()`,
+                # the batch maximum of NEW tokens -- not a context length -- so
+                # the reachability bound is "no request in the batch brings more
+                # than 9 new tokens", not "not a prefill". A short prompt, a
+                # chunked-prefill final chunk, or a prefix-cache-hit tail of 3,
+                # 6 or 9 tokens does reach this tile when some entry's cache
+                # makes `max_num_keys` deep enough to open the key-split arm.
+                # That is intended: at <= 9 query tokens against >= 8065 keys
+                # the launch is decode-shaped by every measure the route uses,
+                # and it is already on the key-split arm without this hint --
+                # the tile only makes its MMA columns exact. What cannot happen
+                # is a many-token prefill landing here.
+                N_TOKENS_ALT=SPEC_DECODE_N_TOKENS_ALT,
+                kpool=kpool,
+            ](
+                scores_tile,
+                q,
+                q_s.as_immut(),
+                k_operand,
+                ks_operand,
+                input_row_offsets,
+                batch_size,
+                max_new_tokens,
+                max_num_keys,
+                mask_str == MaskName.CAUSAL.name,
+                ctx,
+                chunk_begin,
+            )
+        else:
+            comptime assert num_heads % 16 == 0, (
+                "the scalar fp8_index_kernel tiles heads by thread_dim_y == 8"
+                " and is unvalidated below 16 heads; num_heads in {4, 8}"
+                " requires the SM100 tensor-core path"
+            )
+            comptime block_tile_shape: Array[Int, 2] = [512, 128]
+            comptime BM = block_tile_shape[0]
+            comptime BN = block_tile_shape[1]
+            comptime smem_use = size_of[
+                IndexSmemStorage[dtype, num_heads, depth, BN]
+            ]()
+            comptime smem_available = ctx.default_device_info.shared_memory_per_multiprocessor - 1024
+
+            comptime kernel = fp8_index_kernel[
+                dtype,
+                type_of(scores_tile).LayoutType,
+                type_of(q).LayoutType,
+                type_of(q_s).LayoutType,
+                type_of(k_operand),
+                type_of(ks_operand),
+                block_tile_shape,
+                type_of(input_row_offsets.as_immut()).LayoutType,
+                num_heads,
+                depth,
+            ]
+
+            ctx.enqueue_function[kernel](
+                scores_tile,
+                q.as_immut(),
+                q_s,
+                k_operand,
+                ks_operand,
+                input_row_offsets.as_immut(),
+                grid_dim=(
+                    batch_size,
+                    max_new_tokens,
+                    ceildiv(max_num_keys, BM),
+                ),
+                block_dim=(16, 8, 1),
+                shared_mem_bytes=smem_use,
+                func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
+                    UInt32(smem_available)
+                ),
+            )
+
+        # Apply mask for prefill (seq_len > 1). The SM100 scorer fuses the
+        # causal mask into its store guard and the top-k reads only written
+        # slots, so the separate full-buffer mask pass only runs for the scalar
+        # fallback.
+        comptime if mask_str != MaskName.NULL.name and not use_sm100_scorer:
+            if max_new_tokens > 1:
+
+                @always_inline
+                def apply_mask_dispatch[
+                    mask_t: MHAMask
+                ](mask: mask_t) raises {imm}:
+                    comptime mask_kernel = apply_mask_kernel[
+                        mask_t,
+                        scores_tile.LayoutType,
+                        scores_tile.origin,
+                        input_row_offsets.LayoutType,
+                        ImmOrigin(input_row_offsets.origin),
+                        type_of(cache_lengths).LayoutType,
+                    ]
+
+                    ctx.enqueue_function[mask_kernel](
+                        scores_tile,
+                        input_row_offsets.as_immut(),
+                        cache_lengths,
+                        mask,
+                        Int32(max_num_keys),
+                        grid_dim=(
+                            batch_size,
+                            ceildiv(max_new_tokens, 16),
+                            ceildiv(max_num_keys, 16),
+                        ),
+                        block_dim=(16, 16, 1),
+                    )
+
+                dispatch_mask[mask_str](apply_mask_dispatch)
+
+        # The bitonic path can only select up to the champion width
+        # (PERSISTENT_TOPK_MAX_N); topk_gpu handles the rare k above it.
+        if effective_k <= PERSISTENT_TOPK_MAX_N:
+            persistent_topk_block_split(
+                ctx,
+                rebind[UnsafePointer[Float32, ImmutAnyOrigin]](scores_tile.ptr),
+                rebind[UnsafePointer[Int32, MutAnyOrigin]](topk_idxs_tile.ptr)
+                + chunk_begin * effective_k,
+                max_num_keys,
+                effective_k,
+                chunk_rows,
+                Optional(
+                    rebind[UnsafePointer[Int32, ImmutAnyOrigin]](row_bounds_ptr)
+                    + chunk_begin
+                ),
+            )
+        else:
+            # Only reachable unchunked (see `chunk_scores`), so the whole-batch
+            # tiles below are this chunk.
+            topk_gpu[sampling=False, largest=True](
+                ctx,
+                effective_k,
+                scores_tile,
+                topk_vals_tile,
+                topk_idxs_tile,
+            )
 
     # Fill invalid positions with -1:
     # - Positions [effective_k, top_k) when top_k > max_num_keys
@@ -621,18 +696,15 @@ def mla_indexer_ragged_float8_paged[
         ImmOrigin(input_row_offsets.origin),
         type_of(cache_lengths).LayoutType,
         use_causal_mask,
+        kpool,
     ]
 
     var block_size = align_up(top_k, 32)
     block_size = min(block_size, 1024)  # Cap at max threads per block
 
     ctx.enqueue_function[fill_kernel](
-        rebind[UnsafePointer[Scalar[DType.int32], MutAnyOrigin]](
-            output_indices.ptr
-        ),
-        rebind[UnsafePointer[Scalar[DType.int32], MutAnyOrigin]](
-            topk_idxs_tile.ptr
-        ),
+        rebind[UnsafePointer[Int32, MutAnyOrigin]](output_indices.ptr),
+        rebind[UnsafePointer[Int32, MutAnyOrigin]](topk_idxs_tile.ptr),
         input_row_offsets.as_immut(),
         cache_lengths,
         Int32(total_seq_len),

@@ -21,7 +21,7 @@ kernel should check once per simdgroup, not per load.
 """
 
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
-from std.gpu import lane_id
+from max.gpu import lane_id
 from max.gpu.compute.arch.mma_apple import _mma_apple_transposable
 from max.gpu.memory import build_edge_mask, gmem_edge_masked_load
 from std.math import divmod
@@ -180,8 +180,8 @@ struct MmaOpApple[
         # Element alignment only: `rb * row_stride` is unaligned for odd K/N.
         # `width` drives vectorization, not the alignment hint.
         comptime alignment = align_of[Scalar[dtype]]()
-        var lo = (tile.ptr + lo_off).load[width=4, alignment=alignment]()
-        var hi = (tile.ptr + hi_off).load[width=4, alignment=alignment]()
+        var lo = tile.raw_load[width=4, alignment=alignment](lo_off)
+        var hi = tile.raw_load[width=4, alignment=alignment](hi_off)
         return lo.join(hi)
 
     @always_inline
@@ -191,8 +191,8 @@ struct MmaOpApple[
         var row_stride = Self._row_stride(tile)
         var off_lo = self.rb * row_stride + self.cb
         var off_hi = (self.rb + 8) * row_stride + self.cb
-        (tile.ptr + off_lo).store(frag.slice[4, offset=0]())
-        (tile.ptr + off_hi).store(frag.slice[4, offset=4]())
+        tile.raw_store[width=4](off_lo, frag.slice[4, offset=0]())
+        tile.raw_store[width=4](off_hi, frag.slice[4, offset=4]())
 
     @always_inline
     def load_fragment[
@@ -310,20 +310,20 @@ struct MmaOpApple[
         if self.rb < valid_rows:
             var off = self.rb * row_stride + col
             if col + 3 < valid_cols:
-                (tile.ptr + off).store(frag.slice[4, offset=0]())
+                tile.raw_store[width=4](off, frag.slice[4, offset=0]())
             else:
                 for i in range(4):
                     if col + i < valid_cols:
-                        tile.ptr[off + i] = frag[i]
+                        tile.raw_store[width=1](off + i, frag[i])
 
         if self.rb + 8 < valid_rows:
             var off = (self.rb + 8) * row_stride + col
             if col + 3 < valid_cols:
-                (tile.ptr + off).store(frag.slice[4, offset=4]())
+                tile.raw_store[width=4](off, frag.slice[4, offset=4]())
             else:
                 for i in range(4):
                     if col + i < valid_cols:
-                        tile.ptr[off + i] = frag[4 + i]
+                        tile.raw_store[width=1](off + i, frag[4 + i])
 
     @always_inline
     def mma[
@@ -509,10 +509,10 @@ struct MmaOpApple[
             hi_a = gmem_edge_masked_load[4](tile.ptr + hi_off, hi_mask_a)
             hi_b = gmem_edge_masked_load[4](tile.ptr + hi_off + 4, hi_mask_b)
         else:
-            lo_a = (tile.ptr + lo_off).load[width=4, alignment=align]()
-            lo_b = (tile.ptr + lo_off + 4).load[width=4, alignment=align]()
-            hi_a = (tile.ptr + hi_off).load[width=4, alignment=align]()
-            hi_b = (tile.ptr + hi_off + 4).load[width=4, alignment=align]()
+            lo_a = tile.raw_load[width=4, alignment=align](lo_off)
+            lo_b = tile.raw_load[width=4, alignment=align](lo_off + 4)
+            hi_a = tile.raw_load[width=4, alignment=align](hi_off)
+            hi_b = tile.raw_load[width=4, alignment=align](hi_off + 4)
 
         return (lo_a.join(hi_a), lo_b.join(hi_b))
 
@@ -749,22 +749,22 @@ struct MmaOpApple[
         comptime if bounded:
             if self.rb < b_valid:
                 if two_cb + 7 < k_valid:
-                    lo8 = (b_msub.ptr + lo_off).load[width=8, alignment=align]()
+                    lo8 = b_msub.raw_load[width=8, alignment=align](lo_off)
                 else:
                     for i in range(8):
                         if two_cb + i < k_valid:
-                            lo8[i] = b_msub.ptr[lo_off + i]
+                            lo8[i] = b_msub.raw_load[width=1](lo_off + i)
             if self.rb + 8 < b_valid:
                 if two_cb + 7 < k_valid:
-                    hi8 = (b_msub.ptr + hi_off).load[width=8, alignment=align]()
+                    hi8 = b_msub.raw_load[width=8, alignment=align](hi_off)
                 else:
                     for i in range(8):
                         if two_cb + i < k_valid:
-                            hi8[i] = b_msub.ptr[hi_off + i]
+                            hi8[i] = b_msub.raw_load[width=1](hi_off + i)
         else:
             # Interior full strip: every N-col and all 32 K are in-bounds.
-            lo8 = (b_msub.ptr + lo_off).load[width=8, alignment=align]()
-            hi8 = (b_msub.ptr + hi_off).load[width=8, alignment=align]()
+            lo8 = b_msub.raw_load[width=8, alignment=align](lo_off)
+            hi8 = b_msub.raw_load[width=8, alignment=align](hi_off)
 
         var f0 = lo8.slice[4, offset=0]().join(hi8.slice[4, offset=0]())
         var f1 = lo8.slice[4, offset=4]().join(hi8.slice[4, offset=4]())
@@ -974,11 +974,13 @@ struct MmaOpApple[
 
         Caller guarantees all elements are in-bounds.
         """
-        var accum = Self.AccumType(uninitialized=True)
-        comptime for mi in range(Self.num_m_mmas):
-            comptime for ni in range(Self.num_n_mmas):
-                var sub = d_tile.tile[16, 16](mi, ni)
-                accum[mi * Self.num_n_mmas + ni] = self.load_fragment[
-                    Self.out_type
-                ](sub)
-        return accum^
+
+        def fragment_at[
+            idx: Int
+        ]() {imm} -> SIMD[Self.out_type, Self.FRAG_SIZE]:
+            comptime mi, ni = divmod(idx, Self.num_n_mmas)
+            return self.load_fragment[Self.out_type](
+                d_tile.tile[16, 16](mi, ni)
+            )
+
+        return Self.AccumType(fill_with_unrolled=fragment_at)

@@ -26,9 +26,10 @@ from max.gpu.host.info import B200
 from max.gpu.primitives.grid_controls import pdl_launch_attributes, PDLLevel
 from layout import (
     Coord,
+    DefaultEngine,
     Idx,
-    PointerStorage,
     RowMajorLayout,
+    TensorEngine,
     TensorLayout,
     TileTensor,
     row_major as tt_row_major,
@@ -53,13 +54,19 @@ def _blackwell_matmul_swiglu[
     config: FusedSwiGLUMatmulConfig[_, _, _, transpose_b],
     pdl_level: PDLLevel = PDLLevel(),
     BiasLayoutType: TensorLayout = RowMajorLayout[Int64],
+    BiasEngine: TensorEngine = DefaultEngine[element_width=1],
 ](
-    c_out: TileTensor[Storage=PointerStorage[element_width=1], ...],
+    c_out: TileTensor[...],
     a_device: TileTensor,
     b_device: TileTensor,
     ctx: DeviceContext,
     bias_tensor: OptionalReg[
-        TileTensor[config.c_type, BiasLayoutType, ImmutAnyOrigin]
+        TileTensor[
+            config.c_type,
+            BiasLayoutType,
+            ImmutAnyOrigin,
+            Engine=BiasEngine,
+        ]
     ] = None,
 ) raises:
     """Launch fused GEMM+SwiGLU kernel on SM100.
@@ -166,16 +173,16 @@ def _blackwell_matmul_swiglu[
 
     # c_out is always user-frame [user_M, user_H]; derive H from c_out so
     # this is correct under both AB_swapped values.
-    var c_gmem_ptr = c_out._storage
+    var c_gmem_ptr = c_out.ptr
     var c_gmem_stride = UInt32(Int(c_out.dim[1]()))
 
     # Build 1D bias tile (real ptr when use_bias, dummy c_out ptr otherwise).
     comptime ImmutPtr = UnsafePointer[Scalar[c_type], ImmutAnyOrigin]
     var bias_1d_ptr: ImmutPtr
     comptime if config.use_bias:
-        bias_1d_ptr = rebind[ImmutPtr](bias_tensor.value()._storage)
+        bias_1d_ptr = rebind[ImmutPtr](bias_tensor.value().ptr)
     else:
-        bias_1d_ptr = rebind[ImmutPtr](c_out._storage)
+        bias_1d_ptr = rebind[ImmutPtr](c_out.ptr)
     var bias_1d_tile = KernelType.Bias1DTile(
         bias_1d_ptr, KernelType.Bias1DTileLayout
     )

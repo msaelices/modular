@@ -24,28 +24,28 @@ from std.math import ceildiv
 from std.math.uutils import udivmod
 from std.sys import size_of
 
-from std.gpu import MAX_THREADS_PER_BLOCK_METADATA
+from max.gpu import MAX_THREADS_PER_BLOCK_METADATA
 from max.gpu.sync import barrier
 from max.gpu.primitives.cluster import (
     cluster_sync,
     cluster_sync_relaxed,
     elect_one_sync,
 )
-from std.gpu.globals import WARPGROUP_SIZE
+from max.gpu.globals import WARPGROUP_SIZE
 from max.gpu.primitives.grid_controls import (
     PDLLevel,
     launch_dependent_grids,
     wait_on_dependent_grids,
 )
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.gpu import (
+from max.gpu import (
     block_id_in_cluster,
     block_idx,
     grid_dim,
     thread_idx,
     warp_id,
 )
-from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
+from max.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from max.gpu.memory import (
     external_memory,
     fence_mbarrier_init,
@@ -55,7 +55,9 @@ from layout import (
     Idx,
     Layout,
     MixedLayout,
+    DefaultEngine,
     TensorLayout,
+    TensorEngine,
     TileTensor,
     row_major,
 )
@@ -123,8 +125,7 @@ struct HopperMatmulSM90Kernel_SMem[
     The memory is organized to support asynchronous loads and efficient
     bank-conflict-free access patterns for tensor core operations.
 
-    All tiles use TileTensor-based types from tile_types.mojo. At TMA/WGMMA
-    boundaries, pass {tile._storage} to construct the tile view.
+    All tiles use TileTensor-based types from tile_types.mojo.
     """
 
     # SM90 blocked_product ordering: ((8, tiles_m), ...) with non-zero K-tile stride.
@@ -260,6 +261,11 @@ struct HopperMatmulSM90Kernel[
     hilbert_swizzle: Bool = False,
     k_group_size: Int = 1,
     swapAB: Bool = False,
+    a_engine: TensorEngine = DefaultEngine[element_width=1],
+    b_engine: TensorEngine = DefaultEngine[element_width=1],
+    c_engine: TensorEngine = DefaultEngine[element_width=1],
+    a_offsets_engine: TensorEngine = DefaultEngine[element_width=1],
+    expert_ids_engine: TensorEngine = DefaultEngine[element_width=1],
 ]:
     """Hopper SM90 GEMM for NVIDIA H100 GPUs.
 
@@ -305,6 +311,16 @@ struct HopperMatmulSM90Kernel[
         swapAB: Whether to swap the A and B operand roles in the output
             writer for the small-M strategy, transposing the tile and
             block coordinate mapping (defaults to `False`).
+        a_engine: Engine of the A operand (defaults to
+            `DefaultEngine`).
+        b_engine: Engine of the B operand (defaults to
+            `DefaultEngine`).
+        c_engine: Engine of the C output (defaults to
+            `DefaultEngine`).
+        a_offsets_engine: Engine of the `a_offsets` tensor
+            (defaults to `DefaultEngine`).
+        expert_ids_engine: Engine of the `expert_ids` tensor
+            (defaults to `DefaultEngine`).
     """
 
     comptime BM = Self.block_tile_shape[0]
@@ -566,7 +582,7 @@ struct HopperMatmulSM90Kernel[
     @always_inline
     def get_block_swizzle(
         lut_ptr: OptionalReg[UnsafePointer[UInt32, MutAnyOrigin]] = None,
-    ) -> IndexList[2, element_type=DType.uint32]:
+    ) -> IndexList[2, element_type=.uint32]:
         """Calculate block swizzle for better L2 cache locality.
 
         Args:
@@ -584,16 +600,16 @@ struct HopperMatmulSM90Kernel[
                 var packed = lut_ptr.unsafe_value()[linear]
                 var new_x = packed & 0xFFFF
                 var new_y = packed >> 16
-                return Index[dtype=DType.uint32](new_x, new_y)
+                return Index[dtype=.uint32](new_x, new_y)
             else:
                 # Default swizzling pattern for L2 cache optimization
                 return block_swizzle(
-                    Index[dtype=DType.uint32](block_idx.x, block_idx.y),
-                    Index[dtype=DType.uint32](grid_dim.x, grid_dim.y),
+                    Index[dtype=.uint32](block_idx.x, block_idx.y),
+                    Index[dtype=.uint32](grid_dim.x, grid_dim.y),
                 )
         else:
             # Multi-cluster mode: no swizzling (handled by hardware)
-            return Index[dtype=DType.uint32](block_idx.x, block_idx.y)
+            return Index[dtype=.uint32](block_idx.x, block_idx.y)
 
     @staticmethod
     @always_inline
@@ -603,12 +619,7 @@ struct HopperMatmulSM90Kernel[
         ] = Self.elementwise_lambda_fn
     ](
         c_tma_op: TMATensorTile[Self.c_type, _, _, _],
-        c: TileTensor[
-            mut=True,
-            dtype=Self.c_type,
-            address_space=AddressSpace.GENERIC,
-            ...,
-        ],
+        c: TileTensor[mut=True, Self.c_type, address_space=.GENERIC, ...],
         c_tile: Self.SMem.CTile,
         output_reg_tile: Self.AccumRegTile,
         warp_group_thread_idx: Int,
@@ -731,8 +742,12 @@ struct HopperMatmulSM90Kernel[
             WARPGROUP_SIZE // num_threads_per_row, num_threads_per_row
         ](),
     ](
-        a: TileTensor[Self.a_type, Self.a_layout, ImmutAnyOrigin],
-        b: TileTensor[Self.b_type, Self.b_layout, ImmutAnyOrigin],
+        a: TileTensor[
+            Self.a_type, Self.a_layout, ImmutAnyOrigin, Engine=Self.a_engine
+        ],
+        b: TileTensor[
+            Self.b_type, Self.b_layout, ImmutAnyOrigin, Engine=Self.b_engine
+        ],
     ) -> Tuple[
         TileLoaderCPAsync[
             Self.a_type,
@@ -740,6 +755,7 @@ struct HopperMatmulSM90Kernel[
             thread_layout,
             Self.a_swizzle,
             vector_size,
+            Self.a_engine,
         ],
         TileLoaderCPAsync[
             Self.b_type,
@@ -747,6 +763,7 @@ struct HopperMatmulSM90Kernel[
             thread_layout,
             Self.b_swizzle,
             vector_size,
+            Self.b_engine,
         ],
     ]:
         var a_loader = TileLoaderCPAsync[
@@ -755,6 +772,7 @@ struct HopperMatmulSM90Kernel[
             thread_layout,
             Self.a_swizzle,
             vector_size,
+            Self.a_engine,
         ](a)
         var b_loader = TileLoaderCPAsync[
             Self.b_type,
@@ -762,6 +780,7 @@ struct HopperMatmulSM90Kernel[
             thread_layout,
             Self.b_swizzle,
             vector_size,
+            Self.b_engine,
         ](b)
         return (a_loader, b_loader)
 
@@ -882,9 +901,15 @@ struct HopperMatmulSM90Kernel[
         c_tma_op: TMATensorTile[
             Self.c_type, c_tma_rank, c_tile_shape, c_desc_shape
         ],
-        a: TileTensor[Self.a_type, a_tensor_layout, ImmutAnyOrigin],
-        b: TileTensor[Self.b_type, b_tensor_layout, ImmutAnyOrigin],
-        c: TileTensor[Self.c_type, c_tensor_layout, MutAnyOrigin],
+        a: TileTensor[
+            Self.a_type, a_tensor_layout, ImmutAnyOrigin, Engine=Self.a_engine
+        ],
+        b: TileTensor[
+            Self.b_type, b_tensor_layout, ImmutAnyOrigin, Engine=Self.b_engine
+        ],
+        c: TileTensor[
+            Self.c_type, c_tensor_layout, MutAnyOrigin, Engine=Self.c_engine
+        ],
         lut_ptr: UnsafePointer[UInt32, MutAnyOrigin],
     ):
         """Main kernel entry point for matrix multiplication.
@@ -931,8 +956,8 @@ struct HopperMatmulSM90Kernel[
         # Initialize WgmmaOp and SMem first
         var wgmma_op = Self.WgmmaOp()
         ref smem = external_memory[
-            Scalar[DType.uint8],
-            address_space=AddressSpace.SHARED,
+            UInt8,
+            address_space=.SHARED,
             alignment=128,
         ]().bitcast[Self.SMem]()[]
 
@@ -1010,7 +1035,7 @@ struct HopperMatmulSM90Kernel[
 
             var output_reg_tile = (
                 final_c_reg_tile if Self.a_type
-                == DType.float8_e4m3fn else c_reg_tile
+                == .float8_e4m3fn else c_reg_tile
             )
 
             Self.consumer_output(
@@ -1063,7 +1088,9 @@ struct HopperMatmulSM90Kernel[
         c_tma_op: TMATensorTile[
             Self.c_type, c_tma_rank, c_tile_shape, c_desc_shape
         ],
-        c: TileTensor[Self.c_type, c_tensor_layout, MutAnyOrigin],
+        c: TileTensor[
+            Self.c_type, c_tensor_layout, MutAnyOrigin, Engine=Self.c_engine
+        ],
         workspace_ptr: UnsafePointer[Scalar[Self.accum_type], MutAnyOrigin],
         locks_ptr: UnsafePointer[UInt8, MutAnyOrigin],
         problem_shape: IndexList[3],
@@ -1113,8 +1140,8 @@ struct HopperMatmulSM90Kernel[
         # Initialize WgmmaOp and SMem first
         var wgmma_op = Self.WgmmaOp()
         ref smem = external_memory[
-            Scalar[DType.uint8],
-            address_space=AddressSpace.SHARED,
+            UInt8,
+            address_space=.SHARED,
             alignment=128,
         ]().bitcast[Self.SMem]()[]
 
@@ -1221,7 +1248,7 @@ struct HopperMatmulSM90Kernel[
 
                 var output_reg_tile = (
                     final_c_reg_tile if Self.a_type
-                    == DType.float8_e4m3fn else c_reg_tile
+                    == .float8_e4m3fn else c_reg_tile
                 )
 
                 scheduler.reduction(
@@ -1291,12 +1318,22 @@ struct HopperMatmulSM90Kernel[
             Self.c_type, c_tma_rank, c_tile_shape, c_desc_shape
         ],
         a_offsets: TileTensor[
-            mut=False, DType.uint32, AOffsetsLayout, MutAnyOrigin
+            mut=False,
+            .uint32,
+            AOffsetsLayout,
+            MutAnyOrigin,
+            Engine=Self.a_offsets_engine,
         ],
         expert_ids: TileTensor[
-            mut=False, DType.int32, ExpertIdsLayout, MutAnyOrigin
+            mut=False,
+            .int32,
+            ExpertIdsLayout,
+            MutAnyOrigin,
+            Engine=Self.expert_ids_engine,
         ],
-        c: TileTensor[Self.c_type, c_tensor_layout, MutAnyOrigin],
+        c: TileTensor[
+            Self.c_type, c_tensor_layout, MutAnyOrigin, Engine=Self.c_engine
+        ],
     ):
         """Grouped matmul variant for MoE (Mixture of Experts) models.
 
@@ -1348,8 +1385,8 @@ struct HopperMatmulSM90Kernel[
         # Initialize WgmmaOp and SMem first
         var wgmma_op = Self.WgmmaOp()
         ref smem = external_memory[
-            Scalar[DType.uint8],
-            address_space=AddressSpace.SHARED,
+            UInt8,
+            address_space=.SHARED,
             alignment=128,
         ]().bitcast[Self.SMem]()[]
 
@@ -1380,13 +1417,13 @@ struct HopperMatmulSM90Kernel[
 
         # The block may be OOB because we create blocks based the maximum
         # number of tokens per expert.
-        var M = a_offsets[block_idx.z + 1] - a_offsets[block_idx.z]
+        var M = a_offsets[block_idx.z + 1][0] - a_offsets[block_idx.z][0]
         if UInt32(block_idx_swizzle[1] * Self.BM) >= M:
             return
 
-        var a_start_row = a_offsets[block_idx.z]
+        var a_start_row = a_offsets[block_idx.z][0]
 
-        var expert = expert_ids[block_idx.z]
+        var expert = expert_ids[block_idx.z][0]
         # We use -1 to indicate that the block is not active for LoRA use cases.
         # but we still need to zero out the output for this case.
         var skip_matmul = expert < 0
@@ -1448,12 +1485,12 @@ struct HopperMatmulSM90Kernel[
 
             var output_reg_tile = (
                 final_c_reg_tile if Self.a_type
-                == DType.float8_e4m3fn else c_reg_tile
+                == .float8_e4m3fn else c_reg_tile
             )
 
             # C tile for current expert.
             var c_by_expert = TileTensor(
-                c._storage + a_start_row * UInt32(N),
+                c._offset_storage(Coord(a_start_row * UInt32(N))),
                 row_major(Coord(Int(M), Idx[N])),
             )
 
@@ -1522,7 +1559,7 @@ struct HopperMatmulSM90Kernel[
             warp_group_thread_idx: Thread index within the warp group.
         """
 
-        comptime if Self.a_type == DType.float8_e4m3fn:
+        comptime if Self.a_type == .float8_e4m3fn:
             _ = final_c_reg_tile.fill(0.0)
         else:
             _ = c_reg_tile.fill(0.0)
@@ -1577,7 +1614,7 @@ struct HopperMatmulSM90Kernel[
                 # Release stage (advance to next) - signal already done above
                 stage^.release_without_signal()
 
-                comptime if Self.a_type == DType.float8_e4m3fn:
+                comptime if Self.a_type == .float8_e4m3fn:
                     fp8_promotion_iter += 1
                     if fp8_promotion_iter == Self.promotion_frequency:
                         Self.promote_to_cuda_cores(c_reg_tile, final_c_reg_tile)
@@ -1592,7 +1629,7 @@ struct HopperMatmulSM90Kernel[
             consumer_loop[num_remaining_k_iters // Self.k_group_size]()
 
         # Final promotion for fp8 data type if num_k_iters % promotion_frequency != 0
-        comptime if Self.a_type == DType.float8_e4m3fn:
+        comptime if Self.a_type == .float8_e4m3fn:
             if fp8_promotion_iter != 0:
                 Self.promote_to_cuda_cores(c_reg_tile, final_c_reg_tile)
 

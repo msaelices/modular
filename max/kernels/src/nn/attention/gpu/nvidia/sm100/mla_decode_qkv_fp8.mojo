@@ -32,11 +32,11 @@ SMEM Layout (native FP8):
 
 from std.math import ceildiv
 from std.sys import size_of
-from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, warp_id
+from max.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, warp_id
 from max.gpu.sync import barrier
-from std.gpu.globals import WARPGROUP_SIZE
+from max.gpu.globals import WARPGROUP_SIZE
 from max.gpu.primitives.grid_controls import launch_dependent_grids
-from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
+from max.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from max.gpu.memory import external_memory
 from max.gpu.compute.arch.tcgen05 import (
     tcgen05_alloc,
@@ -47,7 +47,14 @@ from max.gpu.compute.arch.tcgen05 import (
 from layout.tma_async import (
     SharedMemBarrier,
 )
-from layout import ComptimeInt, CoordLike, Layout, RowMajorLayout, TileTensor
+from layout import (
+    ComptimeInt,
+    CoordLike,
+    Layout,
+    RowMajorLayout,
+    TensorEngine,
+    TileTensor,
+)
 from layout.tile_layout import row_major as tt_row_major
 from nn.attention.gpu.nvidia.common import (
     OptionalPointer,
@@ -69,6 +76,7 @@ from nn.attention.gpu.nvidia.sm100.mla_decode_utils import (
     MLA_SM100_Decode_Config,
     MLA_SM100_Decode_Common,
     QOTMATile,
+    ORaggedTMATile,
     MLA_Decode_Pack,
     OffsetPosition,
     KVPipelineGeneric,
@@ -97,6 +105,7 @@ struct MLA_SM100_Decode_QKV_FP8[
     MaskType: MHAMask,
     config: MLA_SM100_Decode_Config,
     ValidLengthType: OptionalPointer,
+    Engine: TensorEngine,
     _is_cache_length_accurate: Bool = False,
     ragged: Bool = False,
     # This is used when speculative decoding is enabled.
@@ -132,6 +141,7 @@ struct MLA_SM100_Decode_QKV_FP8[
             kernel.
         ValidLengthType: The optional pointer type for the
             per-request valid sequence length buffer.
+        Engine: Engine policy of the `scalar_args` tile operand.
         _is_cache_length_accurate: Whether the cache length used
             for offset computation is accurate (defaults to
             `False`).
@@ -256,16 +266,16 @@ struct MLA_SM100_Decode_QKV_FP8[
         q_tma: QOTMATile[
             dtype=Self.kv_type,
             BM=Self.config.BM,  # tile_m =64
-            BK=Self.config.BK_QK,  # tile_n =576
+            BK=Self.config.input_q_depth,
             swizzle_mode=Self.config.kv_tma_swizzle_mode,  # SWIZZLE_64B
         ],
         k_tma: KVTMATile[
             dtype=Self.kv_type,
             swizzle_mode=Self.config.kv_tma_swizzle_mode,
             BN=Self.config.BK_PV,  # tile_m =64
-            BK=Self.config.BK_QK,  # tile_n =576
+            BK=Self.config.input_q_depth,
         ],
-        o_tma: QOTMATile[
+        o_tma: ORaggedTMATile[
             dtype=Self.output_type,
             BM=Self.config.out_rows,
             # Per-warp output stripe (= BN_PV/4), not BN_QK.
@@ -279,11 +289,12 @@ struct MLA_SM100_Decode_QKV_FP8[
             MaskType=Self.MaskType,
             SplitAccumType=Self.SplitAccumType,
         ],
-        scales_ptr: UnsafePointer[Scalar[DType.float32], origin=MutAnyOrigin],
+        scales_ptr: UnsafePointer[Float32, origin=MutAnyOrigin],
         scalar_args: TileTensor[
-            DType.int64,
+            .int64,
             RowMajorLayout[ComptimeInt[3]],
             MutAnyOrigin,
+            Engine=Self.Engine,
         ],
     ):
         # MaskType assertion: native FP8 backend supports NullMask, CausalMask,
@@ -324,7 +335,7 @@ struct MLA_SM100_Decode_QKV_FP8[
                 UnsafePointer[
                     Scalar[Self.ValidLengthType.dtype],
                     ImmutAnyOrigin,
-                    address_space=AddressSpace.GENERIC,
+                    address_space=.GENERIC,
                 ]
             ](valid_length.value()),
             q_max_seq_len,
@@ -345,10 +356,8 @@ struct MLA_SM100_Decode_QKV_FP8[
                             offset_position.split_idx,
                             offset_position.batch_idx,
                             offset_position.max_seq_len,
-                            offset_position.out_row_offset_at(q_local),
                             batch_size,
                             lse_accum_split_ptr,
-                            o_tma,
                             seq_idx_fold=UInt32(q_local),
                         )
                 else:
@@ -356,10 +365,8 @@ struct MLA_SM100_Decode_QKV_FP8[
                         offset_position.split_idx,
                         offset_position.batch_idx,
                         offset_position.max_seq_len,
-                        offset_position.out_row_offset,
                         batch_size,
                         lse_accum_split_ptr,
-                        o_tma,
                     )
                 return
 
@@ -383,10 +390,8 @@ struct MLA_SM100_Decode_QKV_FP8[
                             offset_position.split_idx,
                             offset_position.batch_idx,
                             offset_position.max_seq_len,
-                            offset_position.out_row_offset_at(q_local),
                             batch_size,
                             lse_accum_split_ptr,
-                            o_tma,
                             seq_idx_fold=UInt32(q_local),
                         )
                 else:
@@ -394,10 +399,8 @@ struct MLA_SM100_Decode_QKV_FP8[
                         offset_position.split_idx,
                         offset_position.batch_idx,
                         offset_position.max_seq_len,
-                        offset_position.out_row_offset,
                         batch_size,
                         lse_accum_split_ptr,
-                        o_tma,
                     )
                 return
 
@@ -416,10 +419,8 @@ struct MLA_SM100_Decode_QKV_FP8[
                                 offset_position.split_idx,
                                 offset_position.batch_idx,
                                 offset_position.max_seq_len,
-                                offset_position.out_row_offset_at(q_local),
                                 batch_size,
                                 lse_accum_split_ptr,
-                                o_tma,
                                 seq_idx_fold=UInt32(q_local),
                             )
                     else:
@@ -427,10 +428,8 @@ struct MLA_SM100_Decode_QKV_FP8[
                             offset_position.split_idx,
                             offset_position.batch_idx,
                             offset_position.max_seq_len,
-                            offset_position.out_row_offset,
                             batch_size,
                             lse_accum_split_ptr,
-                            o_tma,
                         )
 
                 return
@@ -439,7 +438,7 @@ struct MLA_SM100_Decode_QKV_FP8[
         # Q FP8 region: 64 x 576 x 1 bytes = 36864 bytes
         var q_smem = external_memory[
             Scalar[Self.fp8_type],
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
             alignment=128,
             name="mha_dynamic_shared_memory",
         ]()
@@ -647,14 +646,14 @@ struct MLA_SM100_Decode_QKV_FP8[
         q_tma: QOTMATile[
             dtype=Self.kv_type,
             BM=Self.config.BM,
-            BK=Self.config.BK_QK,
+            BK=Self.config.input_q_depth,
             swizzle_mode=Self.config.kv_tma_swizzle_mode,  # SWIZZLE_64B
         ],
         k_tma: KVTMATile[
             dtype=Self.kv_type,
             swizzle_mode=Self.config.kv_tma_swizzle_mode,
             BN=Self.config.BK_PV,
-            BK=Self.config.BK_QK,
+            BK=Self.config.input_q_depth,
         ],
         kv_lut: Self.KVLUTType,
         q_smem: SharedMemPointer[Scalar[Self.fp8_type]],
@@ -736,7 +735,7 @@ struct MLA_SM100_Decode_QKV_FP8[
                 Self.kv_type,
                 type_of(q_tt_layout),
                 MutAnyOrigin,
-                address_space=AddressSpace.SHARED,
+                address_space=.SHARED,
             ](q_smem.bitcast[Scalar[Self.kv_type]](), q_tt_layout)
             q_tma.async_copy(q_smem_tensor, mbar_q[], (0, row))
 
