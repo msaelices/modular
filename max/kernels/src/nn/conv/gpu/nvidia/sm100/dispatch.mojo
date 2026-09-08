@@ -16,13 +16,13 @@ This module provides a dtype-safe dispatch function that gates SM100
 conv2d kernel instantiation to supported dtypes (bf16/fp16) only.
 Importing this module does NOT trigger kernel compilation -- the kernel
 is only compiled when `dispatch_sm100_conv2d` is called with a supported
-dtype inside a @parameter if guard.
+dtype inside a comptime if guard.
 """
 
 from std.collections import OptionalReg
 from std.math import ceildiv
 from std.sys import size_of
-from std.gpu import global_idx
+from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from layout import Idx, TileTensor, row_major
@@ -130,9 +130,7 @@ def dispatch_sm100_conv2d[
     elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
     has_residual: Bool = False,
 ](
-    input: TileTensor[
-        mut=True, input_type, address_space=AddressSpace.GENERIC, ...
-    ],
+    input: TileTensor[mut=True, input_type, address_space=.GENERIC, ...],
     filter: TileTensor[filter_type, ...],
     output: TileTensor[mut=True, output_type, ...],
     symmetric_padding: IndexList[2],
@@ -144,7 +142,7 @@ def dispatch_sm100_conv2d[
 ) raises:
     """Dispatch to SM100 structured conv2d with filter transpose.
 
-    This function gates the SM100 kernel import behind @parameter if
+    This function gates the SM100 kernel import behind comptime if
     on dtype, so the kernel is never compiled for unsupported dtypes.
 
     Parameters:
@@ -173,7 +171,7 @@ def dispatch_sm100_conv2d[
     comptime assert filter.flat_rank == 4, "filter must be rank 4"
     comptime assert output.flat_rank == 4, "output must be rank 4 (NHWC)"
 
-    comptime if input_type == DType.bfloat16:
+    comptime if input_type == .bfloat16:
         from .conv2d import conv2d_fprop, conv2d_fprop_with_residual
         from .conv_config import Conv2dConfig, Conv2dProblemShape
 
@@ -248,18 +246,12 @@ def dispatch_sm100_conv2d[
             pad_w=symmetric_padding[1],
         )
 
-        var act_tt = TileTensor(
-            input.ptr,
-            row_major(batch, in_h, in_w, in_c),
-        )
+        var act_tt = input.reshape(row_major(batch, in_h, in_w, in_c))
         var filter_tt = TileTensor(
             filter_krsc_ptr,
             row_major(out_c, fh, fw, in_c),
         )
-        var out_tt = TileTensor(
-            output.ptr,
-            row_major(batch, out_h, out_w, out_c),
-        )
+        var out_tt = output.reshape(row_major(batch, out_h, out_w, out_c))
 
         # Pick activation/filter swizzle based on C_in alignment. SWIZZLE_128B
         # requires the inner C-row to be 128B-aligned; SWIZZLE_64B relaxes that

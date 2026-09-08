@@ -15,17 +15,22 @@
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import json
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    TypeAlias,
+    cast,
+)
 
 import numpy as np
 import numpy.typing as npt
-from max.pipelines.context import TextContext
+from max.pipelines.context import AudioContext, PixelContext, TextContext
 from max.pipelines.modeling.types import (
     EmbeddingsContext,
     Pipeline,
@@ -44,12 +49,11 @@ from transformers import (
 if TYPE_CHECKING:
     from .config import PipelineConfig
 
-from max.driver import load_devices
+from max.pipelines.audio.pipeline import AudioGenerationPipeline
 from max.pipelines.diffusion.pipeline import PixelGenerationPipeline
 from max.pipelines.lib._hf_config import load_huggingface_config
-from max.pipelines.lib.memory_estimation import MemoryEstimator, _MemoryPlan
+from max.pipelines.lib.memory_estimation import MemoryEstimator, MemoryPlan
 from max.pipelines.weights.hf_utils import HuggingFaceRepo
-from max.support.human_readable_formatter import to_human_readable_bytes
 
 from .arch_lookup import (
     ARCH_LOOKUP,
@@ -62,7 +66,7 @@ from .arch_lookup import (
 # keep working after their move to the arch_lookup leaf module.
 from .arch_lookup import PipelineModelType as PipelineModelType
 from .embeddings_pipeline import EmbeddingsPipeline
-from .interfaces import ArchConfigWithKVCache, PipelineModel
+from .interfaces import PipelineModel
 from .pipeline_variants.overlap_text_generation import (
     OverlapTextGenerationPipeline,
 )
@@ -72,17 +76,38 @@ from .tokenizer import TextTokenizer
 
 logger = logging.getLogger("max.pipelines")
 
+
 PipelineTypes: TypeAlias = Pipeline[Any, Any]
+
+
+@dataclass(frozen=True)
+class RetrievedPipeline:
+    """Everything :meth:`PipelineRegistry.retrieve_factory` resolves.
+
+    Carries the tokenizer, a factory that constructs the pipeline, and the
+    memory plan the pipeline was sized against.
+    """
+
+    tokenizer: PipelineTokenizer[Any, Any, Any]
+    """Tokenizer paired with the pipeline."""
+
+    factory: Callable[[], PipelineTypes]
+    """Zero-argument callable that constructs the pipeline instance."""
+
+    memory_plan: MemoryPlan
+    """Memory plan (batch size, sequence length, and cache budgets) the
+    pipeline was sized against."""
 
 
 def get_pipeline_for_task(
     task: PipelineTask, pipeline_config: PipelineConfig
-) -> (
-    type[TextGenerationPipeline[TextContext]]
-    | type[EmbeddingsPipeline]
-    | type[PixelGenerationPipeline[Any]]
-    | type[OverlapTextGenerationPipeline[TextContext]]
-):
+) -> type[
+    TextGenerationPipeline[TextContext]
+    | EmbeddingsPipeline
+    | PixelGenerationPipeline[Any]
+    | AudioGenerationPipeline[Any]
+    | OverlapTextGenerationPipeline[TextContext]
+]:
     """Returns the pipeline class for the given task and config.
 
     Args:
@@ -118,6 +143,8 @@ def get_pipeline_for_task(
         return EmbeddingsPipeline
     elif task == PipelineTask.PIXEL_GENERATION:
         return PixelGenerationPipeline
+    elif task == PipelineTask.AUDIO_GENERATION:
+        return AudioGenerationPipeline
     else:
         raise ValueError(f"Unsupported pipeline task: {task}")
 
@@ -239,153 +266,6 @@ def _apply_thinking_region(
         tokenizer, tokenizer.new_context, reasoning_parser_name
     )
     tokenizer.new_context = wrapper  # type: ignore[method-assign]
-
-
-def _run_memory_planning(
-    pipeline_config: Any,
-    arch: Any,
-    draft_arch: Any = None,
-) -> _MemoryPlan:
-    """Runs memory estimation and resolves max_length / max_batch_size.
-
-    Called by ``retrieve_factory`` after the config is constructed.
-    Returns a :class:`_MemoryPlan` whose
-    ``max_batch_size`` is passed to the pipeline constructor.
-
-    Also applies ``max_length`` clamping and ``max_batch_total_tokens``
-    defaulting, which depend on memory estimation output.
-    """
-    # Multi-component pipelines (diffusion models) have no "main" model entry
-    # — they store per-component configs (transformer, vae, text_encoder, etc.)
-    # and don't use a KV cache, so skip memory estimation entirely.
-    if "main" not in pipeline_config.models:
-        return _MemoryPlan(
-            max_batch_size=pipeline_config.runtime.max_batch_size or 1,
-            footprint=0,
-        )
-
-    model_config = pipeline_config.model
-
-    if not issubclass(arch.pipeline_model, PipelineModel):
-        return _MemoryPlan(
-            max_batch_size=pipeline_config.runtime.max_batch_size or 1,
-            footprint=0,
-            device_specs=tuple(model_config.device_specs),
-        )
-
-    effective_specs = tuple(model_config.device_specs)
-    logger.info(
-        "devices: %s",
-        ", ".join(f"{d.device_type}[{d.id}]" for d in effective_specs),
-    )
-    devices = load_devices(effective_specs)
-    arch_config = arch.config.initialize(
-        pipeline_config, model_config=model_config
-    )
-
-    max_batch_size = pipeline_config.runtime.max_batch_size
-    if arch.memory_planner is not None:
-        planner = arch.memory_planner(arch_config)
-        weights_size = planner.estimate_weights_size(pipeline_config)
-        if max_batch_size is None:
-            max_batch_size = planner.infer_max_batch_size(
-                pipeline_config, devices, weights_size
-            )
-        activation_size = planner.estimate_activation_memory(
-            pipeline_config, model_config.huggingface_config
-        )
-        signal_buffer_size = planner.estimate_signal_buffer_memory(
-            pipeline_config, arch_config
-        )
-    else:
-        # ``memory_planner=None`` is the fallback for architectures not yet
-        # wired to a MemoryPlanner. If adding a new architecture that uses a
-        # KV cache, set ``memory_planner=PagedMemoryPlanner`` on its
-        # ``SupportedArchitecture``.
-        weights_size = model_config.weights_size()
-        activation_size = 0
-        signal_buffer_size = pipeline_config.estimate_signal_buffer_memory(
-            arch_config
-        )
-
-    plan = MemoryEstimator.estimate_memory_footprint(
-        pipeline_config,
-        model_config,
-        arch_config,
-        devices,
-        weights_size,
-        activation_size,
-        signal_buffer_size,
-        arch=arch,
-        max_batch_size=max_batch_size,
-    )
-
-    # Clamp max_length to what the KV cache can support.
-    if clamped_max_seq_len := MemoryEstimator.max_supported_sequence_length(
-        weights_size,
-        activation_size,
-        model_config,
-        devices,
-        arch_config,
-        signal_buffer_size,
-        available_cache_memory=plan.available_cache_memory,
-    ):
-        if model_config.max_length is None:
-            model_config.max_length = clamped_max_seq_len
-        elif model_config.max_length > clamped_max_seq_len:
-            logging.warning(
-                "Clamping max_length from %d to %d due to capacity of KV Cache",
-                model_config.max_length,
-                clamped_max_seq_len,
-            )
-            model_config.max_length = clamped_max_seq_len
-
-    # For speculative decoding, clamp max_length to the draft model's limit
-    # (the draft shares the target model's KV cache).
-    if draft_arch is not None and pipeline_config.draft_model is not None:
-        draft_arch_config = draft_arch.config.initialize(
-            pipeline_config, model_config=pipeline_config.draft_model
-        )
-        draft_max_seq_len = draft_arch_config.get_max_seq_len()
-        if (
-            model_config.max_length is not None
-            and model_config.max_length > draft_max_seq_len
-        ):
-            logger.info(
-                "Clamping max_length from %d to %d (draft model max sequence length)",
-                model_config.max_length,
-                draft_max_seq_len,
-            )
-            model_config.max_length = draft_max_seq_len
-            pipeline_config.draft_model.max_length = draft_max_seq_len
-
-    # Validate that architectures requiring chunked prefill have it configured.
-    # Must run after max_length is resolved.
-    if (
-        arch.requires_max_batch_context_length
-        and pipeline_config.runtime.max_batch_total_tokens is None
-    ):
-        logger.warning(
-            "Architecture '%s' requires max-batch-total-tokens to be specified "
-            "but found None. Defaulting to the max sequence length of the model: %s",
-            arch.name,
-            model_config.max_length,
-        )
-        pipeline_config.runtime.max_batch_total_tokens = model_config.max_length
-
-    # TODO(MXF-517): Fold this into a consolidated startup logger that reports
-    # all resolved runtime values together. It logs here, from the planner that
-    # computes the budget, because the value is no longer mutated onto the config
-    # for log_basic_config to read.
-    if plan.available_cache_memory is not None:
-        logger.info(
-            "cache_memory: %s",
-            to_human_readable_bytes(plan.available_cache_memory),
-        )
-
-    # Specs rather than Device objects: the plan is pickled into the
-    # model-worker process.
-    return dataclasses.replace(plan, device_specs=tuple(effective_specs))
 
 
 def _retrieve_chat_template(chat_template: Path | None) -> str | None:
@@ -716,19 +596,15 @@ class PipelineRegistry:
                 "but config could not be loaded. "
                 "Please ensure the model repository contains a valid config.json file."
             )
-        # Use ArchConfigWithKVCache if available for max_seq_len
-        if issubclass(arch.config, ArchConfigWithKVCache):
-            arch_config = arch.config.initialize(pipeline_config)
-            max_length = arch_config.get_max_seq_len()
-        else:
-            if not issubclass(arch.pipeline_model, PipelineModel):
-                raise TypeError(
-                    f"Architecture '{arch.name}' must implement "
-                    "ArchConfigWithKVCache or use a PipelineModel "
-                    "to calculate max_seq_len."
-                )
-            max_length = arch.pipeline_model.calculate_max_seq_len(
-                pipeline_config, huggingface_config=huggingface_config
+        # Construction already applied the architecture's policy.
+        max_length = pipeline_config.model.max_length
+        if max_length is None:
+            raise ValueError(
+                f"max_length is unresolved for "
+                f"'{pipeline_config.model.model_path}'. Construct the config "
+                "through PipelineConfig.from_args, which runs the "
+                "architecture's sequence-length policy, or set max_length "
+                "explicitly."
             )
 
         tokenizer: PipelineTokenizer[Any, Any, Any]
@@ -779,11 +655,8 @@ class PipelineRegistry:
         pipeline_config: PipelineConfig,
         task: PipelineTask = PipelineTask.TEXT_GENERATION,
         override_architecture: str | None = None,
-    ) -> tuple[
-        PipelineTokenizer[Any, Any, Any],
-        Callable[[], PipelineTypes],
-    ]:
-        """Retrieves the tokenizer and a factory that creates the pipeline instance."""
+    ) -> RetrievedPipeline:
+        """Retrieves the tokenizer, pipeline factory, and memory plan for the config."""
         tokenizer: PipelineTokenizer[Any, Any, Any]
         pipeline_factory: Callable[[], PipelineTypes]
 
@@ -844,10 +717,25 @@ class PipelineRegistry:
                     "MAX-Optimized architecture not found for `draft_model`"
                 )
 
-        # Memory planning: derive sizes, run estimation, resolve max_length.
-        memory_plan = _run_memory_planning(
-            pipeline_config, arch, draft_arch=draft_arch
-        )
+        # Memory planning only understands PipelineModel-based architectures;
+        # anything else (a raw Module, an executor) gets a pass-through plan
+        # carrying the config's own values. Multi-component pipelines have no
+        # "main" model and are handled inside ``for_pipeline``.
+        if "main" in pipeline_config.models and not issubclass(
+            arch.pipeline_model, PipelineModel
+        ):
+            memory_plan = MemoryPlan(
+                planned_max_batch_size=pipeline_config.runtime.max_batch_size
+                or 1,
+                footprint=0,
+                planned_max_length=pipeline_config.model.max_length,
+                device_specs=tuple(pipeline_config.model.device_specs),
+                planned_max_batch_total_tokens=pipeline_config.runtime.max_batch_total_tokens,
+            )
+        else:
+            memory_plan = MemoryEstimator.plan(
+                pipeline_config, arch, draft_arch=draft_arch
+            )
 
         pipeline_class = get_pipeline_for_task(task, pipeline_config)
 
@@ -857,17 +745,28 @@ class PipelineRegistry:
         if arch.pipeline_cls is not None:
             pipeline_class = arch.pipeline_cls
 
-        arch_config = arch.config.initialize(pipeline_config)
-        max_length = arch_config.get_max_seq_len()
+        # The tokenizer bound is the memory plan's planned_max_length; pixel
+        # generation resolves its own per-arch bounds below.
+        max_length = memory_plan.planned_max_length
 
         # For pixel generation (diffusion models), we don't need HuggingFace transformers config
         if task == PipelineTask.PIXEL_GENERATION:
+            # Use the first component's config for model_path and revision.
+            first_config = next(iter(pipeline_config.models.values()))
+
+            # Diffusion configs derive their padding length from metadata;
+            # their policy classmethod supplies the required max_seq_len,
+            # since multi-component manifests resolve no "main" max_length.
+            arch_config = arch.config.initialize(
+                pipeline_config,
+                max_seq_len=arch.config.calculate_max_seq_len(
+                    first_config.huggingface_config, first_config
+                ),
+            )
+            max_length = arch_config.get_max_seq_len()
             # Pixel generation pipelines use a different tokenizer with subfolder parameters
             # Check if there's a secondary tokenizer (tokenizer_2) in the manifest
             has_tokenizer_2 = "tokenizer_2" in pipeline_config.models
-
-            # Use the first component's config for model_path and revision.
-            first_config = next(iter(pipeline_config.models.values()))
 
             # Determine tokenizer max_length based on pipeline type.
             # Default to arch_config.get_max_seq_len(); override per-arch as needed.
@@ -926,7 +825,40 @@ class PipelineRegistry:
                 tokenizer,
             )
 
-            return typed_tokenizer, pipeline_factory
+            return RetrievedPipeline(
+                tokenizer=typed_tokenizer,
+                factory=pipeline_factory,
+                memory_plan=memory_plan,
+            )
+
+        # Audio generation, like pixel generation, is a multi-component
+        # checkpoint whose tokenizer lives in a subfolder, and it has no
+        # top-level transformers config to load.
+        if task == PipelineTask.AUDIO_GENERATION:
+            first_config = next(iter(pipeline_config.models.values()))
+            audio_tokenizer = arch.tokenizer(
+                model_path=first_config.model_path,
+                pipeline_config=pipeline_config,
+                subfolder="tokenizer",
+                max_length=max_length,
+                revision=first_config.huggingface_model_revision,
+                trust_remote_code=first_config.trust_remote_code,
+            )
+            audio_factory_kwargs: dict[str, Any] = {
+                "pipeline_config": pipeline_config,
+                "pipeline_model": arch.pipeline_model,
+            }
+            audio_pipeline_factory = cast(
+                Callable[[], PipelineTypes],
+                functools.partial(pipeline_class, **audio_factory_kwargs),
+            )
+            return RetrievedPipeline(
+                tokenizer=cast(
+                    PipelineTokenizer[Any, Any, Any], audio_tokenizer
+                ),
+                factory=audio_pipeline_factory,
+                memory_plan=memory_plan,
+            )
 
         # Load HuggingFace Config for text generation and other tasks
         huggingface_config = pipeline_config.model.huggingface_config
@@ -1008,19 +940,24 @@ class PipelineRegistry:
                 "tokenizer.eos_token_ids is empty, tokenizer configuration is incomplete."
             )
 
-        return tokenizer, pipeline_factory
+        return RetrievedPipeline(
+            tokenizer=tokenizer,
+            factory=pipeline_factory,
+            memory_plan=memory_plan,
+        )
 
     def retrieve_context_type(
         self,
         pipeline_config: PipelineConfig,
         override_architecture: str | None = None,
         task: PipelineTask | None = None,
-    ) -> type[TextContext] | type[EmbeddingsContext]:
+    ) -> type[TextContext | EmbeddingsContext | PixelContext | AudioContext]:
         """Retrieve the context class type associated with the architecture for the given pipeline configuration.
 
-        The context type defines how the pipeline manages request state and inputs during
-        model execution. Different architectures may use different context implementations
-        that adhere to either the TextContext or EmbeddingsContext protocol.
+        The context type defines how the pipeline manages request state and
+        inputs during model execution, and which one an architecture uses
+        follows from its task: TextContext or EmbeddingsContext for token and
+        embedding models, PixelContext or AudioContext for the media tasks.
 
         Args:
             pipeline_config: The configuration for the pipeline.
@@ -1030,8 +967,7 @@ class PipelineRegistry:
                 the same name but serve different tasks.
 
         Returns:
-            The context class type associated with the architecture, which implements
-            either the TextContext or EmbeddingsContext protocol.
+            The context class type associated with the architecture.
 
         Raises:
             ValueError: If no supported architecture is found for the given model repository
@@ -1120,10 +1056,10 @@ class PipelineRegistry:
         override_architecture: str | None = None,
     ) -> tuple[PipelineTokenizer[Any, Any, Any], PipelineTypes]:
         """Retrieves the tokenizer and an instantiated pipeline for the args."""
-        tokenizer, pipeline_factory = self.retrieve_factory(
+        retrieved = self.retrieve_factory(
             pipeline_config, task, override_architecture
         )
-        return tokenizer, pipeline_factory()
+        return retrieved.tokenizer, retrieved.factory()
 
     def reset(self) -> None:
         """Clears all registered architectures (mainly for tests)."""

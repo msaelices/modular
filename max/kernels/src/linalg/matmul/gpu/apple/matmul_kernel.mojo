@@ -27,12 +27,12 @@ tails. Operands load DRAM->register directly -- threadgroup-memory staging
 """
 
 from std.collections import Array, Optional
-from std.gpu import WARP_SIZE, block_dim, block_idx, lane_id, thread_idx
+from max.gpu import WARP_SIZE, block_dim, block_idx, lane_id, thread_idx
 from std.math import align_down, ceildiv
 from max.gpu.host import DeviceContext
 from std.sys import align_of, size_of
 from std.utils import IndexList
-from layout import TensorStorage, TileTensor, Idx
+from layout import TensorEngine, TileTensor, Idx
 from layout.tile_layout import Layout, TensorLayout, row_major
 from layout.coord import Coord
 from linalg.arch.apple.mma import ConvIm2colParams, MmaOpApple
@@ -69,7 +69,7 @@ comptime _BodyMma[
     num_m: Int = 2,
     num_n: Int = 2,
     b_type: DType = in_type,
-    accum_type: DType = DType.float32,
+    accum_type: DType = .float32,
 ] = MmaOpApple[
     accum_type, in_type, num_m_mmas=num_m, num_n_mmas=num_n, b_type=b_type
 ]
@@ -461,7 +461,7 @@ trait WeightLoader:
 
 
 @fieldwise_init
-struct DenseWeightLoader[b_dtype: DType, accum_dtype: DType = DType.float32](
+struct DenseWeightLoader[b_dtype: DType, accum_dtype: DType = .float32](
     ImplicitlyCopyable, Movable, WeightLoader
 ):
     """Direct-DRAM B policy: dense-bf16 and FP8-W8A16.
@@ -481,7 +481,7 @@ struct DenseWeightLoader[b_dtype: DType, accum_dtype: DType = DType.float32](
 
 struct AppleM5MatMul[
     in_type: DType,
-    c_type: DType = DType.float32,
+    c_type: DType = .float32,
     transpose_b: Bool = False,
     elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
     block_m: Int = 64,
@@ -491,10 +491,10 @@ struct AppleM5MatMul[
     sg_n: Int = 32,
     k_unroll: Int = 1,
     use_x2: Bool = False,
-    linear_idx_type: DType = DType.int64,
+    linear_idx_type: DType = .int64,
     clamp_edge: Bool = False,
     b_type: DType = in_type,
-    accum_type: DType = DType.float32,
+    accum_type: DType = .float32,
 ]:
     """Apple M5 simdgroup-tiled GEMM (Metal 4 hardware MMA).
 
@@ -708,8 +708,8 @@ struct AppleM5MatMul[
         seed_from_output: Bool = False,
     ](
         mut loader: L,
-        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Storage=_],
-        b: TileTensor[L.b_type, b_layout, ImmutAnyOrigin, Storage=_],
+        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Engine=_],
+        b: TileTensor[L.b_type, b_layout, ImmutAnyOrigin, Engine=_],
         k: Int,
         conv: ConvIm2colParams,
         log2_grid_m: UInt32,
@@ -745,7 +745,7 @@ struct AppleM5MatMul[
         # accumulation (int8 W8A8) generalizes the A-loader + epilogue in a later
         # slice, so keep the body fp32-only until then.
         comptime assert (
-            Self.accum_type == DType.float32
+            Self.accum_type == .float32
         ), "shared GEMM body is fp32-accumulate; int32 accum is a later slice"
         comptime assert (
             L.b_type == Self.b_type
@@ -780,7 +780,7 @@ struct AppleM5MatMul[
         # `clamp_edge` only applies on the fast fp32 store path, never with
         # the cast/lambda epilogue below (see struct docstring).
         comptime clamp_active = Self.clamp_edge and not (
-            Self.c_type != DType.float32 or Self.elementwise_lambda_fn
+            Self.c_type != .float32 or Self.elementwise_lambda_fn
         )
         # `c_type` / `elementwise_lambda_fn` / `transpose_b` are struct *params*:
         # spelled `Self.x` below (a param can't be aliased to a same-name local
@@ -922,13 +922,13 @@ struct AppleM5MatMul[
         # here was already written by pass 0, and a stray read of a
         # neighbor's cell gets discarded by this tile's own bounded store.
         comptime do_seed = seed_from_output and not (
-            Self.c_type != DType.float32 or Self.elementwise_lambda_fn
+            Self.c_type != .float32 or Self.elementwise_lambda_fn
         )
         var accum: Mma.AccumType
         comptime if do_seed:
-            var c_ptr_fp32_seed = rebind[
-                UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-            ](c_ptr_shifted)
+            var c_ptr_fp32_seed = rebind[UnsafePointer[Float32, MutAnyOrigin]](
+                c_ptr_shifted
+            )
             var c_mat_fp32_seed = TileTensor[
                 linear_idx_type=Self.linear_idx_type
             ](c_ptr_fp32_seed, row_major(m, n))
@@ -942,7 +942,7 @@ struct AppleM5MatMul[
         # fp32 out with no fused lambda takes the fast `mma_op.store` path;
         # every other (c_type, lambda) combo flows through the epilogue below.
         comptime use_epilogue_path = (
-            Self.c_type != DType.float32 or Self.elementwise_lambda_fn
+            Self.c_type != .float32 or Self.elementwise_lambda_fn
         )
 
         # Cast-then-store epilogue (non-fp32 out and/or a fused
@@ -970,7 +970,7 @@ struct AppleM5MatMul[
                 lcol: Int,
                 arow: Int,
                 acol: Int,
-                v_fp32: SIMD[DType.float32, 4],
+                v_fp32: SIMD[.float32, 4],
             ):
                 # `lrow,lcol`: coords inside the simdgroup tile (C store).
                 # `arow,acol`: absolute coords (bounds + the lambda contract).
@@ -1053,9 +1053,9 @@ struct AppleM5MatMul[
         def _fast_path_store[
             bounded: Bool
         ](valid_rows: Int = 0, valid_cols: Int = 0):
-            var c_ptr_fp32 = rebind[
-                UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-            ](c_ptr_shifted)
+            var c_ptr_fp32 = rebind[UnsafePointer[Float32, MutAnyOrigin]](
+                c_ptr_shifted
+            )
             var c_mat_fp32 = TileTensor[linear_idx_type=Self.linear_idx_type](
                 c_ptr_fp32, row_major(m, n)
             )
@@ -1177,15 +1177,13 @@ struct AppleM5MatMul[
         c_layout: TensorLayout,
         a_layout: TensorLayout,
         b_layout: TensorLayout,
-        c_storage: TensorStorage,
-        a_storage: TensorStorage,
-        b_storage: TensorStorage,
+        c_engine: TensorEngine,
+        a_engine: TensorEngine,
+        b_engine: TensorEngine,
     ](
-        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Storage=c_storage],
-        a: TileTensor[
-            Self.in_type, a_layout, ImmutAnyOrigin, Storage=a_storage
-        ],
-        b: TileTensor[Self.b_type, b_layout, ImmutAnyOrigin, Storage=b_storage],
+        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Engine=c_engine],
+        a: TileTensor[Self.in_type, a_layout, ImmutAnyOrigin, Engine=a_engine],
+        b: TileTensor[Self.b_type, b_layout, ImmutAnyOrigin, Engine=b_engine],
         log2_grid_m: UInt32,
         log2_grid_n: UInt32,
     ):
@@ -1204,9 +1202,9 @@ struct AppleM5MatMul[
             c_layout: `TensorLayout` of the output `C` operand.
             a_layout: `TensorLayout` of the A operand.
             b_layout: `TensorLayout` of the B operand.
-            c_storage: `TensorStorage` of the output `C` operand.
-            a_storage: `TensorStorage` of the A operand.
-            b_storage: `TensorStorage` of the B operand.
+            c_engine: `TensorEngine` of the output `C` operand.
+            a_engine: `TensorEngine` of the A operand.
+            b_engine: `TensorEngine` of the B operand.
 
         Args:
             c: Output matrix `(M, N)` row-major; `M` and `N` derive from its
@@ -1267,16 +1265,14 @@ struct AppleM5MatMul[
         c_layout: TensorLayout,
         a_layout: TensorLayout,
         b_layout: TensorLayout,
-        c_storage: TensorStorage,
-        a_storage: TensorStorage,
-        b_storage: TensorStorage,
+        c_engine: TensorEngine,
+        a_engine: TensorEngine,
+        b_engine: TensorEngine,
         seed_from_output: Bool = False,
     ](
-        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Storage=c_storage],
-        a: TileTensor[
-            Self.in_type, a_layout, ImmutAnyOrigin, Storage=a_storage
-        ],
-        b: TileTensor[Self.b_type, b_layout, ImmutAnyOrigin, Storage=b_storage],
+        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Engine=c_engine],
+        a: TileTensor[Self.in_type, a_layout, ImmutAnyOrigin, Engine=a_engine],
+        b: TileTensor[Self.b_type, b_layout, ImmutAnyOrigin, Engine=b_engine],
         log2_grid_m: UInt32,
         log2_grid_n: UInt32,
         k_strip_start_dev: Int32,
@@ -1293,7 +1289,7 @@ struct AppleM5MatMul[
         var k_strip_end = Int(k_strip_end_dev)
         comptime assert (
             Self.clamp_edge
-            and Self.c_type == DType.float32
+            and Self.c_type == .float32
             and not Self.elementwise_lambda_fn
         ), (
             "run_chained requires clamp_edge=True, c_type=float32, no"
@@ -1366,21 +1362,19 @@ struct AppleM5MatMul[
         c_layout: TensorLayout,
         input_layout: TensorLayout,
         b_layout: TensorLayout,
-        c_storage: TensorStorage,
-        input_storage: TensorStorage,
-        b_storage: TensorStorage,
+        c_engine: TensorEngine,
+        input_engine: TensorEngine,
+        b_engine: TensorEngine,
         c_aligned: Bool = False,
     ](
-        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Storage=c_storage],
+        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Engine=c_engine],
         input: TileTensor[
-            Self.in_type, input_layout, ImmutAnyOrigin, Storage=input_storage
+            Self.in_type, input_layout, ImmutAnyOrigin, Engine=input_engine
         ],
         # Conv filter is `in_type` (the `Im2colALoader`'s `b_type == in_type`);
         # the body's `b` param keys on the loader's `b_type`, so this stays
         # `Self.in_type`, not `Self.b_type`.
-        b: TileTensor[
-            Self.in_type, b_layout, ImmutAnyOrigin, Storage=b_storage
-        ],
+        b: TileTensor[Self.in_type, b_layout, ImmutAnyOrigin, Engine=b_engine],
         conv: ConvIm2colParams,
         log2_grid_m: UInt32,
         log2_grid_n: UInt32,
@@ -1403,9 +1397,9 @@ struct AppleM5MatMul[
             c_layout: `TensorLayout` of the output `C` operand.
             input_layout: `TensorLayout` of the NHWC `input` operand.
             b_layout: `TensorLayout` of the filter `B` operand.
-            c_storage: `TensorStorage` of the output `C` operand.
-            input_storage: `TensorStorage` of the NHWC `input` operand.
-            b_storage: `TensorStorage` of the filter `B` operand.
+            c_engine: `TensorEngine` of the output `C` operand.
+            input_engine: `TensorEngine` of the NHWC `input` operand.
+            b_engine: `TensorEngine` of the filter `B` operand.
             c_aligned: When True, assume `conv.C` is a multiple of 8 so the
                 channel run is contiguous and a single width-8 load suffices
                 (defaults to False).
@@ -1471,16 +1465,12 @@ struct AppleM5MatMul[
     def run_split_k_partial[
         a_layout: TensorLayout,
         b_layout: TensorLayout,
-        a_storage: TensorStorage,
-        b_storage: TensorStorage,
+        a_engine: TensorEngine,
+        b_engine: TensorEngine,
     ](
-        partials_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-        a: TileTensor[
-            Self.in_type, a_layout, ImmutAnyOrigin, Storage=a_storage
-        ],
-        b: TileTensor[
-            Self.in_type, b_layout, ImmutAnyOrigin, Storage=b_storage
-        ],
+        partials_ptr: UnsafePointer[Float32, MutAnyOrigin],
+        a: TileTensor[Self.in_type, a_layout, ImmutAnyOrigin, Engine=a_engine],
+        b: TileTensor[Self.in_type, b_layout, ImmutAnyOrigin, Engine=b_engine],
         log2_grid_m: UInt32,
         log2_grid_n: UInt32,
         k_per_split: Int32,
@@ -1497,8 +1487,8 @@ struct AppleM5MatMul[
         Parameters:
             a_layout: `TensorLayout` of the A operand.
             b_layout: `TensorLayout` of the B operand.
-            a_storage: `TensorStorage` of the A operand.
-            b_storage: `TensorStorage` of the B operand.
+            a_engine: `TensorEngine` of the A operand.
+            b_engine: `TensorEngine` of the B operand.
 
         Args:
             partials_ptr: Pointer to the fp32 partials workspace; split `s`
@@ -1663,10 +1653,10 @@ struct AppleM5MatMul[
     @staticmethod
     def run_split_k_reduce[
         c_layout: TensorLayout,
-        c_storage: TensorStorage,
+        c_engine: TensorEngine,
     ](
-        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Storage=c_storage],
-        partials_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Engine=c_engine],
+        partials_ptr: UnsafePointer[Float32, ImmutAnyOrigin],
         num_splits: Int32,
     ):
         """Sum `num_splits` fp32 partials per output element, cast, store / fuse.
@@ -1677,7 +1667,7 @@ struct AppleM5MatMul[
 
         Parameters:
             c_layout: `TensorLayout` of the output `C` operand.
-            c_storage: `TensorStorage` of the output `C` operand.
+            c_engine: `TensorEngine` of the output `C` operand.
 
         Args:
             c: Output matrix `(M, N)` row-major; `M` and `N` derive from its
@@ -1718,7 +1708,7 @@ struct AppleM5MatMul[
 @always_inline
 def enqueue_apple_matmul[
     in_type: DType,
-    c_type: DType = DType.float32,
+    c_type: DType = .float32,
     transpose_b: Bool = False,
     elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
 ](
@@ -1769,11 +1759,11 @@ def enqueue_apple_matmul[
     # param docs), so they're mutually exclusive here. fp32 gets neither
     # (unvalidated).
     comptime use_x2 = transpose_b and (
-        in_type == DType.bfloat16 or in_type == DType.float16
+        in_type == .bfloat16 or in_type == .float16
     )
     comptime block_k = 32 if use_x2 else 16
     comptime k_unroll = 4 if (
-        not use_x2 and (in_type == DType.bfloat16 or in_type == DType.float16)
+        not use_x2 and (in_type == .bfloat16 or in_type == .float16)
     ) else 1
 
     comptime MM = AppleM5MatMul[
@@ -1801,9 +1791,7 @@ def enqueue_apple_matmul[
         )
 
     comptime assert (
-        c_type == DType.float16
-        or c_type == DType.bfloat16
-        or c_type == DType.float32
+        c_type == .float16 or c_type == .bfloat16 or c_type == .float32
     ), "enqueue_apple_matmul: c_type must be one of {fp16, bf16, fp32}"
 
     var m = Int(c.dim[0]())
@@ -1875,8 +1863,8 @@ def enqueue_apple_matmul[
     # it would still get monomorphized (and fail that assert) for every
     # `enqueue_apple_matmul` instantiation, e.g. `c_type=float16`.
     comptime clamp_chain_dtype_ok = (
-        in_type == DType.bfloat16
-        and c_type == DType.float32
+        in_type == .bfloat16
+        and c_type == .float32
         and not elementwise_lambda_fn
         and not transpose_b
     )
@@ -1921,9 +1909,9 @@ def enqueue_apple_matmul[
         type_of(c).LayoutType,
         type_of(a).LayoutType,
         type_of(b).LayoutType,
-        type_of(c).Storage,
-        type_of(a).Storage,
-        type_of(b).Storage,
+        type_of(c).Engine,
+        type_of(a).Engine,
+        type_of(b).Engine,
     ]
     comptime MM_i32 = AppleM5MatMul[
         in_type,
@@ -1933,15 +1921,15 @@ def enqueue_apple_matmul[
         block_k=block_k,
         use_x2=use_x2,
         k_unroll=k_unroll,
-        linear_idx_type=DType.int32,
+        linear_idx_type=.int32,
     ]
     comptime kernel_i32 = MM_i32.run[
         type_of(c).LayoutType,
         type_of(a).LayoutType,
         type_of(b).LayoutType,
-        type_of(c).Storage,
-        type_of(a).Storage,
-        type_of(b).Storage,
+        type_of(c).Engine,
+        type_of(a).Engine,
+        type_of(b).Engine,
     ]
     if fits_i32:
         ctx.enqueue_function[kernel_i32](
@@ -1968,7 +1956,7 @@ def enqueue_apple_matmul[
 @always_inline
 def enqueue_apple_conv2d[
     in_type: DType,
-    c_type: DType = DType.float32,
+    c_type: DType = .float32,
     elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
 ](
     c: TileTensor[mut=True, c_type, ...],
@@ -2096,9 +2084,9 @@ def enqueue_apple_conv2d[
             type_of(c).LayoutType,
             type_of(input).LayoutType,
             type_of(filter_nk).LayoutType,
-            type_of(c).Storage,
-            type_of(input).Storage,
-            type_of(filter_nk).Storage,
+            type_of(c).Engine,
+            type_of(input).Engine,
+            type_of(filter_nk).Engine,
             c_aligned=c_aligned,
         ]
         ctx.enqueue_function[kernel](
@@ -2121,7 +2109,7 @@ def enqueue_apple_conv2d[
 @always_inline
 def enqueue_apple_matmul_split_k[
     in_type: DType,
-    c_type: DType = DType.float32,
+    c_type: DType = .float32,
     transpose_b: Bool = False,
     elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
 ](
@@ -2166,11 +2154,11 @@ def enqueue_apple_matmul_split_k[
     # gets the same measured wins as the single-pass kernel instead of
     # comparing an optimized kernel to an unoptimized one.
     comptime use_x2 = transpose_b and (
-        in_type == DType.bfloat16 or in_type == DType.float16
+        in_type == .bfloat16 or in_type == .float16
     )
     comptime block_k = 32 if use_x2 else 16
     comptime k_unroll = 4 if (
-        not use_x2 and (in_type == DType.bfloat16 or in_type == DType.float16)
+        not use_x2 and (in_type == .bfloat16 or in_type == .float16)
     ) else 1
 
     comptime MM = AppleM5MatMul[
@@ -2224,9 +2212,7 @@ def enqueue_apple_matmul_split_k[
     var actual_splits = ceildiv(num_strips, strips_per_split)
     var k_per_split = strips_per_split * MM.BK
 
-    var partials = ctx.enqueue_create_buffer[DType.float32](
-        actual_splits * m * n
-    )
+    var partials = ctx.enqueue_create_buffer[.float32](actual_splits * m * n)
 
     # int32 offsets are only correct if every A/B/partials tile offset fits
     # int32; gate on byte extent (mirrors enqueue_apple_matmul's guard).
@@ -2249,19 +2235,19 @@ def enqueue_apple_matmul_split_k[
         block_k=block_k,
         use_x2=use_x2,
         k_unroll=k_unroll,
-        linear_idx_type=DType.int32,
+        linear_idx_type=.int32,
     ]
     comptime partial_kernel_i64 = MM.run_split_k_partial[
         type_of(a).LayoutType,
         type_of(b).LayoutType,
-        type_of(a).Storage,
-        type_of(b).Storage,
+        type_of(a).Engine,
+        type_of(b).Engine,
     ]
     comptime partial_kernel_i32 = MM_i32.run_split_k_partial[
         type_of(a).LayoutType,
         type_of(b).LayoutType,
-        type_of(a).Storage,
-        type_of(b).Storage,
+        type_of(a).Engine,
+        type_of(b).Engine,
     ]
     if fits_i32:
         ctx.enqueue_function[partial_kernel_i32](
@@ -2286,7 +2272,7 @@ def enqueue_apple_matmul_split_k[
             block_dim=(MM.THREADS_PER_BLOCK),
         )
     comptime reduce_kernel = MM.run_split_k_reduce[
-        type_of(c).LayoutType, type_of(c).Storage
+        type_of(c).LayoutType, type_of(c).Engine
     ]
     var n_elems = m * n
     ctx.enqueue_function[reduce_kernel](
@@ -2303,7 +2289,7 @@ def enqueue_apple_matmul_split_k[
 @always_inline
 def enqueue_apple_matmul_clamp_chain[
     in_type: DType,
-    c_type: DType = DType.float32,
+    c_type: DType = .float32,
 ](
     c: TileTensor[mut=True, c_type, ...],
     a: TileTensor[in_type, ...],
@@ -2322,7 +2308,7 @@ def enqueue_apple_matmul_clamp_chain[
     """
     comptime block_k = 16
     comptime k_unroll = 4 if (
-        in_type == DType.bfloat16 or in_type == DType.float16
+        in_type == .bfloat16 or in_type == .float16
     ) else 1
 
     comptime MM = AppleM5MatMul[
@@ -2382,43 +2368,43 @@ def enqueue_apple_matmul_clamp_chain[
         block_k=block_k,
         k_unroll=k_unroll,
         clamp_edge=True,
-        linear_idx_type=DType.int32,
+        linear_idx_type=.int32,
     ]
 
     comptime pass0_i64 = MM.run_chained[
         type_of(c).LayoutType,
         type_of(a).LayoutType,
         type_of(b).LayoutType,
-        type_of(c).Storage,
-        type_of(a).Storage,
-        type_of(b).Storage,
+        type_of(c).Engine,
+        type_of(a).Engine,
+        type_of(b).Engine,
         seed_from_output=False,
     ]
     comptime pass1_i64 = MM.run_chained[
         type_of(c).LayoutType,
         type_of(a).LayoutType,
         type_of(b).LayoutType,
-        type_of(c).Storage,
-        type_of(a).Storage,
-        type_of(b).Storage,
+        type_of(c).Engine,
+        type_of(a).Engine,
+        type_of(b).Engine,
         seed_from_output=True,
     ]
     comptime pass0_i32 = MM_i32.run_chained[
         type_of(c).LayoutType,
         type_of(a).LayoutType,
         type_of(b).LayoutType,
-        type_of(c).Storage,
-        type_of(a).Storage,
-        type_of(b).Storage,
+        type_of(c).Engine,
+        type_of(a).Engine,
+        type_of(b).Engine,
         seed_from_output=False,
     ]
     comptime pass1_i32 = MM_i32.run_chained[
         type_of(c).LayoutType,
         type_of(a).LayoutType,
         type_of(b).LayoutType,
-        type_of(c).Storage,
-        type_of(a).Storage,
-        type_of(b).Storage,
+        type_of(c).Engine,
+        type_of(a).Engine,
+        type_of(b).Engine,
         seed_from_output=True,
     ]
 

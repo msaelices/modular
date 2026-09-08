@@ -57,12 +57,12 @@ Activation Support:
 
 from max.algorithm import sync_parallelize
 from max.gpu.host import DeviceContext
-from std.gpu import (
+from max.gpu import (
     block_dim,
     block_idx,
     thread_idx,
 )
-from layout import TensorLayout, TileTensor
+from layout import TensorLayout, TensorEngine, TileTensor
 from nn.activations import silu
 
 
@@ -134,8 +134,7 @@ def causal_conv1d_channel_first_fwd_cpu[
     var total_bc = batch * dim
 
     # Parallelize across batch*channel combinations
-    @__parameter
-    def process_bc(bc_idx: Int):
+    def process_bc(bc_idx: Int) {imm}:
         var b, c = divmod(bc_idx, dim)
 
         # Bounds checking
@@ -210,12 +209,12 @@ def causal_conv1d_channel_first_fwd_cpu[
                 comptime if output_dtype.is_floating_point():
                     out_val = silu(out_val)
                 else:
-                    out_val = silu(out_val.cast[DType.float32]()).cast[
+                    out_val = silu(out_val.cast[.float32]()).cast[
                         output_dtype
                     ]()
             output.raw_store(out_offset, out_val)
 
-    sync_parallelize[process_bc](total_bc, ctx)
+    sync_parallelize(process_bc, total_bc, ctx)
 
 
 def causal_conv1d_channel_first_fwd_cpu_no_bias[
@@ -275,8 +274,7 @@ def causal_conv1d_channel_first_fwd_cpu_no_bias[
     var total_bc = batch * dim
 
     # Parallelize across batch*channel combinations
-    @__parameter
-    def process_bc(bc_idx: Int):
+    def process_bc(bc_idx: Int) {imm}:
         var b, c = divmod(bc_idx, dim)
 
         var weight_c_base_offset = UInt32(UInt32(c) * weight_c_stride)
@@ -337,12 +335,12 @@ def causal_conv1d_channel_first_fwd_cpu_no_bias[
                 comptime if output_dtype.is_floating_point():
                     out_val = silu(out_val)
                 else:
-                    out_val = silu(out_val.cast[DType.float32]()).cast[
+                    out_val = silu(out_val.cast[.float32]()).cast[
                         output_dtype
                     ]()
             output.raw_store(out_offset, out_val)
 
-    sync_parallelize[process_bc](total_bc, ctx)
+    sync_parallelize(process_bc, total_bc, ctx)
 
 
 def causal_conv1d_channel_last_fwd_cpu[
@@ -414,7 +412,7 @@ def causal_conv1d_channel_last_fwd_cpu[
                     comptime if output_dtype.is_floating_point():
                         out_val = silu(out_val)
                     else:
-                        out_val = silu(out_val.cast[DType.float32]()).cast[
+                        out_val = silu(out_val.cast[.float32]()).cast[
                             output_dtype
                         ]()
                 output.raw_store(out_offset, out_val)
@@ -485,7 +483,7 @@ def causal_conv1d_channel_last_fwd_cpu_no_bias[
                     comptime if output_dtype.is_floating_point():
                         out_val = silu(out_val)
                     else:
-                        out_val = silu(out_val.cast[DType.float32]()).cast[
+                        out_val = silu(out_val.cast[.float32]()).cast[
                             output_dtype
                         ]()
                 output.raw_store(out_offset, out_val)
@@ -579,7 +577,7 @@ def causal_conv1d_channel_last_fwd_cpu_with_seq_idx[
                     comptime if output_dtype.is_floating_point():
                         out_val = silu(out_val)
                     else:
-                        out_val = silu(out_val.cast[DType.float32]()).cast[
+                        out_val = silu(out_val.cast[.float32]()).cast[
                             output_dtype
                         ]()
                 output.raw_store(out_offset, out_val)
@@ -669,7 +667,7 @@ def causal_conv1d_channel_last_fwd_cpu_no_bias_with_seq_idx[
                     comptime if output_dtype.is_floating_point():
                         out_val = silu(out_val)
                     else:
-                        out_val = silu(out_val.cast[DType.float32]()).cast[
+                        out_val = silu(out_val.cast[.float32]()).cast[
                             output_dtype
                         ]()
                 output.raw_store(out_offset, out_val)
@@ -692,20 +690,26 @@ def causal_conv1d_channel_first_fwd_gpu[
     weight_LT: TensorLayout,
     output_LT: TensorLayout,
     bias_LT: TensorLayout,
+    x_engine: TensorEngine,
+    weight_engine: TensorEngine,
+    output_engine: TensorEngine,
+    bias_engine: TensorEngine,
 ](
     batch: Int32,
     dim: Int32,
     seqlen: Int32,
     width: Int32,
-    x: TileTensor[x_dtype, x_LT, MutUntrackedOrigin],  # Shape (B, C, L)
+    x: TileTensor[
+        x_dtype, x_LT, MutUntrackedOrigin, Engine=x_engine
+    ],  # Shape (B, C, L)
     weight: TileTensor[
-        weight_dtype, weight_LT, MutUntrackedOrigin
+        weight_dtype, weight_LT, MutUntrackedOrigin, Engine=weight_engine
     ],  # Shape (C, W)
     output: TileTensor[
-        output_dtype, output_LT, MutUntrackedOrigin
+        output_dtype, output_LT, MutUntrackedOrigin, Engine=output_engine
     ],  # Shape (B, C, L)
     bias: TileTensor[
-        bias_dtype, bias_LT, MutUntrackedOrigin
+        bias_dtype, bias_LT, MutUntrackedOrigin, Engine=bias_engine
     ],  # Shape (C,), stride = 1
     x_batch_stride: UInt32,
     x_c_stride: UInt32,
@@ -745,6 +749,10 @@ def causal_conv1d_channel_first_fwd_gpu[
         weight_LT: TensorLayout of the weight tensor `weight`.
         output_LT: TensorLayout of the output tensor `output`.
         bias_LT: TensorLayout of the bias tensor `bias`.
+        x_engine: Engine of the input tensor `x`.
+        weight_engine: Engine of the weight tensor `weight`.
+        output_engine: Engine of the output tensor `output`.
+        bias_engine: Engine of the bias tensor `bias`.
 
     Args:
         batch: Batch size.
@@ -786,10 +794,10 @@ def causal_conv1d_channel_first_fwd_gpu[
 
     # Safety check for null pointers
     if (
-        Int(x._storage) == 0
-        or Int(output._storage) == 0
-        or Int(weight._storage) == 0
-        or Int(bias._storage) == 0
+        Int(x.ptr) == 0
+        or Int(output.ptr) == 0
+        or Int(weight.ptr) == 0
+        or Int(bias.ptr) == 0
     ):
         return
 
@@ -969,9 +977,7 @@ def causal_conv1d_channel_first_fwd_gpu[
             comptime if output_dtype.is_floating_point():
                 out_val = silu(out_val)
             else:
-                out_val = silu(out_val.cast[DType.float32]()).cast[
-                    output_dtype
-                ]()
+                out_val = silu(out_val.cast[.float32]()).cast[output_dtype]()
         out_vals[i] = out_val
 
     comptime for i in range(kNElts):
@@ -1251,7 +1257,7 @@ def causal_conv1d_channel_first_fwd_gpu_no_bias[
             comptime if x_dtype.is_floating_point():
                 out_val = silu(out_val)
             else:
-                out_val = silu(out_val.cast[DType.float32]()).cast[x_dtype]()
+                out_val = silu(out_val.cast[.float32]()).cast[x_dtype]()
         out_vals[i] = out_val
 
     comptime for i in range(kNElts):
@@ -1469,7 +1475,7 @@ def causal_conv1d_channel_last_fwd_gpu[
                 comptime if output_dtype.is_floating_point():
                     out_val = silu(out_val)
                 else:
-                    out_val = silu(out_val.cast[DType.float32]()).cast[
+                    out_val = silu(out_val.cast[.float32]()).cast[
                         output_dtype
                     ]()
             out_vals_channel[i] = out_val
@@ -1660,7 +1666,7 @@ def causal_conv1d_channel_last_fwd_gpu_no_bias[
                 comptime if output_dtype.is_floating_point():
                     out_val = silu(out_val)
                 else:
-                    out_val = silu(out_val.cast[DType.float32]()).cast[
+                    out_val = silu(out_val.cast[.float32]()).cast[
                         output_dtype
                     ]()
             out_vals_channel[i] = out_val
@@ -2104,7 +2110,7 @@ def causal_conv1d_channel_last_fwd_gpu_with_seq_idx[
                 comptime if output_dtype.is_floating_point():
                     out_val = silu(out_val)
                 else:
-                    out_val = silu(out_val.cast[DType.float32]()).cast[
+                    out_val = silu(out_val.cast[.float32]()).cast[
                         output_dtype
                     ]()
             out_vals_channel[i] = out_val
@@ -2462,7 +2468,7 @@ def causal_conv1d_channel_last_fwd_gpu_no_bias_with_seq_idx[
                 comptime if output_dtype.is_floating_point():
                     out_val = silu(out_val)
                 else:
-                    out_val = silu(out_val.cast[DType.float32]()).cast[
+                    out_val = silu(out_val.cast[.float32]()).cast[
                         output_dtype
                     ]()
             out_vals_channel[i] = out_val
@@ -2847,7 +2853,7 @@ def causal_conv1d_channel_first_fwd_gpu_with_seq_idx[
                 comptime if output_dtype.is_floating_point():
                     out_val = silu(out_val)
                 else:
-                    out_val = silu(out_val.cast[DType.float32]()).cast[
+                    out_val = silu(out_val.cast[.float32]()).cast[
                         output_dtype
                     ]()
             out_vals_channel[i] = out_val
@@ -3199,7 +3205,7 @@ def causal_conv1d_channel_first_fwd_gpu_no_bias_with_seq_idx[
                 comptime if output_dtype.is_floating_point():
                     out_val = silu(out_val)
                 else:
-                    out_val = silu(out_val.cast[DType.float32]()).cast[
+                    out_val = silu(out_val.cast[.float32]()).cast[
                         output_dtype
                     ]()
             out_vals_channel[i] = out_val
@@ -3359,7 +3365,7 @@ def causal_conv1d_update_cpu[
                     comptime if output_dtype.is_floating_point():
                         out_val = silu(out_val)
                     else:
-                        out_val = silu(out_val.cast[DType.float32]()).cast[
+                        out_val = silu(out_val.cast[.float32]()).cast[
                             output_dtype
                         ]()
                 output.raw_store(out_offset, out_val)
@@ -3543,7 +3549,7 @@ def causal_conv1d_update_cpu_no_bias[
                     comptime if output_dtype.is_floating_point():
                         out_val = silu(out_val)
                     else:
-                        out_val = silu(out_val.cast[DType.float32]()).cast[
+                        out_val = silu(out_val.cast[.float32]()).cast[
                             output_dtype
                         ]()
                 output.raw_store(out_offset, out_val)
@@ -3610,17 +3616,33 @@ def causal_conv1d_update_gpu[
     weight_LT: TensorLayout,
     output_LT: TensorLayout,
     bias_LT: TensorLayout,
+    x_engine: TensorEngine,
+    conv_state_engine: TensorEngine,
+    weight_engine: TensorEngine,
+    output_engine: TensorEngine,
+    bias_engine: TensorEngine,
 ](
     batch: Int32,
     dim: Int32,
     seqlen: Int32,
     width: Int32,
     state_len: Int32,
-    x: TileTensor[x_dtype, x_LT, MutUntrackedOrigin],
-    conv_state: TileTensor[conv_state_dtype, conv_state_LT, MutUntrackedOrigin],
-    weight: TileTensor[weight_dtype, weight_LT, MutUntrackedOrigin],
-    output: TileTensor[output_dtype, output_LT, MutUntrackedOrigin],
-    bias: TileTensor[bias_dtype, bias_LT, MutUntrackedOrigin],
+    x: TileTensor[x_dtype, x_LT, MutUntrackedOrigin, Engine=x_engine],
+    conv_state: TileTensor[
+        conv_state_dtype,
+        conv_state_LT,
+        MutUntrackedOrigin,
+        Engine=conv_state_engine,
+    ],
+    weight: TileTensor[
+        weight_dtype, weight_LT, MutUntrackedOrigin, Engine=weight_engine
+    ],
+    output: TileTensor[
+        output_dtype, output_LT, MutUntrackedOrigin, Engine=output_engine
+    ],
+    bias: TileTensor[
+        bias_dtype, bias_LT, MutUntrackedOrigin, Engine=bias_engine
+    ],
     x_batch_stride: UInt32,
     x_c_stride: UInt32,
     x_l_stride: UInt32,
@@ -3658,6 +3680,12 @@ def causal_conv1d_update_gpu[
         weight_LT: TensorLayout of the weight tensor `weight`.
         output_LT: TensorLayout of the output tensor `output`.
         bias_LT: TensorLayout of the bias tensor `bias`.
+        x_engine: Engine of the input tensor `x`.
+        conv_state_engine: Engine of the convolution state tensor
+            `conv_state`.
+        weight_engine: Engine of the weight tensor `weight`.
+        output_engine: Engine of the output tensor `output`.
+        bias_engine: Engine of the bias tensor `bias`.
 
     Args:
         batch: Batch size.
@@ -3743,9 +3771,7 @@ def causal_conv1d_update_gpu[
             comptime if output_dtype.is_floating_point():
                 out_val = silu(out_val)
             else:
-                out_val = silu(out_val.cast[DType.float32]()).cast[
-                    output_dtype
-                ]()
+                out_val = silu(out_val.cast[.float32]()).cast[output_dtype]()
         output.raw_store(out_offset, out_val)
 
     # Update conv_state
@@ -3808,16 +3834,29 @@ def causal_conv1d_update_gpu_no_bias[
     conv_state_LT: TensorLayout,
     weight_LT: TensorLayout,
     output_LT: TensorLayout,
+    x_engine: TensorEngine,
+    conv_state_engine: TensorEngine,
+    weight_engine: TensorEngine,
+    output_engine: TensorEngine,
 ](
     batch: Int32,
     dim: Int32,
     seqlen: Int32,
     width: Int32,
     state_len: Int32,
-    x: TileTensor[x_dtype, x_LT, MutUntrackedOrigin],
-    conv_state: TileTensor[conv_state_dtype, conv_state_LT, MutUntrackedOrigin],
-    weight: TileTensor[weight_dtype, weight_LT, MutUntrackedOrigin],
-    output: TileTensor[output_dtype, output_LT, MutUntrackedOrigin],
+    x: TileTensor[x_dtype, x_LT, MutUntrackedOrigin, Engine=x_engine],
+    conv_state: TileTensor[
+        conv_state_dtype,
+        conv_state_LT,
+        MutUntrackedOrigin,
+        Engine=conv_state_engine,
+    ],
+    weight: TileTensor[
+        weight_dtype, weight_LT, MutUntrackedOrigin, Engine=weight_engine
+    ],
+    output: TileTensor[
+        output_dtype, output_LT, MutUntrackedOrigin, Engine=output_engine
+    ],
     x_batch_stride: UInt32,
     x_c_stride: UInt32,
     x_l_stride: UInt32,
@@ -3853,6 +3892,11 @@ def causal_conv1d_update_gpu_no_bias[
             `conv_state`.
         weight_LT: TensorLayout of the weight tensor `weight`.
         output_LT: TensorLayout of the output tensor `output`.
+        x_engine: Engine of the input tensor `x`.
+        conv_state_engine: Engine of the convolution state tensor
+            `conv_state`.
+        weight_engine: Engine of the weight tensor `weight`.
+        output_engine: Engine of the output tensor `output`.
 
     Args:
         batch: Batch size.
@@ -3936,9 +3980,7 @@ def causal_conv1d_update_gpu_no_bias[
             comptime if output_dtype.is_floating_point():
                 out_val = silu(out_val)
             else:
-                out_val = silu(out_val.cast[DType.float32]()).cast[
-                    output_dtype
-                ]()
+                out_val = silu(out_val.cast[.float32]()).cast[output_dtype]()
         output.raw_store(out_offset, out_val)
 
     if _seqlen >= _state_len:

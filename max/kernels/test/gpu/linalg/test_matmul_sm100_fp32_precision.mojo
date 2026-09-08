@@ -41,7 +41,7 @@ from std.random import random_float64, seed
 
 from max.gpu.host import DeviceContext
 from std.testing import assert_true
-from layout import TileTensor, Coord, Idx, PointerStorage, row_major
+from layout import TileTensor, Coord, Idx, DefaultEngine, row_major
 from linalg.matmul.gpu import _matmul_gpu
 
 comptime N = 128
@@ -95,17 +95,17 @@ def _run_matmul[
 ](
     a_host: TileTensor[
         f32,
-        address_space=AddressSpace.GENERIC,
+        address_space=.GENERIC,
         ...,
-        Storage=PointerStorage[element_width=1],
+        Engine=DefaultEngine[element_width=1],
     ],
     b_dev: TileTensor[f32, ...],
     c_host: TileTensor[
         mut=True,
         f32,
-        address_space=AddressSpace.GENERIC,
+        address_space=.GENERIC,
         ...,
-        Storage=PointerStorage[element_width=1],
+        Engine=DefaultEngine[element_width=1],
     ],
     m: Int,
     ctx: DeviceContext,

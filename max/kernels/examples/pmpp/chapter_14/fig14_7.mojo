@@ -13,7 +13,7 @@
 
 """Figure 14.7: Radix sort iteration kernel implementation in Mojo."""
 
-from std.gpu import block_idx, thread_idx
+from max.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from std.random import random_ui64
 
@@ -204,9 +204,9 @@ def main() raises:
     var ctx = DeviceContext()
 
     # Allocate device memory
-    var d_input = ctx.enqueue_create_buffer[DType.uint32](N)
-    var d_output = ctx.enqueue_create_buffer[DType.uint32](N)
-    var d_bits = ctx.enqueue_create_buffer[DType.uint32](N + 1)
+    var d_input = ctx.enqueue_create_buffer[.uint32](N)
+    var d_output = ctx.enqueue_create_buffer[.uint32](N)
+    var d_bits = ctx.enqueue_create_buffer[.uint32](N + 1)
 
     # Copy to device
     ctx.enqueue_copy(d_input, h_data)

@@ -27,7 +27,7 @@ from ..comm.ep.ep_kernels import (
     uses_mx_ep_token_format,
 )
 from ..kernels import moe_create_indices
-from .moe import MoE
+from .moe import MoE, _InterleavedGatedActivation
 from .quant_strategy import (
     BlockScaledStrategy,
     Fp8Strategy,
@@ -62,15 +62,6 @@ class MoEQuantized(MoE):
         if self._uses_nvidia_block_scaled_ep_layout:
             return NvMxf4f8Strategy(self.quant_config, self.dtype)
         elif self.quant_config.is_mxfp6:
-            # Deliberately not a subclass of Mxfp4Strategy: the
-            # `isinstance(strategy, Mxfp4Strategy)` branches below select the
-            # A-scale slot folds, which have no FP6 producer -- writing scales
-            # in the grouped matmul's slot layout is unimplemented in
-            # `fused_silu_mxfp6_kernel` (it asserts on
-            # `fuse_a_scale_preshuffle`). The fused *activation* kernel does
-            # exist for FP6 (`ep.fused_silu.mxfp6`), so MXFP6 is admitted to
-            # that branch explicitly with the fold inputs at 0; it is the
-            # isinstance checks for the folds it must stay out of.
             if not self.quant_config.block_scaled_preshuffled_b:
                 raise ValueError(
                     "MXFP6 MoE requires preshuffled B weights: the 24-byte FP6 "
@@ -308,6 +299,25 @@ class MoEQuantized(MoE):
             and self._uses_fused_swiglu_layout()
         )
 
+    def _can_fuse_swiglu_interleaved(self) -> bool:
+        """Whether the TP expert path can run the fused SwiGLU+quant matmul.
+
+        The fused kernel pairs adjacent matmul-output columns as (gate, up)
+        and applies SiLU, which is what an interleaved SiLU
+        ``gated_activation_fn`` computes on natively interleaved gate_up
+        weights. Keying on the activation itself keeps the gate from firing
+        for any other layout or activation. Shares the EP path's
+        ``MAX_DISABLE_FUSED_SWIGLU_NVFP4=1`` kill-switch through
+        ``can_use_fused_swiglu``.
+        """
+        return (
+            isinstance(self.gated_activation_fn, _InterleavedGatedActivation)
+            and self.gated_activation_fn.activation_fn is ops.silu
+            and self.quant_config is not None
+            and self.quant_config.is_nvfp4
+            and self.quant_config.can_use_fused_swiglu
+        )
+
     def _ep_dispatch_input_scales(self) -> TensorValue | None:
         """Returns NVFP4 input scales for EP dispatch, or ``None``."""
         if self._is_nvfp4:
@@ -377,7 +387,7 @@ class MoEQuantized(MoE):
             if (
                 self._ep_batch_manager
                 and self.use_swigluoai
-                and isinstance(strategy, BlockScaledStrategy)
+                and isinstance(strategy, (BlockScaledStrategy, Mxfp6Strategy))
                 and self.quant_config is not None
                 and self.quant_config.block_scaled_preshuffled_b
             )
@@ -461,7 +471,7 @@ class MoEQuantized(MoE):
                     )
 
         down_inputs = (down_in, silu_scales) + expert_inputs[2:]
-        if isinstance(strategy, BlockScaledStrategy):
+        if isinstance(strategy, (BlockScaledStrategy, Mxfp6Strategy)):
             # Whichever producer wrote the down A-scale in slot layout (up-fold or
             # local SwiGLU down-fold; the other is 0), the reader stride MUST match
             # that constant, not the runtime per-expert max, or it reads wrong scales.
@@ -570,36 +580,48 @@ class MoEQuantized(MoE):
                 *expert_inputs[3:],
             )
 
-        gate_up = strategy.grouped_matmul(
-            self.gate_up_proj,
-            gate_up_scales,
-            expert_scales=nvfp4.gate_up_expert if nvfp4 else None,
-            expert_inputs=expert_inputs,
-            estimated_total_m=total_m,
-        )
-
-        if self.gated_activation_fn is not None:
-            gate_up = self.gated_activation_fn(gate_up, self.moe_dim)
-        elif self.use_swigluoai:
-            gate_up = self._swigluoai_activation(gate_up)
-        else:
-            gate_up = fused_silu(gate_up, expert_start)
-
-        if self._uses_nvidia_block_scaled_ep_layout:
-            assert scales_offset is not None
-            gate_up_quant, gate_up_scales = strategy.grouped_quantize(
-                gate_up,
-                self._token_group_size,
-                nvfp4.down_input if nvfp4 else None,
-                expert_start,
-                scales_offset,
-                expert_ids,
+        if self._can_fuse_swiglu_interleaved():
+            assert isinstance(strategy, NvMxf4f8Strategy)
+            assert nvfp4 is not None
+            gate_up_quant, gate_up_scales = strategy.grouped_matmul_swiglu(
+                self.gate_up_proj,
+                gate_up_scales,
+                expert_scales=nvfp4.gate_up_expert,
+                input_scales=nvfp4.down_input,
+                expert_inputs=expert_inputs,
+                estimated_total_m=total_m,
             )
         else:
-            gate_up_quant, gate_up_scales = strategy.quantize(
-                gate_up,
-                self._token_group_size,
+            gate_up = strategy.grouped_matmul(
+                self.gate_up_proj,
+                gate_up_scales,
+                expert_scales=nvfp4.gate_up_expert if nvfp4 else None,
+                expert_inputs=expert_inputs,
+                estimated_total_m=total_m,
             )
+
+            if self.gated_activation_fn is not None:
+                gate_up = self.gated_activation_fn(gate_up, self.moe_dim)
+            elif self.use_swigluoai:
+                gate_up = self._swigluoai_activation(gate_up)
+            else:
+                gate_up = fused_silu(gate_up, expert_start)
+
+            if self._uses_nvidia_block_scaled_ep_layout:
+                assert scales_offset is not None
+                gate_up_quant, gate_up_scales = strategy.grouped_quantize(
+                    gate_up,
+                    self._token_group_size,
+                    nvfp4.down_input if nvfp4 else None,
+                    expert_start,
+                    scales_offset,
+                    expert_ids,
+                )
+            else:
+                gate_up_quant, gate_up_scales = strategy.quantize(
+                    gate_up,
+                    self._token_group_size,
+                )
 
         down_inputs = (gate_up_quant, gate_up_scales) + expert_inputs[2:]
 

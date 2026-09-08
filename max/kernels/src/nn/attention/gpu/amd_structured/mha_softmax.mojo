@@ -33,8 +33,7 @@ here would lower to `ds_bpermute_b32` (LDS-routed), so we go through
 `permlane_swap` directly.
 """
 
-from std.gpu.intrinsics import permlane_swap
-from std.gpu.primitives.warp import vote as warp_vote
+from max.gpu.intrinsics import permlane_swap
 from std.math import exp2 as math_exp2, recip
 from std.sys.intrinsics import unlikely
 
@@ -48,7 +47,7 @@ from structured_kernels.amd_tile_io import RegTile
 # ===----------------------------------------------------------------------=== #
 
 
-struct OnlineSoftmax[att_dtype: DType = DType.float32](ImplicitlyCopyable):
+struct OnlineSoftmax[att_dtype: DType = .float32](ImplicitlyCopyable):
     """Online softmax row-state bundle for `MhaPrefillV2`.
 
     Parametrized on `att_dtype`: the dtype of the `att_block`
@@ -198,9 +197,9 @@ struct OnlineSoftmax[att_dtype: DType = DType.float32](ImplicitlyCopyable):
 
         var lane_val: Float32
         comptime if op == "max":
-            lane_val = simd_accum.reduce_max().cast[DType.float32]()
+            lane_val = simd_accum.reduce_max().cast[.float32]()
         else:
-            lane_val = simd_accum.reduce_add().cast[DType.float32]()
+            lane_val = simd_accum.reduce_add().cast[.float32]()
 
         # Combine the two half-warps sharing each column.
         var swapped = permlane_swap[32](lane_val, lane_val)
@@ -258,8 +257,8 @@ struct OnlineSoftmax[att_dtype: DType = DType.float32](ImplicitlyCopyable):
         # then fold every remaining pair as `max3(s[p], s[p+1], acc)`.
         var simd_0 = src_v[0, 0, 0]
         var acc = max(
-            simd_0[0].cast[DType.float32](),
-            simd_0[1].cast[DType.float32](),
+            simd_0[0].cast[.float32](),
+            simd_0[1].cast[.float32](),
         )
         comptime for i in range(src_height):
             var simd_row = src_v[i, 0, 0]
@@ -267,8 +266,8 @@ struct OnlineSoftmax[att_dtype: DType = DType.float32](ImplicitlyCopyable):
             comptime for p in range(start, base_tile_elts, 2):
                 acc = max(
                     max(
-                        simd_row[p].cast[DType.float32](),
-                        simd_row[p + 1].cast[DType.float32](),
+                        simd_row[p].cast[.float32](),
+                        simd_row[p + 1].cast[.float32](),
                     ),
                     acc,
                 )
@@ -395,7 +394,7 @@ struct OnlineSoftmax[att_dtype: DType = DType.float32](ImplicitlyCopyable):
     @staticmethod
     @always_inline
     def _div_scalar_inplace(
-        mut dst: RegTile[DType.float32, ...],
+        mut dst: RegTile[.float32, ...],
         scalar: Float32,
     ):
         """`dst /= scalar` per element: final `o_reg /= norm_vec`.
@@ -604,7 +603,7 @@ struct OnlineSoftmax[att_dtype: DType = DType.float32](ImplicitlyCopyable):
         att_full_dtype: DType
     ](
         mut self,
-        mut o_reg: RegTile[DType.float32, _, MutUntrackedOrigin],
+        mut o_reg: RegTile[.float32, _, MutUntrackedOrigin],
         mut att_bf16_full: RegTile[att_full_dtype, _, MutUntrackedOrigin],
         threshold: Float32,
     ) -> Bool:
@@ -617,8 +616,11 @@ struct OnlineSoftmax[att_dtype: DType = DType.float32](ImplicitlyCopyable):
         clusters), rolls back `max_vec` to `max_vec_prev` and resets
         `scale_vec` to 1.
 
-        Wave-AND reduce via 64-bit ballot against full-exec mask
-        (`attend_ker` always runs all 64 lanes active).
+        Per-lane decision (each lane's column of the col_l rt_32x32
+        fragment is an independent Q row; see this struct's docstring),
+        not a wave-wide AND -- a warp-vote here would let one row's
+        growth force a rescale onto a sibling row whose own growth
+        didn't warrant it.
 
         SCALE_VEC INVARIANT: `scale_vec` is exactly 1 whenever no
         rescale fired in the most recent C2/C6. The else-branch reset
@@ -645,9 +647,15 @@ struct OnlineSoftmax[att_dtype: DType = DType.float32](ImplicitlyCopyable):
                 before a rescale fires. When `max_vec - max_vec_prev`
                 exceeds this, the rescale is applied.
         """
+        # Per-lane predicate, not a warp vote: the col_l rt_32x32 fragment
+        # gives each lane an INDEPENDENT Q row (one column of the 32x32
+        # tile, per this struct's own docstring), so an AND across the
+        # wavefront would let one row's growth force a rescale (a real,
+        # non-identity `exp2` multiply of `o_reg`/`att_bf16_full`, plus a
+        # `max_vec` state change that persists into later clusters) onto a
+        # sibling row whose own growth didn't warrant it.
         var lane_ok = (self.max_vec - self.max_vec_prev) <= threshold
-        var ballot = warp_vote[DType.uint64](lane_ok)
-        var all_ok = ballot == UInt64(0xFFFFFFFFFFFFFFFF)
+        var all_ok = lane_ok
         var pending_scale = False
         if unlikely(not all_ok):
             self.scale_vec = math_exp2(self.max_vec_prev - self.max_vec)
@@ -684,7 +692,7 @@ struct OnlineSoftmax[att_dtype: DType = DType.float32](ImplicitlyCopyable):
     @always_inline
     def rescale_output(
         mut self,
-        mut o_reg: RegTile[DType.float32, _, MutUntrackedOrigin],
+        mut o_reg: RegTile[.float32, _, MutUntrackedOrigin],
     ):
         """`o_reg *= scale_vec` per element.
 
@@ -746,7 +754,7 @@ struct OnlineSoftmax[att_dtype: DType = DType.float32](ImplicitlyCopyable):
     @always_inline
     def normalize_output(
         mut self,
-        mut o_reg: RegTile[DType.float32, _, MutUntrackedOrigin],
+        mut o_reg: RegTile[.float32, _, MutUntrackedOrigin],
     ):
         """Final `o_reg /= norm_vec` in place.
 

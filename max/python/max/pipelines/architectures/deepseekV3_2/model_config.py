@@ -31,7 +31,6 @@ from max.pipelines.kv_cache import cache_dtype_for_encoding
 from max.pipelines.lib import KVCacheConfig, MAXModelConfig, PipelineConfig
 from max.pipelines.lib.config.model_config import _select_quantization_encoding
 from max.pipelines.lib.pipeline_variants.utils import get_rope_theta
-from max.pipelines.lib.utils import upper_bounded_default
 from max.pipelines.modeling.config_enums import (
     SupportedEncoding,
     supported_encoding_dtype,
@@ -77,6 +76,8 @@ class DeepseekV3_2Config(DeepseekV3Config):
     DEFAULT_ENCODING: ClassVar[SupportedEncoding] = "float8_e4m3fn"
     SUPPORTED_ENCODINGS: ClassVar[set[SupportedEncoding]] = {"float8_e4m3fn"}
 
+    unpadded_vocab_size: int | None = None
+
     # Added parameters for the Indexer used in DeepSeek Sparse Attention.
     index_head_dim: int = 128
     index_n_heads: int = 64
@@ -84,6 +85,16 @@ class DeepseekV3_2Config(DeepseekV3Config):
     indexer_types: list[str] = field(default_factory=list)
     # GLM-5.x sets indexer_rope_interleave=true.
     indexer_rope_interleave: bool = False
+
+    kv_b_proj_dtype: DType | None = None
+    """Storage dtype of ``kv_b_proj`` when it differs from the rest of the
+    attention block.
+
+    ``None`` keeps it quantized with the other three sparse-MLA projections,
+    which is what DeepSeek-V3.2 and GLM-5.2 ship. A checkpoint that leaves this
+    one projection unquantized sets it here: the absorb then reads the weight
+    directly instead of dequantizing, and declares no
+    ``kv_b_proj.weight_scale``."""
 
     @staticmethod
     def construct_kv_params(
@@ -145,6 +156,8 @@ class DeepseekV3_2Config(DeepseekV3Config):
         cls,
         pipeline_config: PipelineConfig,
         model_config: MAXModelConfig | None = None,
+        *,
+        max_seq_len: int,
     ) -> Self:
         """Initializes a DeepseekV3_2Config instance from pipeline configuration.
 
@@ -219,10 +232,7 @@ class DeepseekV3_2Config(DeepseekV3Config):
             hidden_act=config.hidden_act,
             max_position_embeddings=config.max_position_embeddings
             + spec_decode_cache_slack(kv_params),
-            max_seq_len=upper_bounded_default(
-                upper_bound=config.max_position_embeddings,
-                default=model_config.max_length,
-            ),
+            max_seq_len=max_seq_len,
             rms_norm_eps=config.rms_norm_eps,
             tie_word_embeddings=config.tie_word_embeddings,
             rope_theta=get_rope_theta(config),
