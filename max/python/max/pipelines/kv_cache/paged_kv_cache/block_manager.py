@@ -42,7 +42,6 @@ from max.pipelines.kv_cache.kv_connector import (
     CompletedTransfer,
     KVConnector,
     KVConnectorTransfer,
-    TransferDirection,
 )
 from max.pipelines.modeling.types import RequestID
 from max.profiler import traced
@@ -91,12 +90,7 @@ def compute_block_hashes(
     # We do not compute the hash for the last token because it is ineligible
     # for prefix caching. This is because 100% prefix cache hit is illegal
     # and will result in a 0 input tokens for the request. Hence the minus 1.
-    # When the request carries pending future-token placeholders, all of
-    # them are excluded instead: a placeholder value must never be hashed
-    # into a block key, or the committed block's content would desync from
-    # its key. (With one placeholder pending, this coincides with the
-    # classic minus 1.)
-    num_hashable_tokens = len(ctx.tokens) - max(1, ctx.pending_future_count)
+    num_hashable_tokens = len(ctx.tokens) - 1
     num_unhashed_tokens = num_hashable_tokens - num_hashed_tokens
     if num_unhashed_tokens < block_size:
         return []
@@ -169,11 +163,9 @@ def _compute_seq_len(
     #   2 * num_draft_tokens          : drafts to verify *next* batch
     #                                   + drafts written *during* that batch
     #   1                             : one regular decode step
-    #   -max(1, pending_future_count) : the trailing tokens with no KV entry:
-    #                                   the pending future-token placeholders
-    #                                   (each is a not-yet-run forward's input),
-    #                                   or, with none pending, the last
-    #                                   generated token
+    #   -1                            : the last generated token has no KV
+    #                                   entry yet (overlap's in-flight
+    #                                   placeholder, or the just-sampled token)
     #
     # Block-draft correction (DFlash): the draft model's ``forward_block``
     # writes ``num_draft_tokens_per_step + 1`` positions in a single batched
@@ -203,7 +195,7 @@ def _compute_seq_len(
         + 2 * num_draft_tokens
         + 1
         + block_draft_extra
-        - max(1, ctx.pending_future_count)
+        - 1
     )
     return seq_len
 
@@ -480,7 +472,7 @@ class BlockManager:
         self.assert_runtime_invariants(ctx)
 
         if not self.enable_prefix_caching or ctx.tokens.active_length == 1:
-            return 0, CompletedTransfer(TransferDirection.LOAD)
+            return 0, CompletedTransfer.load()
 
         # Identify a request's first admission so we record one cache-hit
         # observation per request, not one per chunked-prefill chunk.
@@ -492,7 +484,7 @@ class BlockManager:
         self.compute_hashes_for_request(ctx)
 
         # Query prefix cache for full blocks.
-        prefix_cache_blocks, load_event = (
+        prefix_cache_blocks, load_event, num_external_blocks = (
             self.get_full_blocks_from_prefix_cache(ctx)
         )
 
@@ -522,10 +514,23 @@ class BlockManager:
             )
             if is_first_admission:
                 ctx.cached_prefix_length = skip_amount
+                external_tokens = num_external_blocks * self.block_size
+                # The connector's blocks are the tail of the committed prefix,
+                # and `release_uncommitted_blocks` above re-synced
+                # `processed_length` to the committed index, so `skip_amount`
+                # covers every block just spliced in. Assert rather than clamp:
+                # a clamp would silently under-report `external` and inflate
+                # `g0` if that ever stopped holding.
+                assert external_tokens <= skip_amount, (
+                    f"external prefix {external_tokens} tokens exceeds the "
+                    f"{skip_amount} tokens skipped"
+                )
+                ctx.cached_prefix_external_length = external_tokens
             return skip_amount, load_event
 
         if is_first_admission:
             ctx.cached_prefix_length = 0
+            ctx.cached_prefix_external_length = 0
         return 0, load_event
 
     @traced
@@ -717,6 +722,8 @@ class BlockManager:
         self,
         desired_hashes: Sequence[bytes],
         replica_idx: int = 0,
+        *,
+        hint: bytes | None,
     ) -> tuple[list[KVCacheBlock], KVConnectorTransfer]:
         """Onloads device blocks with the desired hashes from the connector.
 
@@ -733,6 +740,9 @@ class BlockManager:
         prefix-cache commit is deferred until the copy lands (``poll_transfers``)
         so a concurrent request in the same batch cannot read them early.
 
+        ``hint`` is the request's raw ``dkv_cache_hint``, passed through to the
+        connector; see :meth:`KVConnector.load`.
+
         Returns:
             ``(loaded_blocks, event)``; ``event`` is an already-complete
             :class:`CompletedTransfer` when nothing was onloaded or the onload
@@ -741,7 +751,7 @@ class BlockManager:
         connector = self.connector
         pool = self.device_block_pools[replica_idx]
         if not desired_hashes:
-            return [], CompletedTransfer(TransferDirection.LOAD)
+            return [], CompletedTransfer.load()
 
         # Limit by available device blocks.
         num_hashes_to_load = min(len(desired_hashes), pool.num_free_blocks)
@@ -754,21 +764,21 @@ class BlockManager:
         # Query connector for available blocks from host cache.
         block_ids = [b.bid for b in blocks]
         event = connector.load(
-            block_ids,
+            {leaf_id: block_ids for leaf_id in connector.leaves},
             desired_hashes,
             replica_idx=replica_idx,
+            hint=hint,
         )
 
         # The connector may load fewer blocks than requested; its event reports
-        # the loaded device blocks in ``g0_blocks``.
-        num_loaded = len(event.g0_blocks)
+        num_loaded = len(next(iter(event.g0_blocks_per_leaf.values())))
         for surplus_block in blocks[num_loaded:]:
             pool.free_block(surplus_block)
         loaded_blocks = blocks[:num_loaded]
         loaded_hashes = list(desired_hashes[:num_loaded])
 
         if not loaded_blocks:
-            return [], CompletedTransfer(TransferDirection.LOAD)
+            return [], CompletedTransfer.load()
 
         if event.is_complete():
             # Synchronous / stream-ordered connector (dKV): the
@@ -794,7 +804,7 @@ class BlockManager:
 
     @traced
     def count_cached_prefix_blocks(
-        self, block_hashes: Sequence[bytes]
+        self, block_hashes: Sequence[bytes], replica_idx: int = 0
     ) -> PrefixCacheHits:
         """Counts contiguous leading blocks resident in this replica's caches.
 
@@ -814,6 +824,7 @@ class BlockManager:
 
         Args:
             block_hashes: The request's block hash chain, in prefix order.
+            replica_idx: The replica whose caches are probed.
 
         Returns:
             Per-tier counts of the contiguous cached prefix.
@@ -823,9 +834,18 @@ class BlockManager:
 
         num_device_hits = 0
         if not self._only_use_kv_connector_last_level_cache:
-            device_prefix_cache = self.device_block_pool.prefix_cache
+            device_prefix_cache = self.device_block_pools[
+                replica_idx
+            ].prefix_cache
             for block_hash in block_hashes:
-                if block_hash not in device_prefix_cache:
+                if self._cross_replica_copy_enabled:
+                    _, blk = self._find_block_in_any_replica(
+                        block_hash, replica_idx
+                    )
+                    present = blk is not None
+                else:
+                    present = block_hash in device_prefix_cache
+                if not present:
                     break
                 num_device_hits += 1
 
@@ -846,16 +866,19 @@ class BlockManager:
     @traced
     def get_full_blocks_from_prefix_cache(
         self, ctx: TextContext
-    ) -> tuple[list[KVCacheBlock], KVConnectorTransfer]:
+    ) -> tuple[list[KVCacheBlock], KVConnectorTransfer, int]:
         """Gets the computed (cached) blocks for the request.
 
         Note that the computed blocks must be full.
 
         Returns:
-            ``(blocks, event)`` where ``event`` is the async onload transfer for
-            the host-tier portion, or an already-complete
+            ``(blocks, event, num_external_blocks)`` where ``event`` is the async
+            onload transfer for the host-tier portion, or an already-complete
             :class:`CompletedTransfer` when nothing was onloaded asynchronously
             (device / cross-replica hits are served synchronously).
+            ``num_external_blocks`` is how many trailing entries of ``blocks``
+            the connector served rather than the device prefix cache, for
+            per-tier hit attribution.
         """
         assert self.enable_prefix_caching
 
@@ -872,14 +895,14 @@ class BlockManager:
         )
 
         if self.connector.name == "NullConnector":
-            return device_blocks, CompletedTransfer(TransferDirection.LOAD)
+            return device_blocks, CompletedTransfer.load(), 0
 
         # remove the hashes that were found in the device prefix cache
         uncommitted_hashes = uncommitted_hashes[len(device_blocks) :]
 
         # query the host prefix cache for full blocks via connector
         host_blocks, load_event = self._get_full_blocks_from_host_prefix_cache(
-            uncommitted_hashes, replica_idx
+            uncommitted_hashes, replica_idx, hint=ctx.dkv_cache_hint
         )
 
         # refresh the lru status of all hit hashes associated with the request.
@@ -889,7 +912,7 @@ class BlockManager:
         if hit_hashes:
             self.connector.touch(hit_hashes, replica_idx=replica_idx)
 
-        return device_blocks + host_blocks, load_event
+        return device_blocks + host_blocks, load_event, len(host_blocks)
 
     @traced
     def commit_to_prefix_cache(
@@ -912,16 +935,8 @@ class BlockManager:
         )
 
         # Count the number of tokens for which we know the values of and align
-        # to the block size. Trailing future-token placeholders count as
-        # processed positions once a later forward is enqueued behind them,
-        # but their host token values are unrealized (-999), so they are not
-        # committable: committing one would poison a prefix block (and there
-        # is no hash for it — compute_hashes_for_request excludes them).
-        num_realized_tokens = len(ctx.tokens) - ctx.pending_future_count
-        num_computed_blocks = (
-            min(ctx.tokens.processed_length, num_realized_tokens)
-            // self.block_size
-        )
+        # to the block size.
+        num_computed_blocks = ctx.tokens.processed_length // self.block_size
 
         # Commit blocks into the prefix cache.
         for block_idx in range(num_committed_blocks, num_computed_blocks):
@@ -969,7 +984,7 @@ class BlockManager:
                 src_blocks.append(block)
             if block_hashes:
                 event = connector.offload(
-                    block_ids,
+                    {leaf_id: block_ids for leaf_id in connector.leaves},
                     block_hashes,
                     replica_idx=replica_idx,
                 )

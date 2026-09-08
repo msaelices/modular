@@ -78,7 +78,7 @@ from nn.attention.gpu.mha import flash_attention, mha_gpu_naive
 from nn.attention.gpu.nvidia.sm100.attention_utils import (
     clusters_per_wave,
 )
-from nn.attention.gpu.nvidia.sm100.dispatch import ws_p_ceiling
+from nn.attention.gpu.nvidia.sm100.dispatch import _bucket_ws, ws_p_ceiling
 from nn.attention.mha_mask import (
     MHAMask,
     NullMask,
@@ -226,17 +226,17 @@ def execute_combine_test[
     seed(0x5151)
 
     # --- Row offsets (single sequence) ---
-    var input_row_offsets = ctx.enqueue_create_host_buffer[DType.uint32](
+    var input_row_offsets = ctx.enqueue_create_host_buffer[.uint32](
         batch_size + 1
     )
     input_row_offsets[0] = 0
     input_row_offsets[1] = UInt32(valid_length)
-    var input_row_offsets_dev = ctx.enqueue_create_buffer[DType.uint32](
+    var input_row_offsets_dev = ctx.enqueue_create_buffer[.uint32](
         batch_size + 1
     )
     ctx.enqueue_copy(input_row_offsets_dev, input_row_offsets)
     var input_row_offsets_lt = LayoutTensor[
-        mut=False, DType.uint32, row_offsets_layout
+        mut=False, .uint32, row_offsets_layout
     ](
         input_row_offsets_dev,
         RuntimeLayout[row_offsets_layout].row_major(
@@ -297,7 +297,7 @@ def execute_combine_test[
     # --- Full lookup table (unique physical block per logical page) ---
     var full_pages = ceildiv(num_keys, page_size)
     var lut_cols = padded_lut_cols(full_pages)
-    var paged_lut_host = ctx.enqueue_create_host_buffer[DType.uint32](
+    var paged_lut_host = ctx.enqueue_create_host_buffer[.uint32](
         batch_size * lut_cols
     )
     var lut_set = Set[Int]()
@@ -309,24 +309,22 @@ def execute_combine_test[
         paged_lut_host[blk] = UInt32(randval)
 
     # ============ Run 1: split FA4 over the FULL cache ============
-    var cache_lengths_host = ctx.enqueue_create_host_buffer[DType.uint32](
-        batch_size
-    )
+    var cache_lengths_host = ctx.enqueue_create_host_buffer[.uint32](batch_size)
     cache_lengths_host[0] = UInt32(cache_length)
-    var cache_lengths_dev = ctx.enqueue_create_buffer[DType.uint32](batch_size)
+    var cache_lengths_dev = ctx.enqueue_create_buffer[.uint32](batch_size)
     ctx.enqueue_copy(cache_lengths_dev, cache_lengths_host)
     var cache_lengths_lt = LayoutTensor[
-        mut=False, DType.uint32, cache_lengths_layout
+        mut=False, .uint32, cache_lengths_layout
     ](
         cache_lengths_dev,
         RuntimeLayout[cache_lengths_layout].row_major(IndexList[1](batch_size)),
     )
 
-    var paged_lut_dev = ctx.enqueue_create_buffer[DType.uint32](
+    var paged_lut_dev = ctx.enqueue_create_buffer[.uint32](
         batch_size * lut_cols
     )
     ctx.enqueue_copy(paged_lut_dev, paged_lut_host)
-    var paged_lut_lt = LayoutTensor[mut=False, DType.uint32, paged_lut_layout](
+    var paged_lut_lt = LayoutTensor[mut=False, .uint32, paged_lut_layout](
         paged_lut_dev,
         RuntimeLayout[paged_lut_layout].row_major(
             IndexList[2](batch_size, lut_cols)
@@ -473,8 +471,8 @@ def execute_combine_test[
         for h in range(num_q_heads):
             for d in range(head_size):
                 var flat = (i * num_q_heads + h) * head_size + d
-                var a = test_out_host[flat].cast[DType.float32]()
-                var expected = ref_out_host[flat].cast[DType.float32]()
+                var a = test_out_host[flat].cast[.float32]()
+                var expected = ref_out_host[flat].cast[.float32]()
                 var diff = abs(a - expected)
                 if diff > max_abs_diff:
                     max_abs_diff = diff
@@ -547,12 +545,41 @@ def execute_combine_test[
     print("test_mha_sm100_1q_splitk_combine: PASSED")
 
 
+def _auto_p[sm_count: Int](by_cache: Int, raw_grid: Int) -> Int:
+    """Buckets `by_cache` at `raw_grid` with that grid's real ceiling.
+
+    Every `raw_grid` asserted below has a ceiling of 2 or more. A result of 1
+    thus shows the saturation guard, not the ceiling.
+    """
+    return _bucket_ws[sm_count](
+        by_cache, Int(ws_p_ceiling[sm_count](UInt32(raw_grid))), raw_grid
+    )
+
+
 def main() raises:
     comptime MASK = get_defined_int["FA4_1Q_SPLITK_MASK", 0]()
     comptime DEPTH = get_defined_int["FA4_1Q_SPLITK_DEPTH", 64]()
 
     assert_equal(ws_p_ceiling[148](24), UInt32(37))
     assert_equal(ws_p_ceiling[148](25), UInt32(35))
+
+    # The `_bucket_ws` saturation guard. A `by_cache` of 0 is a cache too short
+    # for a rung, which is the only cache the guard applies to.
+    comptime SM_COUNT = 148
+    comptime HALF_WAVE = SM_COUNT // 2
+    # A grid below `sm_count` has no last wave. The split stays.
+    assert_equal(_auto_p[SM_COUNT](0, SM_COUNT - 1), 2)
+    # An exact multiple fills every wave and leaves no SM idle.
+    assert_equal(_auto_p[SM_COUNT](0, SM_COUNT), 1)
+    # A last wave that is half full or less leaves idle SMs. The split stays.
+    assert_equal(_auto_p[SM_COUNT](0, SM_COUNT + HALF_WAVE), 2)
+    # One work item more makes the last wave too full. The split goes.
+    assert_equal(_auto_p[SM_COUNT](0, SM_COUNT + HALF_WAVE + 1), 1)
+    # The boundary is per wave, not a property of the first wave.
+    assert_equal(_auto_p[SM_COUNT](0, 2 * SM_COUNT + HALF_WAVE), 2)
+    # A cache long enough for a rung does not meet the guard. It splits even at
+    # an exact multiple: rung 4, capped by the ceiling.
+    assert_equal(_auto_p[SM_COUNT](4, 2 * SM_COUNT), 3)
 
     with DeviceContext() as ctx:
         comptime if MASK == 0:

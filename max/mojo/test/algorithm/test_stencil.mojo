@@ -199,7 +199,7 @@ def test_stencil_avg_pool_padded() raises:
     comptime output_shape_dims = IndexList[4](1, output_height, output_width, 1)
 
     var input_stack = Array[Scalar[dtype], input_shape_dims.flattened_length()](
-        uninitialized=True
+        fill={}
     )
     var input = Span(input_stack)
     var input_shape = IndexList[rank](1, input_height, input_width, 1)
@@ -571,21 +571,21 @@ def test_stencil_size_0() raises:
     ](point: IndexList[rank, ...]) -> SIMD[dtype, simd_width]:
         return 0
 
-    def init_fn[simd_width: Int]() -> SIMD[DType.float32, simd_width]:
+    def init_fn[simd_width: Int]() -> SIMD[.float32, simd_width]:
         return 0
 
     def compute_fn[
         simd_width: SIMDLength
     ](
         point: IndexList[rank, ...],
-        a: SIMD[DType.float32, simd_width],
-        b: SIMD[DType.float32, simd_width],
-    ) -> SIMD[DType.float32, simd_width]:
+        a: SIMD[.float32, simd_width],
+        b: SIMD[.float32, simd_width],
+    ) -> SIMD[.float32, simd_width]:
         return a + b
 
     def finalize_fn[
         simd_width: SIMDLength
-    ](point: IndexList[rank, ...], val: SIMD[DType.float32, simd_width],):
+    ](point: IndexList[rank, ...], val: SIMD[.float32, simd_width],):
         pass
 
     comptime stencil_axis = IndexList[stencil_rank](1, 2)

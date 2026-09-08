@@ -66,7 +66,11 @@ from _fuzz import (
     value_dist_name,
 )
 
-comptime in_type = DType.float32
+# The rejection sampler's target-side mask runs at float32 under
+# `draft_proposal: argmax` and bfloat16 under `sampled`. The dtype
+# specializes the kernel, so it is a build-time axis.
+comptime in_bf16 = get_defined_int["ttmp_bf16", 0]() == 1
+comptime in_type = DType.bfloat16 if in_bf16 else DType.float32
 comptime fuzz_seed = get_defined_int["fuzz_seed", 12345]()
 comptime budget = get_defined_int["budget", 16]()
 
@@ -309,23 +313,23 @@ def run_one_case(ctx: DeviceContext, spec: CaseSpec, check: Bool) raises:
 
     var top_p = Float32(spec.top_p_milli) / 1000.0
     var temp = Float32(spec.temp_milli) / 1000.0
-    var top_p_host = ctx.enqueue_create_host_buffer[DType.float32](rows)
-    var top_k_host = ctx.enqueue_create_host_buffer[DType.int64](rows)
-    var temp_host = ctx.enqueue_create_host_buffer[DType.float32](rows)
+    var top_p_host = ctx.enqueue_create_host_buffer[.float32](rows)
+    var top_k_host = ctx.enqueue_create_host_buffer[.int64](rows)
+    var temp_host = ctx.enqueue_create_host_buffer[.float32](rows)
     for r in range(rows):
         top_p_host[r] = top_p
         top_k_host[r] = Int64(spec.k)
         temp_host[r] = temp
-    var top_p_dev = ctx.enqueue_create_buffer[DType.float32](rows)
-    var top_k_dev = ctx.enqueue_create_buffer[DType.int64](rows)
-    var temp_dev = ctx.enqueue_create_buffer[DType.float32](rows)
+    var top_p_dev = ctx.enqueue_create_buffer[.float32](rows)
+    var top_k_dev = ctx.enqueue_create_buffer[.int64](rows)
+    var temp_dev = ctx.enqueue_create_buffer[.float32](rows)
     ctx.enqueue_copy(top_p_dev, top_p_host)
     ctx.enqueue_copy(top_k_dev, top_k_host)
     ctx.enqueue_copy(temp_dev, temp_host)
 
     # FRESH output every case, so an unwritten element is visible to the
     # poison / initcheck / memcheck oracles.
-    var probs_dev = ctx.enqueue_create_buffer[DType.float32](in_len)
+    var probs_dev = ctx.enqueue_create_buffer[.float32](in_len)
 
     topk_topp_masked_probs(
         ctx,
@@ -344,7 +348,7 @@ def run_one_case(ctx: DeviceContext, spec: CaseSpec, check: Bool) raises:
         .as_immut(),
     )
 
-    var probs_host = ctx.enqueue_create_host_buffer[DType.float32](in_len)
+    var probs_host = ctx.enqueue_create_host_buffer[.float32](in_len)
     ctx.enqueue_copy(probs_host, probs_dev)
     ctx.synchronize()
 

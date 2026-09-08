@@ -107,6 +107,7 @@ public:
     const PointerLayout &info = ptrInfos[addrSpace];
     return info.ptrWidth ? info.ptrAbiAlign : ptrInfos[0].ptrAbiAlign;
   }
+  int32_t getStructABIAlign() const;
   /// Get the endianness
   bool getIsLittleEndian() const { return isLittleEndian; }
 
@@ -140,6 +141,9 @@ private:
   /// The list of alignment entries for vectors; the key is the datatype size in
   /// BITS, the value is the alignment in BYTES.
   SmallVector<std::pair<int32_t, int32_t>> vecAbiAlign;
+  /// The alignment entry for struct types ("aggregates" in the LLVM DataLayout
+  /// string nomenclature, but "struct" in the DataLayout API...)
+  int32_t structAbiAlign = 0;
 
   /// The default alloca address space.
   int32_t allocaAddrSpace = 0;
@@ -422,6 +426,10 @@ DeviceRefAttr fromRuntimeDeviceRef(MLIRContext *ctx,
 /// helpers and MODevices.cpp for implementation.
 DeviceRefAttr getHostDevice(MLIRContext *ctx);
 DeviceRefAttr getHostDevice(Operation *op);
+
+/// Returns true if the device ref names a host (CPU) device, regardless of
+/// its id: `cpu:1` is as host-resident as `cpu:0`.
+bool isHostPlaced(DeviceRefAttr device);
 
 //===----------------------------------------------------------------------===//
 // DeviceSpecAttr

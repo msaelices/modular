@@ -23,7 +23,7 @@ Two-phase QK matmul per tile:
 from std.math.uutils import ufloordiv
 from std.sys import align_of, simd_width_of
 from std.sys.intrinsics import readfirstlane
-from std.gpu import warp_id as get_warp_id
+from max.gpu import warp_id as get_warp_id
 from std.memory import bitcast, unsafe_stack_allocation
 from layout.swizzle import Swizzle
 from nn.attention.mha_mask import CausalMask, TileMaskStatus
@@ -72,7 +72,7 @@ __extension Attention:
         )
 
         var warp_id = UInt32(
-            readfirstlane(bitcast[DType.int32](UInt32(get_warp_id())))
+            readfirstlane(bitcast[.int32](UInt32(get_warp_id())))
         )
 
         # K buffer (nope): depth=128, double-buffered gfx950 style.
@@ -143,7 +143,7 @@ __extension Attention:
         var k_rope_smem_ptr = unsafe_stack_allocation[
             k_rope_smem_elems,
             k_rope_t.dtype,
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
             alignment=alignment,
         ]()
         comptime KRopeBufT = KVBuffer[
