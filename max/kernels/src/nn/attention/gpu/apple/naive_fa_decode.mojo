@@ -46,14 +46,22 @@ Partial-buffer layout (partition-last / contiguous):
 """
 
 from std.collections import OptionalReg
-from std.gpu import WARP_SIZE, block_idx, lane_id, thread_idx
+from max.gpu import WARP_SIZE, block_idx, lane_id, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, exp
 from std.sys import llvm_intrinsic
 from std.utils.index import Index
 from std.utils.numerics import get_accum_type
 
-from layout import UNKNOWN_VALUE, Idx, Layout, LayoutTensor, TileTensor
+from layout import (
+    UNKNOWN_VALUE,
+    Idx,
+    Layout,
+    LayoutTensor,
+    DefaultEngine,
+    TensorEngine,
+    TileTensor,
+)
 from layout.coord import Coord
 from layout.tile_layout import (
     TensorLayout,
@@ -150,20 +158,32 @@ def naive_fa_decode_apple_core[
     *,
     Depth: Int,
     SplitSize: Int,
+    OPartialEngine: TensorEngine = DefaultEngine[element_width=1],
+    MPartialEngine: TensorEngine = DefaultEngine[element_width=1],
+    LPartialEngine: TensorEngine = DefaultEngine[element_width=1],
+    QEngine: TensorEngine = DefaultEngine[element_width=1],
+    VLEngine: TensorEngine = DefaultEngine[element_width=1],
+    SinkEngine: TensorEngine = DefaultEngine[element_width=1],
 ](
-    o_partial: TileTensor[p_type, p_layout, MutAnyOrigin],
-    m_partial: TileTensor[p_type, p_layout, MutAnyOrigin],
-    l_partial: TileTensor[p_type, p_layout, MutAnyOrigin],
-    q: TileTensor[q_type, q_layout, ImmutAnyOrigin],
+    o_partial: TileTensor[
+        p_type, p_layout, MutAnyOrigin, Engine=OPartialEngine
+    ],
+    m_partial: TileTensor[
+        p_type, p_layout, MutAnyOrigin, Engine=MPartialEngine
+    ],
+    l_partial: TileTensor[
+        p_type, p_layout, MutAnyOrigin, Engine=LPartialEngine
+    ],
+    q: TileTensor[q_type, q_layout, ImmutAnyOrigin, Engine=QEngine],
     k: k_t,
     v: v_t,
     mask_functor: mask_t,
     valid_length: TileTensor[
-        DType.uint32,
-        valid_length_layout,
-        ImmutAnyOrigin,
+        .uint32, valid_length_layout, ImmutAnyOrigin, Engine=VLEngine
     ],
-    sink_weights: OptionalReg[TileTensor[q_type, sink_layout, ImmutAnyOrigin]],
+    sink_weights: OptionalReg[
+        TileTensor[q_type, sink_layout, ImmutAnyOrigin, Engine=SinkEngine]
+    ],
     scale: Float32,
     batch_size: Int32,
     max_prompt_len: Int32,
@@ -210,6 +230,12 @@ def naive_fa_decode_apple_core[
         Depth: Compile-time head dimension; must be a multiple of
             `WARP_SIZE`.
         SplitSize: Per-partition KV span in keys.
+        OPartialEngine: Engine of the `o_partial` tile.
+        MPartialEngine: Engine of the `m_partial` tile.
+        LPartialEngine: Engine of the `l_partial` tile.
+        QEngine: Engine of the `q` tile.
+        VLEngine: Engine of the `valid_length` tile.
+        SinkEngine: Engine of the `sink_weights` tile.
 
     Args:
         o_partial: Flat 1D partial output buffer; one accumulator per
@@ -330,7 +356,7 @@ def naive_fa_decode_apple_core[
     # Replicated on every lane, so the running softmax needs no cross-lane comms.
     var m = NEG_INF
     var l = Float32(0.0)
-    var o_frag = SIMD[DType.float32, EPL](0.0)
+    var o_frag = SIMD[.float32, EPL](0.0)
 
     # Attention sink as init-state: pre-seed (m, l) with a virtual "key -1" of
     # raw score `sink_weight`, contributing `exp(sink - m) = 1` to the running
@@ -352,7 +378,7 @@ def naive_fa_decode_apple_core[
             l = Float32(1.0)
 
     for kv0 in range(start, end, BN):
-        var partials = SIMD[DType.float32, BN](0.0)
+        var partials = SIMD[.float32, BN](0.0)
 
         comptime for kk in range(BN):
             var j = kv0 + kk
@@ -370,7 +396,7 @@ def naive_fa_decode_apple_core[
 
         # `air.simd_sum` is a warp collective; the `j < end` guard is
         # lane-independent, so all lanes enter it together.
-        var scores = SIMD[DType.float32, BN](NEG_INF)
+        var scores = SIMD[.float32, BN](NEG_INF)
 
         comptime for kk in range(BN):
             var j = kv0 + kk
@@ -447,16 +473,27 @@ def naive_fa_decode_apple_stitch[
     _is_cache_length_accurate: Bool = False,
     *,
     SplitSize: Int,
+    OutEngine: TensorEngine = DefaultEngine[element_width=1],
+    OPartialEngine: TensorEngine = DefaultEngine[element_width=1],
+    MPartialEngine: TensorEngine = DefaultEngine[element_width=1],
+    LPartialEngine: TensorEngine = DefaultEngine[element_width=1],
+    VLEngine: TensorEngine = DefaultEngine[element_width=1],
 ](
-    output: TileTensor[output_type, output_layout, MutAnyOrigin],
-    o_partial: TileTensor[p_type, p_layout, ImmutAnyOrigin],
-    m_partial: TileTensor[p_type, p_layout, ImmutAnyOrigin],
-    l_partial: TileTensor[p_type, p_layout, ImmutAnyOrigin],
+    output: TileTensor[
+        output_type, output_layout, MutAnyOrigin, Engine=OutEngine
+    ],
+    o_partial: TileTensor[
+        p_type, p_layout, ImmutAnyOrigin, Engine=OPartialEngine
+    ],
+    m_partial: TileTensor[
+        p_type, p_layout, ImmutAnyOrigin, Engine=MPartialEngine
+    ],
+    l_partial: TileTensor[
+        p_type, p_layout, ImmutAnyOrigin, Engine=LPartialEngine
+    ],
     k: k_t,
     valid_length: TileTensor[
-        DType.uint32,
-        valid_length_layout,
-        ImmutAnyOrigin,
+        .uint32, valid_length_layout, ImmutAnyOrigin, Engine=VLEngine
     ],
     max_prompt_len: Int32,
     # Full key count for the dense decode path; mirrors the producer so the
@@ -522,17 +559,17 @@ def naive_fa_decode_apple_stitch[
 
     for split in range(active_splits):
         var ml = _ml_idx(batch_id, head_id, split, _num_heads, _num_partitions)
-        var m_s = rebind[Scalar[p_type]](m_partial[ml]).cast[DType.float32]()
+        var m_s = rebind[Scalar[p_type]](m_partial[ml]).cast[.float32]()
         var m_new = max(m, m_s)
         var corr = exp(m - m_new)
         # `p` must use the same exp base as the producer for an exact combine.
         var p = exp(m_s - m_new)
-        var l_s = rebind[Scalar[p_type]](l_partial[ml]).cast[DType.float32]()
+        var l_s = rebind[Scalar[p_type]](l_partial[ml]).cast[.float32]()
         l = l * corr + p * l_s
         var oi = _o_idx(
             batch_id, head_id, d, split, _num_heads, _depth, _num_partitions
         )
-        var o_s = rebind[Scalar[p_type]](o_partial[oi]).cast[DType.float32]()
+        var o_s = rebind[Scalar[p_type]](o_partial[oi]).cast[.float32]()
         acc = acc * corr + p * o_s
         m = m_new
 
@@ -558,16 +595,12 @@ def naive_fa_decode_apple[
     _use_valid_length: Bool = False,
     _is_cache_length_accurate: Bool = False,
 ](
-    q: LayoutTensor[mut=False, address_space=AddressSpace.GENERIC, ...],
+    q: LayoutTensor[mut=False, address_space=.GENERIC, ...],
     k: k_t,
     v: v_t,
     mask_functor: mask_t,
-    output: LayoutTensor[
-        mut=True, output_type, address_space=AddressSpace.GENERIC, ...
-    ],
-    valid_length: LayoutTensor[
-        mut=False, DType.uint32, address_space=AddressSpace.GENERIC, ...
-    ],
+    output: LayoutTensor[mut=True, output_type, address_space=.GENERIC, ...],
+    valid_length: LayoutTensor[mut=False, .uint32, address_space=.GENERIC, ...],
     scale: Float32,
     batch_size: Int,
     max_prompt_len: Int,
@@ -671,7 +704,7 @@ def naive_fa_decode_apple[
     # Flat 1D TileTensor views over the q/output/partial buffers. The kernels
     # bake the per-(batch, head, split, depth) offset into a linear index
     # (`_o_idx`/`_ml_idx`) and the BSHD/ragged q/out offset, so the flat views
-    # just carry the device pointers with TileTensor typing (no raw pointers /
+    # just carry the storage handles with TileTensor typing (no raw pointers /
     # DeviceBuffer-as-pointer inside the kernels).
     var q_flat = TileTensor(
         q.ptr.as_imm().as_unsafe_any_origin(),
@@ -685,27 +718,12 @@ def naive_fa_decode_apple[
         valid_length.ptr.as_imm().as_unsafe_any_origin(),
         row_major(Coord(Int(valid_length.size()))),
     )
-    var o_partial_t = TileTensor(
-        o_partial_dev.unsafe_ptr(), row_major(Coord(o_partial_n))
-    )
-    var m_partial_t = TileTensor(
-        m_partial_dev.unsafe_ptr(), row_major(Coord(ml_partial_n))
-    )
-    var l_partial_t = TileTensor(
-        l_partial_dev.unsafe_ptr(), row_major(Coord(ml_partial_n))
-    )
-    var o_partial_imm = TileTensor(
-        o_partial_dev.unsafe_ptr().as_imm().as_unsafe_any_origin(),
-        row_major(Coord(o_partial_n)),
-    )
-    var m_partial_imm = TileTensor(
-        m_partial_dev.unsafe_ptr().as_imm().as_unsafe_any_origin(),
-        row_major(Coord(ml_partial_n)),
-    )
-    var l_partial_imm = TileTensor(
-        l_partial_dev.unsafe_ptr().as_imm().as_unsafe_any_origin(),
-        row_major(Coord(ml_partial_n)),
-    )
+    var o_partial_t = TileTensor(o_partial_dev, row_major(Coord(o_partial_n)))
+    var m_partial_t = TileTensor(m_partial_dev, row_major(Coord(ml_partial_n)))
+    var l_partial_t = TileTensor(l_partial_dev, row_major(Coord(ml_partial_n)))
+    var o_partial_imm = o_partial_t.as_immut()
+    var m_partial_imm = m_partial_t.as_immut()
+    var l_partial_imm = l_partial_t.as_immut()
 
     # Sink weights: a nullable `OptionalReg[TileTensor]` passed by value (NOT a
     # dangling `UnsafePointer` -- KB `unsafepointer-is-non-nullable`). When
@@ -754,6 +772,12 @@ def naive_fa_decode_apple[
                     _is_cache_length_accurate=_is_cache_length_accurate,
                     Depth=D,
                     SplitSize=SplitSize,
+                    OPartialEngine=o_partial_t.Engine,
+                    MPartialEngine=m_partial_t.Engine,
+                    LPartialEngine=l_partial_t.Engine,
+                    QEngine=q_flat.Engine,
+                    VLEngine=valid_length_flat.Engine,
+                    SinkEngine=SinkTile.Engine,
                 ]
                 ctx.enqueue_function[core_kernel](
                     o_partial_t,
@@ -791,6 +815,11 @@ def naive_fa_decode_apple[
         _use_valid_length=_use_valid_length,
         _is_cache_length_accurate=_is_cache_length_accurate,
         SplitSize=SplitSize,
+        OutEngine=output_flat.Engine,
+        OPartialEngine=o_partial_imm.Engine,
+        MPartialEngine=m_partial_imm.Engine,
+        LPartialEngine=l_partial_imm.Engine,
+        VLEngine=valid_length_flat.Engine,
     ]
     ctx.enqueue_function[stitch_kernel](
         output_flat,

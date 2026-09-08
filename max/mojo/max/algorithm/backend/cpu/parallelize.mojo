@@ -31,44 +31,13 @@ from max.gpu.host import DeviceContext
 
 @always_inline
 def sync_parallelize[
-    origins: OriginSet,
-    //,
-    func: def(Int) raises capturing[origins] -> None,
-](num_work_items: Int, ctx: Optional[DeviceContext] = None):
-    """Executes func(0) ... func(num_work_items-1) as parallel sub-tasks,
-    and returns when all are complete.
-
-    TODO: Currently exceptions raised by func will cause a trap rather than
-          be propagated back to the caller.
-
-    Parameters:
-        origins: The capture origins.
-        func: The function to invoke.
-
-    Args:
-        num_work_items: Number of parallel tasks.
-        ctx: Optional CPU DeviceContext to execute the tasks on.
-    """
-
-    # The try/except here is required to satisfy the non-raising
-    # ` -> None` signature. The overload's
-    # inner `func_wrapped` has its own try/except for the same reason, but
-    # that outer catch is unreachable since abort() here terminates first.
-    def func_unified(i: Int):
-        try:
-            func(i)
-        except e:
-            abort(String(e))
-
-    sync_parallelize(func_unified, num_work_items, ctx)
-
-
-@always_inline
-def sync_parallelize[
-    FuncType: def(Int) -> None,
+    FuncType: def(Int) raises -> None,
 ](func: FuncType, num_work_items: Int, ctx: Optional[DeviceContext] = None):
     """Executes func(0) ... func(num_work_items-1) as parallel sub-tasks,
     and returns when all are complete.
+
+    Non-raising closures still bind this signature. Exceptions raised by
+    `func` abort rather than propagating to the caller.
 
     Parameters:
         FuncType: The body function type.
@@ -110,51 +79,6 @@ def sync_parallelize[
         cpu_ctx.synchronize()
     except e:
         abort(String(e))
-
-
-@always_inline
-def parallelize[
-    origins: OriginSet, //, func: def(Int) capturing[origins] -> None
-](num_work_items: Int, ctx: Optional[DeviceContext] = None):
-    """Executes func(0) ... func(num_work_items-1) as sub-tasks in parallel, and
-    returns when all are complete.
-
-    Parameters:
-        origins: The capture origins.
-        func: The function to invoke.
-
-    Args:
-        num_work_items: Number of parallel tasks.
-        ctx: Optional CPU DeviceContext to execute the work on.
-    """
-
-    def func_unified(i: Int):
-        func(i)
-
-    _parallelize_impl(func_unified, num_work_items, parallelism_level(ctx), ctx)
-
-
-@always_inline
-def parallelize[
-    origins: OriginSet, //, func: def(Int) capturing[origins] -> None
-](num_work_items: Int, num_workers: Int, ctx: Optional[DeviceContext] = None):
-    """Executes func(0) ... func(num_work_items-1) as sub-tasks in parallel, and
-    returns when all are complete.
-
-    Parameters:
-        origins: The capture origins.
-        func: The function to invoke.
-
-    Args:
-        num_work_items: Number of parallel tasks.
-        num_workers: The number of workers to use for execution.
-        ctx: Optional CPU DeviceContext to execute the work on.
-    """
-
-    def func_unified(i: Int):
-        func(i)
-
-    _parallelize_impl(func_unified, num_work_items, num_workers, ctx)
 
 
 @always_inline
@@ -271,32 +195,6 @@ def _get_num_workers(
 # ===-----------------------------------------------------------------------===#
 # parallelize_over_rows
 # ===-----------------------------------------------------------------------===#
-
-
-def parallelize_over_rows[
-    func: def(Int, Int) capturing[_] -> None
-](
-    shape: IndexList,
-    axis: Int,
-    grain_size: Int,
-    ctx: Optional[DeviceContext] = None,
-):
-    """Parallelize func over non-axis dims of shape.
-
-    Parameters:
-        func: Function to call on range of rows.
-
-    Args:
-        shape: Shape to parallelize over.
-        axis: Rows are slices along the axis dimension of shape.
-        grain_size: The minimum number of elements to warrant using an additional thread.
-        ctx: Optional CPU DeviceContext to execute the work on.
-    """
-
-    def func_unified(start: Int, end: Int):
-        func(start, end)
-
-    parallelize_over_rows(func_unified, shape, axis, grain_size, ctx)
 
 
 def parallelize_over_rows[

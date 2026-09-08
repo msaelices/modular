@@ -102,37 +102,65 @@ def cache_dtype_for_encoding(
 
 
 class KVConnectorConfig(ConfigFileModel):
-    """Connector-specific configuration for KV cache connectors.
+    """KV cache connector configuration: the connector type and its settings.
 
-    Common fields are typed. Additional connector-specific fields pass
-    through via ``extra="allow"`` and are accessible via ``model_extra``.
+    The type travels with its settings so the two are configured as one
+    object::
+
+        --kv-connector-config '{"type": "rust_tiered"}'
+
+    Common fields are typed. Additional connector-specific fields pass through
+    via ``extra="allow"`` and are accessible via ``model_extra``.
     """
 
-    model_config = ConfigDict(strict=False, extra="allow")
+    model_config = ConfigDict(strict=False, extra="allow", frozen=True)
 
-    host_kvcache_swap_space_gb: float = Field(
-        default=50.0,
+    type: KVConnectorType = Field(
+        default=KVConnectorType.null,
         description=(
-            "Host memory (GiB) reserved for KV cache swapping. "
-            "Used by the tiered connector."
+            "Type of KV cache connector to use. "
+            "Defaults to ``null`` (no external caching)."
         ),
     )
-    """Host memory in GiB for KV cache swapping."""
+    """Type of KV cache connector to use."""
+
+    host_offload_max_gb: float | None = Field(
+        default=None,
+        description=(
+            "Maximum host memory (GiB) for KV cache offloading, used by the "
+            "tiered connectors. When unset, sized to hold 1.5 times the device "
+            "page pool."
+        ),
+    )
+    """Maximum host memory in GiB for KV cache offloading. ``None`` sizes it to
+    1.5 times the device page pool."""
 
     disk_offload_dir: str | None = Field(
         default=None,
         description=(
             "Directory for disk-based KV cache offloading. "
-            "Required when kv_connector is 'tiered'."
+            "Required when the connector type is 'tiered'."
         ),
     )
     """Directory for disk-based KV cache offloading."""
 
-    disk_offload_max_gb: float = Field(
-        default=50.0,
-        description="Maximum disk space (GB) for KV cache offloading.",
+    disk_offload_max_gb: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Maximum disk space (GiB) for KV cache offloading. When unset, "
+            "sized to hold twice the device page pool. 0 drops the disk tier, "
+            "leaving a host-only connector."
+        ),
     )
-    """Maximum disk space in GB for KV cache offloading."""
+    """Maximum disk space in GiB for KV cache offloading.
+
+    ``None`` sizes it to twice the device page pool. ``0`` builds the connector
+    with no disk last level: nothing is written to disk and no offload
+    directory is created. 0 cannot mean "unlimited" here, because the disk tier
+    derives its block capacity from this budget -- a 0 that still opened a disk
+    tier would disable eviction and grow without bound.
+    """
 
     num_disk_workers: int = Field(
         default=32,
@@ -150,21 +178,21 @@ class KVConnectorConfig(ConfigFileModel):
         description=(
             "Endpoint for the co-located dKV service. Supports IPC "
             "(ipc:///path) or TCP (tcp://host:port). "
-            "Required when kv_connector is 'dkv'."
+            "Required when the connector type is 'dkv'."
         ),
     )
     """Endpoint for the co-located dKV service.
 
-    Remote dKV endpoints are discovered at runtime through the
-    Orchestrator (via ``external_block_metadata`` on the request
-    context), not configured statically. For multi-store reads, the
-    discovered metadata must include MAX-native transfer-engine metadata so
-    the connector can reuse ``KVTransferEngine.connect()``.
+    Remote dKV endpoints are discovered at runtime from the Orchestrator's
+    per-request ``dkv_cache_hint``, not configured statically. The connector
+    parses the hint in Rust and dials each named instance itself.
     """
 
 
 class KVCacheConfig(ConfigFileModel):
     """Configuration for the paged KV cache."""
+
+    model_config = ConfigDict(frozen=True)
 
     kv_cache_page_size: int = Field(
         default=128,
@@ -194,24 +222,19 @@ class KVCacheConfig(ConfigFileModel):
     """Whether DP cross-replica prefix-cache hits may be served by
     device-to-device copies."""
 
-    kv_connector: KVConnectorType | None = Field(
-        default=None,
+    kv_connector_config: KVConnectorConfig = Field(
+        default_factory=KVConnectorConfig,
         description=(
-            "Type of KV cache connector to use. "
-            "When not set, defaults to ``null`` (no external caching)."
+            "KV cache connector configuration as inline JSON or a path to a "
+            "YAML/JSON file. The connector type is the ``type`` field, e.g. "
+            '``\'{"type": "rust_tiered"}\'``. Defaults to the ``null`` '
+            "connector (no external caching); each type has sensible defaults "
+            "for its remaining fields. Merges field-wise over a config file's "
+            "value, so overriding one field on the command line preserves the "
+            "rest."
         ),
     )
-    """Type of KV cache connector to use."""
-
-    kv_connector_config: KVConnectorConfig | None = Field(
-        default=None,
-        description=(
-            "Connector-specific configuration overrides as inline JSON or "
-            "path to a YAML/JSON file. Each connector type has sensible "
-            "defaults, so this is only needed for customization."
-        ),
-    )
-    """Connector-specific configuration overrides."""
+    """KV cache connector configuration, including the connector ``type``."""
 
     device_memory_utilization: float = Field(
         default=0.9,
@@ -224,18 +247,6 @@ class KVCacheConfig(ConfigFileModel):
     )
     """The fraction of available device memory the process should consume."""
 
-    allow_kv_head_replication: bool = Field(
-        default=False,
-        description=(
-            "Allow TP wider than the KV head count by replicating each KV head "
-            "across a group of devices. Used as the default for "
-            "to_params(allow_kv_head_replication=...) so it reaches base-class "
-            "paths that don't thread the flag. Only for architectures whose "
-            "attention shards K/V projections to match."
-        ),
-    )
-    """Default for :meth:`to_params`'s ``allow_kv_head_replication`` argument."""
-
     kv_cache_format: str | None = Field(
         default=None,
         description=(
@@ -244,6 +255,36 @@ class KVCacheConfig(ConfigFileModel):
         ),
     )
     """An override for the default data type of the KV cache."""
+
+    indexer_kv_cache_format: str | None = Field(
+        default=None,
+        description=(
+            "Override the MiniMax sparse-indexer (IndexK) cache dtype, "
+            "independent of ``kv_cache_format``. "
+            "Supported values: ``bfloat16``, ``float8_e4m3fn``. "
+            "``None`` (default) keeps IndexK in bfloat16 so "
+            "``--kv-cache-format=float8_e4m3fn`` still means main GQA FP8 "
+            "plus indexer BF16. Ignored by architectures without an "
+            "indexer cache. FP8 IndexK is scale-free and AMD-only."
+        ),
+    )
+    """Independent IndexK cache dtype for MiniMax sparse attention."""
+
+    state_pool_dtype: str | None = Field(
+        default=None,
+        description=(
+            "Override the storage dtype of a hybrid model's recurrent state "
+            "pools (SSM/linear-attention conv and recurrent state). Defaults "
+            "to the model's compute dtype (bfloat16 for supported "
+            "architectures). ``float32`` makes a speculated generation follow "
+            "the exact state trajectory of an unspeculated one, at roughly "
+            "double the per-request state memory (Qwen3.8-27B: 74.8 to "
+            "149.6 MiB per seated request). Supported values: ``bfloat16``, "
+            "``float32``."
+        ),
+    )
+    """An override for the storage dtype of recurrent (SSM) state pools."""
+
     kv_cache_hash_algo: KVHashAlgo = Field(
         default="ahash64",
         description=(
@@ -286,7 +327,7 @@ class KVCacheConfig(ConfigFileModel):
         kvcache_quant_config: KVCacheQuantizationConfig | None = None,
         speculative_method: SpeculativeMethod | None = None,
         num_draft_tokens: int = 0,
-        allow_kv_head_replication: bool | None = None,
+        allow_kv_head_replication: bool = False,
         page_size: int | None = None,
         window_size: int | None = None,
     ) -> KVCacheParams:
@@ -313,9 +354,10 @@ class KVCacheConfig(ConfigFileModel):
                 ``None`` when speculative decoding is disabled.
             num_draft_tokens: Total draft tokens generated per
                 speculative iteration. Zero when no speculative decoding.
-            allow_kv_head_replication: Replicate KV heads for TP wider than the
-                KV head count. Defaults to ``None`` (falls back to the config's
-                :attr:`allow_kv_head_replication`).
+            allow_kv_head_replication: Replicate KV heads for TP wider than
+                the KV head count. An architecture fact: implementations of
+                ``construct_kv_params`` pass it for the head layouts that
+                need it.
             page_size: Tokens per KV cache page. Defaults to ``None`` (falls
                 back to the config's :attr:`kv_cache_page_size`). Architectures
                 with a kernel-imposed minimum page size pass their effective
@@ -325,15 +367,6 @@ class KVCacheConfig(ConfigFileModel):
         Returns:
             The constructed KV cache parameters.
         """
-        if allow_kv_head_replication is None:
-            allow_kv_head_replication = self.allow_kv_head_replication
-        # A connector without an explicit config gets defaults (e.g.
-        # `--kv-connector tiered` with no `--kv-connector-config`). Done here
-        # rather than in the pipeline config so the connector config's defaults
-        # are owned by this module.
-        cfg = self.kv_connector_config
-        if cfg is None and self.kv_connector is not None:
-            cfg = KVConnectorConfig()
         kv_hash_seed = resolve_kv_hash_seed(
             self.kv_cache_hash_algo, self.kv_cache_hash_seed
         )
@@ -348,11 +381,7 @@ class KVCacheConfig(ConfigFileModel):
             enable_dp_cross_replica_prefix_copy=(
                 self.enable_dp_cross_replica_prefix_copy
             ),
-            kv_connector=self.kv_connector,
-            kv_connector_config=cfg,
-            host_kvcache_swap_space_gb=(
-                cfg.host_kvcache_swap_space_gb if cfg else None
-            ),
+            kv_connector_config=self.kv_connector_config,
             devices=devices,
             data_parallel_degree=data_parallel_degree,
             kvcache_quant_config=kvcache_quant_config,

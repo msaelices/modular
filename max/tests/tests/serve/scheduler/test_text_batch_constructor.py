@@ -12,7 +12,8 @@
 # ===----------------------------------------------------------------------=== #
 
 import time
-from unittest.mock import Mock
+from collections.abc import Mapping, Sequence
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -100,7 +101,7 @@ def create_mock_kv_cache() -> Mock:
     cache.get_total_num_pages = Mock(return_value=128)
     cache.get_free_blocks_pct = Mock(return_value=0.5)
 
-    cache.alloc = Mock(return_value=CompletedTransfer(TransferDirection.LOAD))
+    cache.alloc = Mock(return_value=CompletedTransfer.load())
     cache.claim = Mock()
     cache.release = Mock()
     cache.contains = Mock(return_value=False)
@@ -174,7 +175,7 @@ def test_text_batch_constructor__batch_construction_without_chunked_prefill_no_p
 
     kv_cache = Mock()
     kv_cache.alloc = Mock()
-    kv_cache.alloc.return_value = CompletedTransfer(TransferDirection.LOAD)
+    kv_cache.alloc.return_value = CompletedTransfer.load()
     kv_cache.claim = Mock()
     kv_cache.contains = Mock()
     set_mock_kv_usage(kv_cache, 0.0)
@@ -276,7 +277,7 @@ def test_text_batch_constructor__batch_construction_no_requests(
 
     kv_cache = Mock()
     kv_cache.alloc = Mock()
-    kv_cache.alloc.return_value = CompletedTransfer(TransferDirection.LOAD)
+    kv_cache.alloc.return_value = CompletedTransfer.load()
     kv_cache.claim = Mock()
     kv_cache.contains = Mock()
     set_mock_kv_usage(kv_cache, 0.0)
@@ -289,6 +290,36 @@ def test_text_batch_constructor__batch_construction_no_requests(
     inputs = batch_constructor.construct_batch()
     assert len(inputs.batches) == 1
     assert len(inputs.batches[0]) == 0
+
+
+def test_text_batch_constructor__structured_output_enabled_mirrors_bitmask_constraints(
+    pipeline: Mock,
+) -> None:
+    """``structured_output_enabled`` forwards
+    ``PipelineConfig.needs_bitmask_constraints`` -- on for either
+    ``--enable-structured-output`` or a grammar-capable tool parser with
+    ``--enable-tool-call-constrained-decode`` -- and stays off if the
+    pipeline exposes no ``pipeline_config`` at all."""
+    batch_constructor = TextBatchConstructor(
+        scheduler_config=TokenGenerationSchedulerConfig(
+            max_batch_size=5,
+            max_batch_total_tokens=None,
+            enable_in_flight_batching=False,
+            enable_chunked_prefill=False,
+            target_tokens_per_batch_ce=30,
+        ),
+        pipeline=pipeline,
+        kv_cache=Mock(),
+    )
+
+    pipeline.pipeline_config = Mock(needs_bitmask_constraints=True)
+    assert batch_constructor.structured_output_enabled is True
+
+    pipeline.pipeline_config.needs_bitmask_constraints = False
+    assert batch_constructor.structured_output_enabled is False
+
+    del pipeline.pipeline_config
+    assert batch_constructor.structured_output_enabled is False
 
 
 def test_text_batch_constructor__batch_construction_no_room_in_cache(
@@ -347,8 +378,8 @@ def test_text_batch_constructor__insufficient_blocks_defers_then_retries(
     kv_cache.alloc = Mock(
         side_effect=[
             InsufficientBlocksError("insufficient blocks"),
-            CompletedTransfer(TransferDirection.LOAD),
-            CompletedTransfer(TransferDirection.LOAD),
+            CompletedTransfer.load(),
+            CompletedTransfer.load(),
         ]
     )
     kv_cache.claim = Mock()
@@ -523,6 +554,74 @@ def test_text_batch_constructor__tg_insufficient_blocks_fatal_when_nothing_infli
         batch_constructor.construct_batch()
 
 
+def test_text_batch_constructor__tg_insufficient_blocks_preempts_ce_block_holder(
+    pipeline: Pipeline[TextGenerationInputs[TextContext], TextGenerationOutput],
+) -> None:
+    """A decode request that can't get a block reclaims from a chunked
+    prefill parked in ce_reqs (which keeps its blocks between chunks)
+    instead of raising a fatal InsufficientBlocksError: the parked
+    prefill's blocks are reclaimable, so this is not a genuine OOM."""
+    scheduler_config = TokenGenerationSchedulerConfig(
+        max_batch_size=5,
+        max_batch_total_tokens=None,
+        enable_in_flight_batching=False,
+        enable_chunked_prefill=True,
+        target_tokens_per_batch_ce=30,
+    )
+    holder = TextContext(
+        request_id=RequestID(),
+        tokens=TokenBuffer(np.ones(50, dtype=np.int64)),
+        max_length=100,
+    )
+    released: list[RequestID] = []
+
+    def release(ctx: TextContext) -> None:
+        released.append(ctx.request_id)
+
+    def alloc(ctx: TextContext) -> CompletedTransfer:
+        # Blocks free up only once the parked prefill is preempted.
+        if not released:
+            raise InsufficientBlocksError("insufficient blocks")
+        return CompletedTransfer.load()
+
+    kv_cache = Mock()
+    kv_cache.alloc = Mock(side_effect=alloc)
+    kv_cache.claim = Mock()
+    kv_cache.release = Mock(side_effect=release)
+    kv_cache.contains = Mock(
+        side_effect=lambda ctx: (
+            ctx.request_id == holder.request_id and not released
+        )
+    )
+    kv_cache.pending_transfers_exist = Mock(return_value=False)
+    kv_cache.get_req_blocks = Mock(
+        side_effect=lambda ctx: (
+            [0] if ctx.request_id == holder.request_id else []
+        )
+    )
+    # A full cache forces TG priority, so the parked prefill is never
+    # popped by _add_ce_requests before the decode request's alloc fails.
+    set_mock_kv_usage(kv_cache, 1.0)
+
+    batch_constructor = TextBatchConstructor(
+        scheduler_config=scheduler_config,
+        pipeline=pipeline,
+        kv_cache=kv_cache,
+        get_inflight_kv_transfer_count=lambda replica_idx: 0,
+    )
+    tg_context = create_lora_context(seq_len=9, is_tg=True)
+    batch_constructor.enqueue_new_request(tg_context, replica_idx=0)
+    batch_constructor.enqueue_new_request(holder, replica_idx=0)
+
+    inputs = batch_constructor.construct_batch()
+
+    assert has_request(inputs.batches[0], tg_context.request_id)
+    assert released == [holder.request_id]
+    assert batch_constructor.total_preemption_count == 1
+    # The preempted prefill is requeued, not dropped.
+    assert holder.request_id in batch_constructor.replicas[0].ce_reqs
+
+
 def test_text_batch_constructor__batch_construction_with_chunked_prefill_and_preemption(
     pipeline: Pipeline[TextGenerationInputs[TextContext], TextGenerationOutput],
 ) -> None:
@@ -535,7 +634,7 @@ def test_text_batch_constructor__batch_construction_with_chunked_prefill_and_pre
     )
     kv_cache = Mock()
     kv_cache.alloc = Mock()
-    kv_cache.alloc.return_value = CompletedTransfer(TransferDirection.LOAD)
+    kv_cache.alloc.return_value = CompletedTransfer.load()
     kv_cache.claim = Mock()
     kv_cache.contains = Mock()
     kv_cache.pending_transfers_exist = Mock(return_value=False)
@@ -620,11 +719,11 @@ def test_text_batch_constructor__batch_construction_with_chunked_prefill_and_pre
     # then succeeding and returning 0 (no prefix cache skip) for the remaining calls.
     kv_cache.alloc.side_effect = [
         InsufficientBlocksError(),
-        CompletedTransfer(TransferDirection.LOAD),
-        CompletedTransfer(TransferDirection.LOAD),
-        CompletedTransfer(TransferDirection.LOAD),
-        CompletedTransfer(TransferDirection.LOAD),
-        CompletedTransfer(TransferDirection.LOAD),
+        CompletedTransfer.load(),
+        CompletedTransfer.load(),
+        CompletedTransfer.load(),
+        CompletedTransfer.load(),
+        CompletedTransfer.load(),
     ]
 
     last_request_id = list(batch_constructor.replicas[0].tg_reqs.keys())[-1]
@@ -661,7 +760,7 @@ def test_text_batch_constructor__batch_construction_with_chunked_prefill_and_inf
     )
     kv_cache = Mock()
     kv_cache.alloc = Mock()
-    kv_cache.alloc.return_value = CompletedTransfer(TransferDirection.LOAD)
+    kv_cache.alloc.return_value = CompletedTransfer.load()
     kv_cache.claim = Mock()
     kv_cache.contains = Mock()
     set_mock_kv_usage(kv_cache, 0.0)
@@ -725,7 +824,7 @@ def test_text_batch_constructor__batch_construction_without_chunked_prefill_and_
     )
     kv_cache = Mock()
     kv_cache.alloc = Mock()
-    kv_cache.alloc.return_value = CompletedTransfer(TransferDirection.LOAD)
+    kv_cache.alloc.return_value = CompletedTransfer.load()
     kv_cache.claim = Mock()
     kv_cache.contains = Mock()
     set_mock_kv_usage(kv_cache, 0.0)
@@ -989,7 +1088,7 @@ def test_tg_pure_age_based_preemption() -> None:
 
     kv_cache.alloc = Mock(
         side_effect=[
-            CompletedTransfer(TransferDirection.LOAD),
+            CompletedTransfer.load(),
             InsufficientBlocksError,
             InsufficientBlocksError,
         ]
@@ -1582,6 +1681,63 @@ def test_batch_scheduling_strategy__decode_first_idle_replica_does_not_starve_si
     assert inputs.batches[1][0].tokens.generated_length == 0
 
 
+def test_ce_preempts_pending_tg_emits_iteration_stealing_metric() -> None:
+    """A CE batch that admits work while TG requests are pending on the
+    same replica steals the whole iteration from TG (the CE case's TG
+    fallback only runs when CE admits nothing). Verify the
+    iteration-stealing counter and gauge fire in that case.
+    """
+    from max.serve.scheduler.batch_constructor.text_batch_constructor import (
+        BatchSchedulingStrategy,
+    )
+
+    pipeline = Mock(spec=["release"])
+    pipeline.release = Mock()
+    kv_cache = create_mock_kv_cache()
+
+    scheduler_config = TokenGenerationSchedulerConfig(
+        max_batch_size=10,
+        target_tokens_per_batch_ce=100,
+        data_parallel_degree=1,
+        enable_in_flight_batching=False,
+    )
+
+    batch_constructor = TextBatchConstructor(
+        scheduler_config=scheduler_config,
+        pipeline=pipeline,
+        kv_cache=kv_cache,
+        batch_scheduling_strategy=BatchSchedulingStrategy.PREFILL_FIRST,
+    )
+
+    # One TG request already in flight, plus a fresh CE request --
+    # PREFILL_FIRST forces CE priority for the whole replica, so CE wins
+    # this iteration and the TG request gets skipped entirely.
+    ctx_tg = TextContext(
+        request_id=RequestID(),
+        tokens=TokenBuffer(np.ones(10, dtype=np.int64)),
+        max_length=100,
+    )
+    ctx_tg.update(ARBITRARY_TOKEN_ID)
+    batch_constructor.enqueue_new_request(ctx_tg, replica_idx=0)
+
+    ctx_ce = TextContext(
+        request_id=RequestID(),
+        tokens=TokenBuffer(np.ones(10, dtype=np.int64)),
+        max_length=100,
+    )
+    batch_constructor.enqueue_new_request(ctx_ce, replica_idx=0)
+
+    with patch(
+        "max.serve.scheduler.batch_constructor.text_batch_constructor.METRICS"
+    ) as mock_metrics:
+        inputs = batch_constructor.construct_batch()
+
+    assert len(inputs.batches[0]) == 1
+    assert inputs.batches[0][0].tokens.generated_length == 0
+    mock_metrics.di_ce_preempted_tg_iteration_count.assert_called_once()
+    mock_metrics.di_ce_preempted_tg_pending_count.assert_called_once_with(1)
+
+
 def test_batch_scheduling_strategy__balanced_majority_ce() -> None:
     """Test BALANCED strategy prioritizes CE when CE is the majority."""
     from max.serve.scheduler.batch_constructor.text_batch_constructor import (
@@ -2082,8 +2238,8 @@ class _IncompleteOnload:
         return TransferDirection.LOAD
 
     @property
-    def g0_blocks(self) -> list[int]:
-        return []
+    def g0_blocks_per_leaf(self) -> Mapping[str, Sequence[int]]:
+        return {}
 
     def is_complete(self) -> bool:
         return self.complete
@@ -2154,7 +2310,7 @@ def test_text_batch_constructor__readmits_request_when_onload_completes(
     # First alloc cordons (incomplete); the re-admit pass re-allocs and the
     # prefix is now device-resident, so the second alloc completes immediately.
     kv_cache = _make_cordon_kv_cache(
-        Mock(side_effect=[onload, CompletedTransfer(TransferDirection.LOAD)])
+        Mock(side_effect=[onload, CompletedTransfer.load()])
     )
     batch_constructor = TextBatchConstructor(
         scheduler_config=_cordon_config(),

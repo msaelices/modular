@@ -33,7 +33,7 @@ from std.math import ceildiv
 from std.sys import align_of, size_of
 
 from std.memory import UnsafePointer
-from std.gpu import WARP_SIZE, warp_id as get_warp_id
+from max.gpu import WARP_SIZE, warp_id as get_warp_id
 from max.gpu.sync import barrier
 from max.gpu.primitives.cluster import (
     block_rank_in_cluster,
@@ -41,7 +41,7 @@ from max.gpu.primitives.cluster import (
     elect_one_sync,
 )
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.gpu import block_idx, lane_id
+from max.gpu import block_idx, lane_id
 from max.gpu.memory import (
     async_copy,
     async_copy_commit_group,
@@ -1494,9 +1494,7 @@ struct BlackwellMatmulSM100Kernel[
 
     comptime Bias1DTileLayout = row_major[1, Self.MMA_N]()
     comptime Bias1DTile = TileTensor[
-        Self.c_type,
-        type_of(Self.Bias1DTileLayout),
-        ImmutAnyOrigin,
+        Self.c_type, type_of(Self.Bias1DTileLayout), ImmutAnyOrigin
     ]
 
     comptime WorkIter = WorkIterator[
@@ -1587,7 +1585,7 @@ struct BlackwellMatmulSM100Kernel[
                     )
                     var src_ptr = (
                         bias_1d_tile._storage + gmem_offset + lane_start
-                    ).address_space_cast[AddressSpace.GLOBAL]()
+                    ).address_space_cast[.GLOBAL]()
                     var dst_ptr = smem_tile._storage + lane_start
                     comptime for chunk in range(num_copies):
                         async_copy[
@@ -1728,8 +1726,8 @@ struct BlackwellMatmulSM100Kernel[
 
         # Access shared memory via bitcast
         ref smem = external_memory[
-            Scalar[DType.uint8],
-            address_space=AddressSpace.SHARED,
+            UInt8,
+            address_space=.SHARED,
             alignment=128,
         ]().bitcast[Self.SmemType]()[]
 
@@ -2259,8 +2257,8 @@ struct BlackwellMatmulSM100Kernel[
 
         # Access shared memory via bitcast
         ref smem = external_memory[
-            Scalar[DType.uint8],
-            address_space=AddressSpace.SHARED,
+            UInt8,
+            address_space=.SHARED,
             alignment=128,
         ]().bitcast[Self.SmemType]()[]
 
@@ -2646,7 +2644,7 @@ struct BlackwellMatmulSM100FallbackKernel[
         var a_smem = rebind[SMemPtr[Scalar[Self.a_type]]](
             external_memory[
                 Scalar[Self.a_type],
-                address_space=AddressSpace.SHARED,
+                address_space=.SHARED,
                 alignment=128,
                 name="tmem_test_dynamic_shared_memory",
             ]()

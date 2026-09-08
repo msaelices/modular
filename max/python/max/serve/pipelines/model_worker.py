@@ -32,8 +32,11 @@ from max.driver.driver import load_device
 from max.dtype import DType
 from max.experimental.nn._compilation_timer import collect_compilation_stats
 from max.pipelines.context import BaseContextType
-from max.pipelines.kv_cache import DummyKVCache, PagedKVCacheManager
-from max.pipelines.lib import PipelineConfig, PipelineModel
+from max.pipelines.kv_cache import (
+    DummyKVCache,
+    PagedKVCacheManagerInterface,
+)
+from max.pipelines.lib import MemoryPlan, PipelineConfig, PipelineModel
 from max.pipelines.lib.eplb_stats import EplbStatsAccumulator
 from max.pipelines.modeling.types import (
     Pipeline,
@@ -85,6 +88,11 @@ class SupportsGraphCaptureWarmup(Protocol):
     max_batch_size: int
 
     def warmup_graph_capture(self) -> None: ...
+
+
+@runtime_checkable
+class SupportsGraphSynthesisBuckets(Protocol):
+    def prepare_graph_synthesis_buckets(self) -> None: ...
 
 
 def _prime_pinned_memory_cache(device: Device, bytes: int = GiB) -> None:
@@ -149,21 +157,23 @@ def _get_eplb_stats_accumulator(
 def get_reset_prefix_cache_backend(
     pipeline: Pipeline[Any, Any],
     zmq_endpoint_base: str,
-) -> tuple[ResetPrefixCacheBackend | None, PagedKVCacheManager | None]:
-    """Get the paged KV cache manager from a pipeline, if available.
+) -> tuple[ResetPrefixCacheBackend | None, PagedKVCacheManagerInterface | None]:
+    """Get the KV cache manager from a pipeline, if reset is supported.
 
     Args:
         pipeline: The pipeline to extract the KV cache manager from.
+        zmq_endpoint_base: Base ZMQ endpoint for the reset-prefix-cache queue.
 
     Returns:
-        The paged KV cache manager if available, None otherwise.
+        A reset backend and the KV cache manager when the pipeline uses a real
+        paged or Jenga manager; ``(None, None)`` otherwise.
     """
 
     if hasattr(pipeline, "kv_manager"):
         kv_manager = pipeline.kv_manager
-        if isinstance(kv_manager, PagedKVCacheManager) and not isinstance(
-            kv_manager, DummyKVCache
-        ):
+        if isinstance(
+            kv_manager, PagedKVCacheManagerInterface
+        ) and not isinstance(kv_manager, DummyKVCache):
             return ResetPrefixCacheBackend(zmq_endpoint_base), kv_manager
     return None, None
 
@@ -222,6 +232,7 @@ class ModelWorker:
             BaseContextType, PipelineOutputType
         ],
         zmq_endpoint_base: str,
+        memory_plan: MemoryPlan | None,
         spawn_start_wall_ts: float | None = None,
     ) -> None:
         """Runs a model worker process.
@@ -237,6 +248,8 @@ class ModelWorker:
             metric_client_factory: Factory function to create metric client
             zmq_endpoint_base: Prefix for ZMQ IPC endpoints shared between
                 the API server process and this worker process.
+            memory_plan: The memory plan the pipeline was sized against,
+                consumed by the scheduler config.
             spawn_start_wall_ts: ``time.time()`` recorded in the parent just
                 before spawning this worker. Used to log how long the worker
                 process took to start (Python imports + driver init), which
@@ -354,6 +367,19 @@ class ModelWorker:
                         pipeline_config.models.main_architecture_name,
                         pipeline.max_batch_size,
                     )
+                elif (
+                    pipeline_config.runtime.experimental_device_graph_synthesis
+                ):
+                    if not isinstance(pipeline, SupportsGraphSynthesisBuckets):
+                        raise ValueError(
+                            "experimental_device_graph_synthesis is enabled but the "
+                            "pipeline does not support synthesis bucketing."
+                        )
+                    pipeline.prepare_graph_synthesis_buckets()
+                    logger.info(
+                        "Device graph synthesis bucketing prepared (model=%s).",
+                        pipeline_config.models.main_architecture_name,
+                    )
 
             total_in_run_s = time.monotonic() - run_start_s
             spawn_str = (
@@ -406,6 +432,7 @@ class ModelWorker:
                 pipeline_config,
                 settings,
                 worker_queues,
+                memory_plan,
             )
 
             # Get the reset prefix cache backend.
@@ -535,6 +562,7 @@ class ModelWorker:
             BaseContextType, PipelineOutputType
         ],
         zmq_endpoint_base: str,
+        memory_plan: MemoryPlan | None,
         spawn_start_wall_ts: float | None = None,
     ) -> None:
         """Primary entry point for running a ModelWorker process.
@@ -562,6 +590,7 @@ class ModelWorker:
                     metric_client_factory,
                     model_worker_interface,
                     zmq_endpoint_base,
+                    memory_plan,
                     spawn_start_wall_ts,
                 )
             )
@@ -579,6 +608,7 @@ async def start_model_worker(
         BaseContextType, PipelineOutputType
     ],
     zmq_endpoint_base: str,
+    memory_plan: MemoryPlan | None,
 ) -> AsyncGenerator[ModelWorkerProxy[BaseContextType, PipelineOutputType]]:
     """Starts a model worker and associated process.
 
@@ -590,6 +620,8 @@ async def start_model_worker(
         model_worker_interface: Interface for communicating with the worker
         zmq_endpoint_base: Prefix for ZMQ IPC endpoints shared between
             the API server process and the worker process.
+        memory_plan: The memory plan the pipeline was sized against,
+            consumed by the worker's scheduler config.
 
     Returns:
         AsyncIterator[Worker]: Iterator to model worker.
@@ -613,6 +645,7 @@ async def start_model_worker(
             metric_client.cross_process_factory(settings),
             model_worker_interface,
             zmq_endpoint_base,
+            memory_plan,
             spawn_start_wall_ts,
         )
 

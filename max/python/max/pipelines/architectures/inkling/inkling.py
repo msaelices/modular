@@ -36,6 +36,7 @@ from max.nn.embedding import Embedding, VocabParallelEmbedding
 from max.nn.kv_cache import (
     KVCacheInputs,
     MHAKVCacheParams,
+    MultiKVCacheInputs,
     MultiKVCacheParams,
     PagedCacheValues,
 )
@@ -45,6 +46,7 @@ from max.nn.moe import make_interleaved_gated_activation_fn
 from max.nn.norm import RMSNorm
 from max.nn.quant_config import QuantConfig
 from max.nn.transformer import (
+    ReturnHiddenStates,
     ReturnLogits,
     forward_sequential_layers,
     logits_postprocess,
@@ -53,6 +55,7 @@ from max.nn.transformer.distributed_transformer import (
     distributed_logits_postprocess,
     forward_sharded_layers,
 )
+from max.pipelines.lib.vlm_utils import merge_multimodal_embeddings
 
 from .layers.attention import InklingAttention, log_scaling_tau
 from .layers.moe import InklingGate, InklingMoE
@@ -63,7 +66,7 @@ from .model_config import (
     InklingConfig,
     InklingTextConfig,
 )
-from .state_cache import CONV_STATE_DTYPE, ConvSite, InklingConvStateLayout
+from .state_cache import ConvSite, InklingConvStateLayout
 
 
 class InklingDecoderLayer(Module):
@@ -79,6 +82,8 @@ class InklingDecoderLayer(Module):
         dtype: DType,
         devices: list[DeviceRef],
         quant_config: QuantConfig | None = None,
+        is_local: bool | None = None,
+        force_dense_mlp: bool = False,
     ) -> None:
         super().__init__()
         self.num_devices = len(devices)
@@ -98,6 +103,7 @@ class InklingDecoderLayer(Module):
             kv_params=kv_params,
             dtype=dtype,
             devices=devices,
+            is_local=is_local,
         )
         self.attn.sharding_strategy = tensor_parallel
         self.attn_shards = list(self.attn.shard(devices))
@@ -120,7 +126,7 @@ class InklingDecoderLayer(Module):
         self.mlp: InklingMoE | MLP
         # Dense layers only: the learned scalar the output is scaled by.
         self.mlp_global_scale_shards: list[Weight] | None = None
-        if text_config.is_moe_layer(layer_idx):
+        if text_config.is_moe_layer(layer_idx) and not force_dense_mlp:
             # Only routed experts quantize; sinks and gate stay at dtype.
             routed_quant = (
                 quant_config
@@ -303,6 +309,17 @@ def _subgraph_layer_groups(
     return names, shared
 
 
+def kv_collections_by_key(
+    tree: MultiKVCacheInputs[TensorValue, BufferValue],
+) -> dict[str, list[PagedCacheValues]]:
+    """Groups an unflattened KV tree by attention flavor, then by rank."""
+    collections: dict[str, list[PagedCacheValues]] = {}
+    for key, child in tree.children.items():
+        assert isinstance(child, KVCacheInputs)
+        collections[key] = list(child.inputs)
+    return collections
+
+
 class Inkling(Module):
     """The Inkling text model: embedding, decoder layers, LM head."""
 
@@ -311,6 +328,7 @@ class Inkling(Module):
         config: InklingConfig,
         *,
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
+        return_hidden_states: ReturnHiddenStates = ReturnHiddenStates.NONE,
     ) -> None:
         super().__init__()
         text_config = config.text_config
@@ -319,6 +337,7 @@ class Inkling(Module):
         self.num_devices = len(config.devices)
         self.dtype = config.dtype
         self.return_logits = return_logits
+        self.return_hidden_states = return_hidden_states
         device = config.devices[0]
         replicate = ShardingStrategy.replicate(self.num_devices)
 
@@ -428,6 +447,8 @@ class Inkling(Module):
         input_row_offsets: TensorValue,
         positions: TensorValue,
         return_n_logits: TensorValue,
+        image_embeddings: TensorValue,
+        image_indices: TensorValue,
         signal_buffers: list[BufferValue],
         kv_collections: dict[str, list[PagedCacheValues]],
         slot_idx: list[TensorValue],
@@ -450,6 +471,10 @@ class Inkling(Module):
             log_scaling = [self._log_scaling(positions)]
         if self.embed_norm_shards:
             hs = forward_sharded_layers(self.embed_norm_shards, hs)
+        # Merged after the embedding norm, so the tower's rows skip it.
+        hs = self._merge_images(
+            hs, image_embeddings, image_indices, signal_buffers
+        )
 
         num_devices = self.num_devices
 
@@ -498,6 +523,7 @@ class Inkling(Module):
                 return_logits=self.return_logits,
                 device=self.devices[0],
                 norm_shards=self.norm_shards,
+                return_hidden_states=self.return_hidden_states,
                 logits_scaling=self.text_config.logits_mup_width_multiplier,
             )
         return logits_postprocess(
@@ -507,6 +533,7 @@ class Inkling(Module):
             self.norm,
             self._lm_head,
             self.return_logits,
+            return_hidden_states=self.return_hidden_states,
             logits_scaling=self.text_config.logits_mup_width_multiplier,
         )
 
@@ -516,6 +543,31 @@ class Inkling(Module):
             alpha=self.text_config.log_scaling_alpha,
             n_floor=self.text_config.log_scaling_n_floor,
         )
+
+    def _merge_images(
+        self,
+        hs: list[TensorValue],
+        embeddings: TensorValue,
+        indices: TensorValue,
+        signal_buffers: Sequence[BufferValue],
+    ) -> list[TensorValue]:
+        """Overwrites each placeholder row with its vision-tower row."""
+        if self.num_devices > 1:
+            embeddings_per_rank = ops.distributed_broadcast(
+                embeddings, signal_buffers
+            )
+            indices_per_rank = ops.distributed_broadcast(
+                indices, signal_buffers
+            )
+        else:
+            embeddings_per_rank = [embeddings]
+            indices_per_rank = [indices]
+        return [
+            merge_multimodal_embeddings(h, rank_embeddings, rank_indices)
+            for h, rank_embeddings, rank_indices in zip(
+                hs, embeddings_per_rank, indices_per_rank, strict=True
+            )
+        ]
 
     def _lm_head(self, h: TensorValue) -> TensorValue:
         return self._mask_padded_tail(self.unembed(h))
@@ -547,20 +599,6 @@ class Inkling(Module):
         signals = (
             Signals(self.devices).input_types() if self.num_devices > 1 else []
         )
-        pools: list[TensorType | BufferType] = [
-            BufferType(
-                CONV_STATE_DTYPE,
-                shape=[
-                    "max_conv_slots",
-                    channels,
-                    self.conv_layout.state_len,
-                ],
-                device=pool_device,
-            )
-            for pool_device in self.devices
-            for widths in self.conv_layout.layers
-            for channels in widths
-        ]
         return (
             TensorType(DType.int64, shape=["total_seq_len"], device=device),
             TensorType(
@@ -570,6 +608,14 @@ class Inkling(Module):
             TensorType(
                 DType.int64, shape=["return_n_logits"], device=DeviceRef.CPU()
             ),
+            TensorType(
+                self.dtype,
+                shape=["total_image_tokens", self.text_config.hidden_size],
+                device=device,
+            ),
+            TensorType(
+                DType.int32, shape=["total_image_tokens"], device=device
+            ),
             *signals,
             *self.kv_params.flattened_kv_inputs(),
             *(
@@ -578,23 +624,22 @@ class Inkling(Module):
                 )
                 for slot_device in self.devices
             ),
-            *pools,
+            *self.conv_layout.buffer_types(self.devices),
         )
 
     def unflatten_kv_inputs(
         self, kv_inputs: Sequence[object]
     ) -> dict[str, list[PagedCacheValues]]:
         """Groups the flattened KV inputs by attention flavor, then by rank."""
-        tree = self.kv_params.unflatten_kv_inputs(iter(kv_inputs))
-        collections: dict[str, list[PagedCacheValues]] = {}
-        for key, child in tree.children.items():
-            assert isinstance(child, KVCacheInputs)
-            collections[key] = list(child.inputs)
-        return collections
+        return kv_collections_by_key(
+            self.kv_params.unflatten_kv_inputs(iter(kv_inputs))
+        )
 
     def unpack_inputs(
         self, inputs: Sequence[Value[Any]]
     ) -> tuple[
+        TensorValue,
+        TensorValue,
         TensorValue,
         TensorValue,
         TensorValue,
@@ -614,6 +659,8 @@ class Inkling(Module):
             input_row_offsets,
             positions,
             return_n_logits,
+            image_embeddings,
+            image_indices,
             *rest,
         ) = inputs
         signals = rest[:num_signals]
@@ -626,6 +673,8 @@ class Inkling(Module):
             input_row_offsets.tensor,
             positions.tensor,
             return_n_logits.tensor,
+            image_embeddings.tensor,
+            image_indices.tensor,
             [value.buffer for value in signals],
             self.unflatten_kv_inputs(kv_inputs),
             [value.tensor for value in slot_idx],

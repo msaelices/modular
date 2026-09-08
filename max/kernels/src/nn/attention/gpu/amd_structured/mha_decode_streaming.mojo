@@ -21,9 +21,9 @@ Uses DecodeStreamingKVBuffer for single-buffer, per-strip DRAM→SMEM staging
 
 from std.math import ceildiv
 from std.sys.intrinsics import readfirstlane
-from std.gpu import block_idx
+from max.gpu import block_idx
 from max.gpu.sync import barrier
-from std.gpu import warp_id as get_warp_id
+from max.gpu import warp_id as get_warp_id
 from std.memory import bitcast
 from std.utils import IndexList
 from std.utils.numerics import get_accum_type
@@ -73,7 +73,7 @@ __extension Attention:
         comptime k_swizzle = Swizzle(2, 0, 2)
 
         var warp_id = UInt32(
-            readfirstlane(bitcast[DType.int32](UInt32(get_warp_id())))
+            readfirstlane(bitcast[.int32](UInt32(get_warp_id())))
         )
 
         # QK MMA op.

@@ -12,7 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from asyncrt_test_utils import create_test_device_context
-from std.gpu import global_idx
+from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from std.testing import TestSuite, assert_equal
 
@@ -52,10 +52,10 @@ def run_captured_func(ctx: DeviceContext, captured: Float32) raises:
 
     comptime length = 1024
 
-    var in0 = ctx.enqueue_create_buffer[DType.float32](length)
-    var in1 = ctx.enqueue_create_buffer[DType.float32](length)
+    var in0 = ctx.enqueue_create_buffer[.float32](length)
+    var in1 = ctx.enqueue_create_buffer[.float32](length)
     in1.enqueue_fill(2)
-    var out = ctx.enqueue_create_buffer[DType.float32](length)
+    var out = ctx.enqueue_create_buffer[.float32](length)
 
     # Initialize the input and outputs with known values.
     with in0.map_to_host() as in0_host, out.map_to_host() as out_host:

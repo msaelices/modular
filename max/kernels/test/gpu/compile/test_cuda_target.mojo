@@ -16,10 +16,10 @@ from std.math import erf
 from std.math.uutils import ufloordiv, udivmod
 from std.sys.info import is_nvidia_gpu, simd_width_of
 
-import std.gpu.primitives.warp as warp
+import max.gpu.primitives.warp as warp
 from max.algorithm.functional import elementwise
 from std.bit import log2_floor
-from std.gpu import (
+from max.gpu import (
     WARP_SIZE,
     thread_idx,
     block_dim,
@@ -118,7 +118,7 @@ def test_hello_mojo_sm90() raises:
 
 
 def erf_elementwise(
-    buf: UnsafePointer[Float32, MutAnyOrigin], len: Int, ctx: DeviceContext
+    buf: MutPointer[Float32, MutAnyOrigin], len: Int, ctx: DeviceContext
 ) raises:
     # Each thread will process 4 * simd_width elements.
     comptime granularity = 4 * simd_width_of[DType.float32]()
@@ -162,7 +162,7 @@ def test_erf_elementwise_sm90() raises:
 # ===-----------------------------------------------------------------------===#
 
 
-def erf_kernel(buf: UnsafePointer[Float32, MutAnyOrigin], len: Int):
+def erf_kernel(buf: MutPointer[Float32, MutAnyOrigin], len: Int):
     var tid = thread_idx.x + block_dim.y * block_idx.y
 
     if tid >= len:
@@ -195,11 +195,9 @@ def test_erf_kernel_sm90() raises:
 
 
 def test_shared_stack_allocation() -> (
-    UnsafePointer[Int8, MutUntrackedOrigin, address_space=AddressSpace.SHARED]
+    MutPointer[Int8, MutUntrackedOrigin, address_space=.SHARED]
 ):
-    return unsafe_stack_allocation[
-        999, DType.int8, 8, address_space=AddressSpace.SHARED
-    ]()
+    return unsafe_stack_allocation[999, DType.int8, 8, address_space=.SHARED]()
 
 
 @always_inline
@@ -257,9 +255,9 @@ def test_barrier_sm90() raises:
 
 
 def gemm(
-    c: UnsafePointer[Float32, MutAnyOrigin],
-    a: UnsafePointer[Float32, ImmutAnyOrigin],
-    b: UnsafePointer[Float32, ImmutAnyOrigin],
+    c: MutPointer[Float32, MutAnyOrigin],
+    a: ImmPointer[Float32, ImmutAnyOrigin],
+    b: ImmPointer[Float32, ImmutAnyOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -297,7 +295,7 @@ def gemm(
     var b_shared = unsafe_stack_allocation[
         TILE_SZ_RATIO * TILE_SZ_B,
         DType.float32,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
     ]()
 
     # Thread indexing offsets.
@@ -465,7 +463,7 @@ def test_warp_sum_reduce_sm90() raises:
 
 def block_reduce(val: Float32) -> Float32:
     var shared = unsafe_stack_allocation[
-        WARP_SIZE, DType.float32, address_space=AddressSpace.SHARED
+        WARP_SIZE, DType.float32, address_space=.SHARED
     ]()
 
     comptime warp_shift = log2_floor(WARP_SIZE)

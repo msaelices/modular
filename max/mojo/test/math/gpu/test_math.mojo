@@ -19,10 +19,12 @@ from std.testing import TestSuite
 
 def run_func[
     dtype: DType,
-    kernel_fn: def[dtype: DType, width: SIMDLength](
-        SIMD[dtype, width]
-    ) thin -> SIMD[dtype, width],
-](ctx: DeviceContext, val: Scalar[dtype] = 0) raises:
+    kernel_fn: def[fn_dtype: DType, width: SIMDLength](
+        SIMD[fn_dtype, width]
+    ) thin -> SIMD[fn_dtype, width] where fn_dtype.is_floating_point(),
+](
+    ctx: DeviceContext, val: Scalar[dtype] = 0
+) raises where dtype.is_floating_point():
     @__parameter
     def kernel(
         output: Pointer[Scalar[dtype], MutAnyOrigin], input: Scalar[dtype]
@@ -93,16 +95,16 @@ def test_math() raises:
 
         @__parameter
         def test[
-            *kernel_fns: def[dtype: DType, width: SIMDLength](
-                SIMD[dtype, width]
-            ) thin -> SIMD[dtype, width]
+            *kernel_fns: def[fn_dtype: DType, width: SIMDLength](
+                SIMD[fn_dtype, width]
+            ) thin -> SIMD[fn_dtype, width] where fn_dtype.is_floating_point()
         ](ctx: DeviceContext) raises:
             comptime ls = kernel_fns.size
 
             comptime for idx in range(ls):
                 comptime kernel_fn = kernel_fns[idx]
-                run_func[DType.float32, kernel_fn[...]](ctx)
-                run_func[DType.float16, kernel_fn[...]](ctx)
+                run_func[.float32, kernel_fn[...]](ctx)
+                run_func[.float16, kernel_fn[...]](ctx)
 
         # Anything that's commented does not work atm and needs to be
         # implemented. This list is also not exhaustive and needs to be

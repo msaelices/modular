@@ -15,10 +15,16 @@ from .arch import inkling_arch
 from .batch_processor import InklingInputs
 from .model import InklingModel
 from .model_config import InklingConfig
+from .reasoning import InklingReasoningParser
+from .tokenizer import InklingTokenizer
+from .tool_parser import InklingToolParser
 
 __all__ = [
     "InklingConfig",
     "InklingInputs",
     "InklingModel",
+    "InklingReasoningParser",
+    "InklingTokenizer",
+    "InklingToolParser",
     "inkling_arch",
 ]

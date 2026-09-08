@@ -899,7 +899,7 @@ def test_arange_nested_layout() raises:
     """Test arange function with nested layout structures."""
     # Test nested layout with tile structure similar to GPU shared memory tiles
     var nested_tensor = LayoutTensor[
-        DType.float32,
+        .float32,
         Layout(
             IntTuple(IntTuple(16, 8), IntTuple(32, 2)),
             IntTuple(IntTuple(32, 1024), IntTuple(1, 512)),
@@ -911,7 +911,7 @@ def test_arange_nested_layout() raises:
 
     # Test simple 2D layout with row-major for comparison
     var simple_tensor = LayoutTensor[
-        DType.float32,
+        .float32,
         Layout.row_major(4, 4),
         MutAnyOrigin,
     ].stack_allocation()
@@ -929,7 +929,7 @@ def test_arange_nested_layout() raises:
 
     # Test column-major layout
     var col_major_tensor = LayoutTensor[
-        DType.float32,
+        .float32,
         Layout.col_major(4, 4),
         MutAnyOrigin,
     ].stack_allocation()
@@ -947,9 +947,9 @@ def test_layout_tensor_iterator_print() raises:
     """Test case for MSTDL-1984: Tensors generated from LayoutTensorIter won't print.
     """
     comptime buf_size = 16
-    var storage = Array[Int16, buf_size](uninitialized=True)
-    for i in range(buf_size):
-        storage[i] = Int16(i)
+    var storage = Array[Int16, buf_size](
+        fill_with=lambda (i: Int) -> Int16: Int16(i)
+    )
     comptime tile_layout = Layout.row_major(2, 2)
     var iter = LayoutTensorIter[
         DType.int16,

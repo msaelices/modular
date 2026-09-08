@@ -17,8 +17,8 @@ from std.math.uutils import udivmod, ufloordiv
 
 from max.algorithm.reduction import _get_nd_indices_from_flat_index
 from max.gpu.primitives.block import broadcast
-from max.gpu.host import DeviceContext
-from std.gpu import (
+from max.gpu.host import DeviceContext, get_gpu_target
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     block_dim,
@@ -35,8 +35,7 @@ from max.gpu.primitives.grid_controls import (
     PDLLevel,
     pdl_launch_attributes,
 )
-from max.gpu.host import DeviceContext, get_gpu_target
-from std.gpu.primitives import warp
+from max.gpu.primitives import warp
 from std.memory import unsafe_stack_allocation
 from std.atomic import Atomic
 
@@ -160,7 +159,7 @@ def block_reduce[
     var shared = unsafe_stack_allocation[
         (BLOCK_SIZE // WARP_SIZE) * num_reductions * simd_width,
         dtype,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
     ]()
 
     var warp = warp_id()
@@ -573,7 +572,7 @@ def twophase_reduce_kernel[
     # that device memory has no tracked Mojo origin; the safe `Pointer` matches
     # the buffers' `UnsafePointer` `device_type` at the enqueue boundary.
     partials: Pointer[Scalar[accum_type], MutAnyOrigin],
-    counters: Pointer[Scalar[DType.int32], MutAnyOrigin],
+    counters: Pointer[Int32, MutAnyOrigin],
     # `Int` is not device-passable; use a fixed-width `Int32`.
     blocks_per_row: Int32,
 ):
@@ -645,7 +644,7 @@ def twophase_reduce_kernel[
         ](accum, init_cast)
 
         # Thread 0 writes partial result for this block and signals completion.
-        var is_last_block: Scalar[DType.bool] = False
+        var is_last_block: Scalar[.bool] = False
         if thread_idx.x == 0:
             var base = block_idx.x * num_reductions
             comptime for i in range(num_reductions):
@@ -925,7 +924,7 @@ def reduce_launch[
         var partials_buf = ctx.enqueue_create_buffer[_accum_type](
             total_blocks * num_reductions
         )
-        var counter_buf = ctx.enqueue_create_buffer[DType.int32](num_rows)
+        var counter_buf = ctx.enqueue_create_buffer[.int32](num_rows)
         ctx.enqueue_memset(counter_buf, Int32(0))
 
         comptime kernel = twophase_reduce_kernel[
