@@ -50,20 +50,20 @@ boundary -- no cross-sequence bleed. `final_states (batch, nheads, head_dim,
 dstate)` is written at each sequence end.
 """
 
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_dim,
     block_idx,
     thread_idx,
 )
 from max.gpu.host import DeviceContext
-from std.gpu.primitives.warp import lane_group_sum
+from max.gpu.primitives.warp import lane_group_sum
 from max.algorithm import sync_parallelize
 from std.math import exp2
 from std.sys.info import align_of
 from std.utils.index import IndexList
 from std.utils.static_tuple import StaticTuple
-from layout import PointerStorage, TensorLayout, TensorStorage, TileTensor
+from layout import DefaultEngine, TensorLayout, TensorEngine, TileTensor
 from state_space.selective_scan import softplus
 
 # LOG2E: convert exp(x) -> exp2(x * LOG2E) (faster on GPU), matching the
@@ -94,8 +94,8 @@ def mamba2_ssd_chunk_scan_varlen_fwd_gpu[
     has_initial_state_LT: TensorLayout,
     # All operands are built from the same source (graph input tensors in
     # production, device buffers in the coverage test) so they share one
-    # storage policy; a single param binds it for every tile argument.
-    Storage: TensorStorage = PointerStorage[element_width=1],
+    # engine; a single param binds it for every tile argument.
+    Engine: TensorEngine = DefaultEngine[element_width=1],
 ](
     nheads_dev: Int32,
     head_dim_dev: Int32,
@@ -105,40 +105,40 @@ def mamba2_ssd_chunk_scan_varlen_fwd_gpu[
     dt_softplus: Int8,
     # Tensors (varlen / ragged: time dim is the packed total_len)
     x: TileTensor[
-        kernel_dtype, x_LT, MutUntrackedOrigin, Storage=Storage
+        kernel_dtype, x_LT, MutUntrackedOrigin, Engine=Engine
     ],  # (total_len, nheads, head_dim)
     dt: TileTensor[
-        kernel_dtype, dt_LT, MutUntrackedOrigin, Storage=Storage
+        kernel_dtype, dt_LT, MutUntrackedOrigin, Engine=Engine
     ],  # (total_len, nheads)
     A: TileTensor[
-        kernel_dtype, A_LT, MutUntrackedOrigin, Storage=Storage
+        kernel_dtype, A_LT, MutUntrackedOrigin, Engine=Engine
     ],  # (nheads,)
     B: TileTensor[
-        kernel_dtype, B_LT, MutUntrackedOrigin, Storage=Storage
+        kernel_dtype, B_LT, MutUntrackedOrigin, Engine=Engine
     ],  # (total_len, ngroups, dstate)
     C: TileTensor[
-        kernel_dtype, C_LT, MutUntrackedOrigin, Storage=Storage
+        kernel_dtype, C_LT, MutUntrackedOrigin, Engine=Engine
     ],  # (total_len, ngroups, dstate)
     D: TileTensor[
-        kernel_dtype, D_LT, MutUntrackedOrigin, Storage=Storage
+        kernel_dtype, D_LT, MutUntrackedOrigin, Engine=Engine
     ],  # (nheads,) optional
     dt_bias: TileTensor[
-        kernel_dtype, dt_bias_LT, MutUntrackedOrigin, Storage=Storage
+        kernel_dtype, dt_bias_LT, MutUntrackedOrigin, Engine=Engine
     ],  # (nheads,) optional
     initial_states: TileTensor[
-        DType.float32, initial_states_LT, MutUntrackedOrigin, Storage=Storage
+        .float32, initial_states_LT, MutUntrackedOrigin, Engine=Engine
     ],  # (batch, nheads, head_dim, dstate) optional
     y: TileTensor[
-        kernel_dtype, y_LT, MutUntrackedOrigin, Storage=Storage
+        kernel_dtype, y_LT, MutUntrackedOrigin, Engine=Engine
     ],  # (total_len, nheads, head_dim)
     final_states: TileTensor[
-        DType.float32, final_states_LT, MutUntrackedOrigin, Storage=Storage
+        .float32, final_states_LT, MutUntrackedOrigin, Engine=Engine
     ],  # (batch, nheads, head_dim, dstate)
     query_start_loc: TileTensor[
-        DType.int32, query_start_loc_LT, MutUntrackedOrigin, Storage=Storage
+        .int32, query_start_loc_LT, MutUntrackedOrigin, Engine=Engine
     ],  # (batch + 1,)
     has_initial_state: TileTensor[
-        DType.bool, has_initial_state_LT, MutUntrackedOrigin, Storage=Storage
+        .bool, has_initial_state_LT, MutUntrackedOrigin, Engine=Engine
     ],  # (batch,) optional
     x_strides: Strides3D,  # (total_len, nheads, head_dim)
     dt_strides: Strides2D,  # (total_len, nheads)
@@ -195,7 +195,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_gpu[
     if has_dt_bias:
         dt_bias_val = Scalar[kernel_dtype](
             dt_bias.raw_load(UInt32(h * dt_bias_strides[0]))
-        ).cast[DType.float32]()
+        ).cast[.float32]()
 
     var D_val = Float32(0.0)
     if has_D:
@@ -204,7 +204,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_gpu[
         ]()
 
     # State vector over dstate, fp32. Initialise from initial_states if present.
-    var state = SIMD[DType.float32, MAX_DSTATE](0.0)
+    var state = SIMD[.float32, MAX_DSTATE](0.0)
     var use_initial = False
     if has_init_tensor:
         use_initial = Bool(has_initial_state.raw_load(b))
@@ -227,12 +227,12 @@ def mamba2_ssd_chunk_scan_varlen_fwd_gpu[
             x.raw_load(
                 UInt32(gt * x_strides[0] + h * x_strides[1] + p * x_strides[2])
             )
-        ).cast[DType.float32]()
+        ).cast[.float32]()
 
         # dt[gt, h] (+ dt_bias), softplus -> per-(t,h) scalar (broadcast over p).
         var dt_val = Scalar[kernel_dtype](
             dt.raw_load(UInt32(gt * dt_strides[0] + h * dt_strides[1]))
-        ).cast[DType.float32]()
+        ).cast[.float32]()
         if has_dt_bias:
             dt_val += dt_bias_val
         if dt_softplus_bool:
@@ -243,8 +243,8 @@ def mamba2_ssd_chunk_scan_varlen_fwd_gpu[
         var dt_x = dt_val * x_val
 
         # Load B and C rows for this (gt, group_id).
-        var B_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
-        var C_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
+        var B_vals = SIMD[.float32, MAX_DSTATE](0.0)
+        var C_vals = SIMD[.float32, MAX_DSTATE](0.0)
         comptime for n in range(DSTATE):
             B_vals[n] = Scalar[kernel_dtype](
                 B.raw_load(
@@ -254,7 +254,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_gpu[
                         + n * B_strides[2]
                     )
                 )
-            ).cast[DType.float32]()
+            ).cast[.float32]()
             C_vals[n] = Scalar[kernel_dtype](
                 C.raw_load(
                     UInt32(
@@ -263,7 +263,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_gpu[
                         + n * C_strides[2]
                     )
                 )
-            ).cast[DType.float32]()
+            ).cast[.float32]()
 
         # state_n = state_n * dA + (dt * x) * B_n   (vector over dstate)
         state = state * dA + B_vals * dt_x
@@ -304,9 +304,9 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu[
     query_start_loc_LT: TensorLayout,
     has_initial_state_LT: TensorLayout,
     cache_indices_LT: TensorLayout,
-    # All operands share one storage policy (see the non-inplace variant); a
+    # All operands share one engine (see the non-inplace variant); a
     # single param binds it for every tile argument.
-    Storage: TensorStorage = PointerStorage[element_width=1],
+    Engine: TensorEngine = DefaultEngine[element_width=1],
 ](
     nheads_dev: Int32,
     head_dim_dev: Int32,
@@ -314,30 +314,30 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu[
     nheads_ngroups_ratio_dev: Int32,
     batch_dev: Int32,
     dt_softplus: Int8,
-    x: TileTensor[kernel_dtype, x_LT, MutUntrackedOrigin, Storage=Storage],
-    dt: TileTensor[kernel_dtype, dt_LT, MutUntrackedOrigin, Storage=Storage],
-    A: TileTensor[kernel_dtype, A_LT, MutUntrackedOrigin, Storage=Storage],
-    B: TileTensor[kernel_dtype, B_LT, MutUntrackedOrigin, Storage=Storage],
-    C: TileTensor[kernel_dtype, C_LT, MutUntrackedOrigin, Storage=Storage],
-    D: TileTensor[kernel_dtype, D_LT, MutUntrackedOrigin, Storage=Storage],
+    x: TileTensor[kernel_dtype, x_LT, MutUntrackedOrigin, Engine=Engine],
+    dt: TileTensor[kernel_dtype, dt_LT, MutUntrackedOrigin, Engine=Engine],
+    A: TileTensor[kernel_dtype, A_LT, MutUntrackedOrigin, Engine=Engine],
+    B: TileTensor[kernel_dtype, B_LT, MutUntrackedOrigin, Engine=Engine],
+    C: TileTensor[kernel_dtype, C_LT, MutUntrackedOrigin, Engine=Engine],
+    D: TileTensor[kernel_dtype, D_LT, MutUntrackedOrigin, Engine=Engine],
     dt_bias: TileTensor[
-        kernel_dtype, dt_bias_LT, MutUntrackedOrigin, Storage=Storage
+        kernel_dtype, dt_bias_LT, MutUntrackedOrigin, Engine=Engine
     ],
-    y: TileTensor[kernel_dtype, y_LT, MutUntrackedOrigin, Storage=Storage],
+    y: TileTensor[kernel_dtype, y_LT, MutUntrackedOrigin, Engine=Engine],
     # ssm_pool: [max_slots, nheads, head_dim, dstate] fp32 — read for initial
     # state (when has_initial_state[b]) and written in-place at slot
     # cache_indices[b] (instead of a separate final_states output).
     ssm_pool: TileTensor[
-        DType.float32, ssm_pool_LT, MutUntrackedOrigin, Storage=Storage
+        .float32, ssm_pool_LT, MutUntrackedOrigin, Engine=Engine
     ],
     query_start_loc: TileTensor[
-        DType.int32, query_start_loc_LT, MutUntrackedOrigin, Storage=Storage
+        .int32, query_start_loc_LT, MutUntrackedOrigin, Engine=Engine
     ],
     has_initial_state: TileTensor[
-        DType.bool, has_initial_state_LT, MutUntrackedOrigin, Storage=Storage
+        .bool, has_initial_state_LT, MutUntrackedOrigin, Engine=Engine
     ],
     cache_indices: TileTensor[
-        DType.uint32, cache_indices_LT, MutUntrackedOrigin, Storage=Storage
+        .uint32, cache_indices_LT, MutUntrackedOrigin, Engine=Engine
     ],
     x_strides: Strides3D,
     dt_strides: Strides2D,
@@ -377,8 +377,8 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu[
         query_start_loc_LT: Tensor layout of `query_start_loc`.
         has_initial_state_LT: Tensor layout of `has_initial_state`.
         cache_indices_LT: Tensor layout of `cache_indices`.
-        Storage: Storage policy shared by all tile operands (defaults to
-            `PointerStorage[element_width=1]`).
+        Engine: Engine shared by all tile operands (defaults to
+            `DefaultEngine[element_width=1]`).
 
     Args:
         nheads_dev: Number of attention heads.
@@ -458,7 +458,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu[
     if has_dt_bias:
         dt_bias_val = Scalar[kernel_dtype](
             dt_bias.raw_load(UInt32(h * dt_bias_strides[0]))
-        ).cast[DType.float32]()
+        ).cast[.float32]()
 
     var D_val = Float32(0.0)
     if has_D:
@@ -468,7 +468,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu[
 
     # Load initial state from ssm_pool at the slot for this sequence.
     var slot = Int(cache_indices.raw_load(b))
-    var state = SIMD[DType.float32, MAX_DSTATE](0.0)
+    var state = SIMD[.float32, MAX_DSTATE](0.0)
     var use_initial = False
     if has_init_tensor:
         use_initial = Bool(has_initial_state.raw_load(b))
@@ -490,11 +490,11 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu[
             x.raw_load(
                 UInt32(gt * x_strides[0] + h * x_strides[1] + p * x_strides[2])
             )
-        ).cast[DType.float32]()
+        ).cast[.float32]()
 
         var dt_val = Scalar[kernel_dtype](
             dt.raw_load(UInt32(gt * dt_strides[0] + h * dt_strides[1]))
-        ).cast[DType.float32]()
+        ).cast[.float32]()
         if has_dt_bias:
             dt_val += dt_bias_val
         if dt_softplus_bool:
@@ -503,8 +503,8 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu[
         var dA = exp2(A_val * dt_val)
         var dt_x = dt_val * x_val
 
-        var B_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
-        var C_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
+        var B_vals = SIMD[.float32, MAX_DSTATE](0.0)
+        var C_vals = SIMD[.float32, MAX_DSTATE](0.0)
         comptime for n in range(DSTATE):
             B_vals[n] = Scalar[kernel_dtype](
                 B.raw_load(
@@ -514,7 +514,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu[
                         + n * B_strides[2]
                     )
                 )
-            ).cast[DType.float32]()
+            ).cast[.float32]()
             C_vals[n] = Scalar[kernel_dtype](
                 C.raw_load(
                     UInt32(
@@ -523,7 +523,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu[
                         + n * C_strides[2]
                     )
                 )
-            ).cast[DType.float32]()
+            ).cast[.float32]()
 
         state = state * dA + B_vals * dt_x
 
@@ -592,6 +592,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_dstate_split[
     query_start_loc_LT: TensorLayout,
     has_initial_state_LT: TensorLayout,
     cache_indices_LT: TensorLayout,
+    Engine: TensorEngine,
     DSTATE_SPLIT: Int = 1,
 ](
     nheads_dev: Int32,
@@ -600,23 +601,27 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_dstate_split[
     nheads_ngroups_ratio_dev: Int32,
     batch_dev: Int32,
     dt_softplus: Int8,
-    x: TileTensor[kernel_dtype, x_LT, MutUntrackedOrigin],
-    dt: TileTensor[kernel_dtype, dt_LT, MutUntrackedOrigin],
-    A: TileTensor[kernel_dtype, A_LT, MutUntrackedOrigin],
-    B: TileTensor[kernel_dtype, B_LT, MutUntrackedOrigin],
-    C: TileTensor[kernel_dtype, C_LT, MutUntrackedOrigin],
-    D: TileTensor[kernel_dtype, D_LT, MutUntrackedOrigin],
-    dt_bias: TileTensor[kernel_dtype, dt_bias_LT, MutUntrackedOrigin],
-    y: TileTensor[kernel_dtype, y_LT, MutUntrackedOrigin],
-    ssm_pool: TileTensor[DType.float32, ssm_pool_LT, MutUntrackedOrigin],
+    x: TileTensor[kernel_dtype, x_LT, MutUntrackedOrigin, Engine=Engine],
+    dt: TileTensor[kernel_dtype, dt_LT, MutUntrackedOrigin, Engine=Engine],
+    A: TileTensor[kernel_dtype, A_LT, MutUntrackedOrigin, Engine=Engine],
+    B: TileTensor[kernel_dtype, B_LT, MutUntrackedOrigin, Engine=Engine],
+    C: TileTensor[kernel_dtype, C_LT, MutUntrackedOrigin, Engine=Engine],
+    D: TileTensor[kernel_dtype, D_LT, MutUntrackedOrigin, Engine=Engine],
+    dt_bias: TileTensor[
+        kernel_dtype, dt_bias_LT, MutUntrackedOrigin, Engine=Engine
+    ],
+    y: TileTensor[kernel_dtype, y_LT, MutUntrackedOrigin, Engine=Engine],
+    ssm_pool: TileTensor[
+        .float32, ssm_pool_LT, MutUntrackedOrigin, Engine=Engine
+    ],
     query_start_loc: TileTensor[
-        DType.int32, query_start_loc_LT, MutUntrackedOrigin
+        .int32, query_start_loc_LT, MutUntrackedOrigin, Engine=Engine
     ],
     has_initial_state: TileTensor[
-        DType.bool, has_initial_state_LT, MutUntrackedOrigin
+        .bool, has_initial_state_LT, MutUntrackedOrigin, Engine=Engine
     ],
     cache_indices: TileTensor[
-        DType.uint32, cache_indices_LT, MutUntrackedOrigin
+        .uint32, cache_indices_LT, MutUntrackedOrigin, Engine=Engine
     ],
     x_strides: Strides3D,
     dt_strides: Strides2D,
@@ -707,7 +712,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_dstate_split[
     # the result is bit-identical. `n_base` is a multiple of L and dstate is a
     # multiple of L, so the row-major base offset is L-aligned -- the SIMD
     # alignment below is satisfied for every dispatched DSTATE (16/64/128/256).
-    comptime pool_align = align_of[SIMD[DType.float32, L]]()
+    comptime pool_align = align_of[SIMD[.float32, L]]()
     comptime bc_align = align_of[SIMD[kernel_dtype, L]]()
     var pool_contig = ssm_pool_strides[3] == 1
     var bc_contig = (B_strides[2] == 1) and (C_strides[2] == 1)
@@ -736,7 +741,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_dstate_split[
     if has_dt_bias:
         dt_bias_val = Scalar[kernel_dtype](
             dt_bias.raw_load(UInt32(h * dt_bias_strides[0]))
-        ).cast[DType.float32]()
+        ).cast[.float32]()
 
     var D_val = Float32(0.0)
     if has_D:
@@ -746,7 +751,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_dstate_split[
 
     # Load this thread's DSTATE sub-tile of the initial state from ssm_pool.
     var slot = Int(cache_indices.raw_load(b))
-    var state = SIMD[DType.float32, L](0.0)
+    var state = SIMD[.float32, L](0.0)
     var use_initial = False
     if has_init_tensor:
         use_initial = Bool(has_initial_state.raw_load(b))
@@ -778,8 +783,8 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_dstate_split[
         var x_val = Float32(0.0)
         var dt_x = Float32(0.0)
         var dA = Float32(0.0)
-        var B_vals = SIMD[DType.float32, L](0.0)
-        var C_vals = SIMD[DType.float32, L](0.0)
+        var B_vals = SIMD[.float32, L](0.0)
+        var C_vals = SIMD[.float32, L](0.0)
         if active:
             x_val = Scalar[kernel_dtype](
                 x.raw_load(
@@ -787,11 +792,11 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_dstate_split[
                         gt * x_strides[0] + h * x_strides[1] + p * x_strides[2]
                     )
                 )
-            ).cast[DType.float32]()
+            ).cast[.float32]()
 
             var dt_val = Scalar[kernel_dtype](
                 dt.raw_load(UInt32(gt * dt_strides[0] + h * dt_strides[1]))
-            ).cast[DType.float32]()
+            ).cast[.float32]()
             if has_dt_bias:
                 dt_val += dt_bias_val
             if dt_softplus_bool:
@@ -808,14 +813,14 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_dstate_split[
                         + group_id * B_strides[1]
                         + n_base * B_strides[2]
                     )
-                ).cast[DType.float32]()
+                ).cast[.float32]()
                 C_vals = C.raw_load[width=L, alignment=bc_align](
                     UInt32(
                         gt * C_strides[0]
                         + group_id * C_strides[1]
                         + n_base * C_strides[2]
                     )
-                ).cast[DType.float32]()
+                ).cast[.float32]()
             else:
                 comptime for i in range(L):
                     var n = n_base + i
@@ -827,7 +832,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_dstate_split[
                                 + n * B_strides[2]
                             )
                         )
-                    ).cast[DType.float32]()
+                    ).cast[.float32]()
                     C_vals[i] = Scalar[kernel_dtype](
                         C.raw_load(
                             UInt32(
@@ -836,7 +841,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_dstate_split[
                                 + n * C_strides[2]
                             )
                         )
-                    ).cast[DType.float32]()
+                    ).cast[.float32]()
 
         state = state * dA + B_vals * dt_x
 
@@ -888,7 +893,7 @@ struct DStateVecLoader[
     ssm_pool_LT: TensorLayout,
     B_LT: TensorLayout,
     C_LT: TensorLayout,
-    Storage: TensorStorage,
+    Engine: TensorEngine,
     VEC: Int,
     NCHUNK: Int,
 ](ImplicitlyCopyable, Movable):
@@ -898,7 +903,7 @@ struct DStateVecLoader[
     ``..._dstate_split`` sibling performs the identical widen-on-load /
     round-on-store / vectorized-vs-scalar-fallback logic inline; it COULD reuse
     this owner later (it is parameterized on the storage dtypes / layouts /
-    ``Storage``), but is not wired to it here (Apple-scoped change).
+    ``Engine``), but is not wired to it here (Apple-scoped change).
 
     Every DRAM <-> register transition on the innermost (dstate) axis has an
     owner here instead of a ``raw_load`` / ``raw_store`` scattered across the
@@ -930,7 +935,7 @@ struct DStateVecLoader[
         ssm_pool_LT: Layout type of the ``ssm_pool`` view.
         B_LT: Layout type of the ``B`` view.
         C_LT: Layout type of the ``C`` view.
-        Storage: Shared tensor-storage policy of the views.
+        Engine: Shared engine of the views.
         VEC: SIMD load/store width over the contiguous dstate axis.
         NCHUNK: Number of ``VEC``-wide chunks spanning ``DSTATE``.
     """
@@ -939,13 +944,13 @@ struct DStateVecLoader[
         Self.state_dtype,
         Self.ssm_pool_LT,
         MutUntrackedOrigin,
-        Storage=Self.Storage,
+        Engine=Self.Engine,
     ]
     var B: TileTensor[
-        Self.kernel_dtype, Self.B_LT, MutUntrackedOrigin, Storage=Self.Storage
+        Self.kernel_dtype, Self.B_LT, MutUntrackedOrigin, Engine=Self.Engine
     ]
     var C: TileTensor[
-        Self.kernel_dtype, Self.C_LT, MutUntrackedOrigin, Storage=Self.Storage
+        Self.kernel_dtype, Self.C_LT, MutUntrackedOrigin, Engine=Self.Engine
     ]
     # Innermost (dstate) strides for the scalar fallback gather/scatter.
     var pool_dstate_stride: Int
@@ -962,19 +967,19 @@ struct DStateVecLoader[
             Self.state_dtype,
             Self.ssm_pool_LT,
             MutUntrackedOrigin,
-            Storage=Self.Storage,
+            Engine=Self.Engine,
         ],
         B: TileTensor[
             Self.kernel_dtype,
             Self.B_LT,
             MutUntrackedOrigin,
-            Storage=Self.Storage,
+            Engine=Self.Engine,
         ],
         C: TileTensor[
             Self.kernel_dtype,
             Self.C_LT,
             MutUntrackedOrigin,
-            Storage=Self.Storage,
+            Engine=Self.Engine,
         ],
         pool_dstate_stride: Int,
         b_dstate_stride: Int,
@@ -992,7 +997,7 @@ struct DStateVecLoader[
     @always_inline
     def load_state(
         self,
-        mut state: Array[SIMD[DType.float32, Self.VEC], Self.NCHUNK],
+        mut state: Array[SIMD[.float32, Self.VEC], Self.NCHUNK],
         pool_base: UInt32,
     ):
         """Fill fp32 ``state`` from ``ssm_pool[.., pool_base + n]`` (widening).
@@ -1005,15 +1010,15 @@ struct DStateVecLoader[
             comptime for c in range(Self.NCHUNK):
                 state[c] = self.ssm_pool.raw_load[
                     width=Self.VEC, alignment=pool_align
-                ](pool_base + UInt32(c * Self.VEC)).cast[DType.float32]()
+                ](pool_base + UInt32(c * Self.VEC)).cast[.float32]()
         else:
             comptime for c in range(Self.NCHUNK):
-                var chunk = SIMD[DType.float32, Self.VEC](0.0)
+                var chunk = SIMD[.float32, Self.VEC](0.0)
                 comptime for i in range(Self.VEC):
                     chunk[i] = self.ssm_pool.raw_load(
                         pool_base
                         + UInt32((c * Self.VEC + i) * self.pool_dstate_stride)
-                    ).cast[DType.float32]()
+                    ).cast[.float32]()
                 state[c] = chunk
 
     @always_inline
@@ -1023,8 +1028,8 @@ struct DStateVecLoader[
         self,
         b_base: UInt32,
         c_base: UInt32,
-        mut b_c: SIMD[DType.float32, Self.VEC],
-        mut c_c: SIMD[DType.float32, Self.VEC],
+        mut b_c: SIMD[.float32, Self.VEC],
+        mut c_c: SIMD[.float32, Self.VEC],
     ):
         """Load B and C chunk ``c`` (``VEC`` dstate lanes each), widening to fp32.
 
@@ -1040,24 +1045,24 @@ struct DStateVecLoader[
         comptime if contig:
             b_c = self.B.raw_load[width=Self.VEC, alignment=bc_align](
                 b_base + UInt32(c * Self.VEC)
-            ).cast[DType.float32]()
+            ).cast[.float32]()
             c_c = self.C.raw_load[width=Self.VEC, alignment=bc_align](
                 c_base + UInt32(c * Self.VEC)
-            ).cast[DType.float32]()
+            ).cast[.float32]()
         else:
             comptime for i in range(Self.VEC):
                 var n = c * Self.VEC + i
                 b_c[i] = Scalar[Self.kernel_dtype](
                     self.B.raw_load(b_base + UInt32(n * self.b_dstate_stride))
-                ).cast[DType.float32]()
+                ).cast[.float32]()
                 c_c[i] = Scalar[Self.kernel_dtype](
                     self.C.raw_load(c_base + UInt32(n * self.c_dstate_stride))
-                ).cast[DType.float32]()
+                ).cast[.float32]()
 
     @always_inline
     def store_state(
         self,
-        state: Array[SIMD[DType.float32, Self.VEC], Self.NCHUNK],
+        state: Array[SIMD[.float32, Self.VEC], Self.NCHUNK],
         pool_wb: UInt32,
     ):
         """Round fp32 ``state`` to ``state_dtype`` and write back to ``ssm_pool``.
@@ -1101,16 +1106,16 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_apple[
     # dominant per-step pool traffic on Apple silicon; the recurrence still
     # accumulates in fp32 registers (loads widen, only the final write-back
     # rounds). See the docstring numerics contract.
-    state_dtype: DType = DType.float32,
+    state_dtype: DType = .float32,
     # SIMD load/store width over the contiguous dstate axis. 4 fp32 = 16 B is
     # the proven M5 vector-load cap; 2/8 are sweepable in the microbench. NOTE:
     # VEC=8 is fp32-ONLY -- a width-8 bf16/fp16 load scalarizes on the M5 (AGX)
     # backend (`<8 x half>`/`<8 x bfloat>` under-alignment cliff), so the
     # shipping default VEC=4 is the safe choice across state dtypes.
     VEC: Int = 4,
-    # All operands share one storage policy (see the v1 variant); a single
+    # All operands share one engine (see the v1 variant); a single
     # param binds it for every tile argument.
-    Storage: TensorStorage = PointerStorage[element_width=1],
+    Engine: TensorEngine = DefaultEngine[element_width=1],
 ](
     nheads_dev: Int32,
     head_dim_dev: Int32,
@@ -1118,27 +1123,27 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_apple[
     nheads_ngroups_ratio_dev: Int32,
     batch_dev: Int32,
     dt_softplus: Int8,
-    x: TileTensor[kernel_dtype, x_LT, MutUntrackedOrigin, Storage=Storage],
-    dt: TileTensor[kernel_dtype, dt_LT, MutUntrackedOrigin, Storage=Storage],
-    A: TileTensor[kernel_dtype, A_LT, MutUntrackedOrigin, Storage=Storage],
-    B: TileTensor[kernel_dtype, B_LT, MutUntrackedOrigin, Storage=Storage],
-    C: TileTensor[kernel_dtype, C_LT, MutUntrackedOrigin, Storage=Storage],
-    D: TileTensor[kernel_dtype, D_LT, MutUntrackedOrigin, Storage=Storage],
+    x: TileTensor[kernel_dtype, x_LT, MutUntrackedOrigin, Engine=Engine],
+    dt: TileTensor[kernel_dtype, dt_LT, MutUntrackedOrigin, Engine=Engine],
+    A: TileTensor[kernel_dtype, A_LT, MutUntrackedOrigin, Engine=Engine],
+    B: TileTensor[kernel_dtype, B_LT, MutUntrackedOrigin, Engine=Engine],
+    C: TileTensor[kernel_dtype, C_LT, MutUntrackedOrigin, Engine=Engine],
+    D: TileTensor[kernel_dtype, D_LT, MutUntrackedOrigin, Engine=Engine],
     dt_bias: TileTensor[
-        kernel_dtype, dt_bias_LT, MutUntrackedOrigin, Storage=Storage
+        kernel_dtype, dt_bias_LT, MutUntrackedOrigin, Engine=Engine
     ],
-    y: TileTensor[kernel_dtype, y_LT, MutUntrackedOrigin, Storage=Storage],
+    y: TileTensor[kernel_dtype, y_LT, MutUntrackedOrigin, Engine=Engine],
     ssm_pool: TileTensor[
-        state_dtype, ssm_pool_LT, MutUntrackedOrigin, Storage=Storage
+        state_dtype, ssm_pool_LT, MutUntrackedOrigin, Engine=Engine
     ],
     query_start_loc: TileTensor[
-        DType.int32, query_start_loc_LT, MutUntrackedOrigin, Storage=Storage
+        .int32, query_start_loc_LT, MutUntrackedOrigin, Engine=Engine
     ],
     has_initial_state: TileTensor[
-        DType.bool, has_initial_state_LT, MutUntrackedOrigin, Storage=Storage
+        .bool, has_initial_state_LT, MutUntrackedOrigin, Engine=Engine
     ],
     cache_indices: TileTensor[
-        DType.uint32, cache_indices_LT, MutUntrackedOrigin, Storage=Storage
+        .uint32, cache_indices_LT, MutUntrackedOrigin, Engine=Engine
     ],
     x_strides: Strides3D,
     dt_strides: Strides2D,
@@ -1215,7 +1220,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_apple[
     # recurrence (fp16 max 65504 risks overflow) and wide fp16 loads hit the
     # M5 scalarization trap. Only the two validated storage dtypes compile.
     comptime assert (
-        state_dtype == DType.float32 or state_dtype == DType.bfloat16
+        state_dtype == .float32 or state_dtype == .bfloat16
     ), "state_dtype must be float32 or bfloat16"
 
     var nheads = Int(nheads_dev)
@@ -1253,7 +1258,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_apple[
     if has_dt_bias:
         dt_bias_val = Scalar[kernel_dtype](
             dt_bias.raw_load(UInt32(h * dt_bias_strides[0]))
-        ).cast[DType.float32]()
+        ).cast[.float32]()
 
     var D_val = Float32(0.0)
     if has_D:
@@ -1275,14 +1280,14 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_apple[
         ssm_pool_LT,
         B_LT,
         C_LT,
-        Storage,
+        Engine,
         VEC,
         NCHUNK,
     ](ssm_pool, B, C, ssm_pool_strides[3], B_strides[2], C_strides[2])
 
     # Per-thread dstate state as native VEC-wide fp32 chunks (see docstring).
-    var state = Array[SIMD[DType.float32, VEC], NCHUNK](
-        fill=SIMD[DType.float32, VEC](0.0)
+    var state = Array[SIMD[.float32, VEC], NCHUNK](
+        fill=SIMD[.float32, VEC](0.0)
     )
 
     var slot = Int(cache_indices.raw_load(b))
@@ -1306,11 +1311,11 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_apple[
             x.raw_load(
                 UInt32(gt * x_strides[0] + h * x_strides[1] + p * x_strides[2])
             )
-        ).cast[DType.float32]()
+        ).cast[.float32]()
 
         var dt_val = Scalar[kernel_dtype](
             dt.raw_load(UInt32(gt * dt_strides[0] + h * dt_strides[1]))
-        ).cast[DType.float32]()
+        ).cast[.float32]()
         if has_dt_bias:
             dt_val += dt_bias_val
         if dt_softplus_bool:
@@ -1328,21 +1333,21 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_apple[
         # so each arm is a straight-line unrolled loop -- a per-chunk runtime
         # branch measured ~18% slower on M5 (33.6 vs 28.4 us at the decode
         # shape) by interleaving cold scalar-gather code into the hot loop.
-        var y_acc = SIMD[DType.float32, VEC](0.0)
+        var y_acc = SIMD[.float32, VEC](0.0)
         var B_base = UInt32(gt * B_strides[0] + group_id * B_strides[1])
         var C_base = UInt32(gt * C_strides[0] + group_id * C_strides[1])
         if loader.bc_contig:
             comptime for c in range(NCHUNK):
-                var b_c = SIMD[DType.float32, VEC](0.0)
-                var c_c = SIMD[DType.float32, VEC](0.0)
+                var b_c = SIMD[.float32, VEC](0.0)
+                var c_c = SIMD[.float32, VEC](0.0)
                 loader.load_bc[c, True](B_base, C_base, b_c, c_c)
                 var s_c = state[c] * dA + b_c * dt_x
                 state[c] = s_c
                 y_acc += s_c * c_c
         else:
             comptime for c in range(NCHUNK):
-                var b_c = SIMD[DType.float32, VEC](0.0)
-                var c_c = SIMD[DType.float32, VEC](0.0)
+                var b_c = SIMD[.float32, VEC](0.0)
+                var c_c = SIMD[.float32, VEC](0.0)
                 loader.load_bc[c, False](B_base, C_base, b_c, c_c)
                 var s_c = state[c] * dA + b_c * dt_x
                 state[c] = s_c
@@ -1389,10 +1394,10 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_cpu[
     # ssm_pool: [max_slots, nheads, head_dim, dstate] fp32 — read for initial
     # state (when has_initial_state[b]) and written in-place at slot
     # cache_indices[b] (instead of a separate final_states output).
-    ssm_pool: TileTensor[mut=True, DType.float32, ...],
-    query_start_loc: TileTensor[mut=False, DType.int32, ...],
-    has_initial_state: TileTensor[mut=False, DType.bool, ...],
-    cache_indices: TileTensor[mut=False, DType.uint32, ...],
+    ssm_pool: TileTensor[mut=True, .float32, ...],
+    query_start_loc: TileTensor[mut=False, .int32, ...],
+    has_initial_state: TileTensor[mut=False, .bool, ...],
+    cache_indices: TileTensor[mut=False, .uint32, ...],
     x_strides: Strides3D,
     dt_strides: Strides2D,
     A_strides: Strides1D,
@@ -1464,8 +1469,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_cpu[
     var has_init_tensor = Int(has_initial_state.dim[0]()) > 0
     var dt_softplus_bool = Bool(Int(dt_softplus) != 0)
 
-    @__parameter
-    def worker(idx: Int):
+    def worker(idx: Int) {imm}:
         var b, remaining = divmod(idx, nheads * head_dim)
         var h, p = divmod(remaining, head_dim)
 
@@ -1488,16 +1492,16 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_cpu[
         if has_dt_bias:
             dt_bias_val = Scalar[kernel_dtype](
                 dt_bias.raw_load(UInt32(h * dt_bias_strides[0]))
-            ).cast[DType.float32]()
+            ).cast[.float32]()
 
         var D_val = Float32(0.0)
         if has_D:
             D_val = Scalar[kernel_dtype](
                 D.raw_load(UInt32(h * D_strides[0]))
-            ).cast[DType.float32]()
+            ).cast[.float32]()
 
         var slot = Int(cache_indices.raw_load(b))
-        var state = SIMD[DType.float32, MAX_DSTATE](0.0)
+        var state = SIMD[.float32, MAX_DSTATE](0.0)
         var use_initial = False
         if has_init_tensor:
             use_initial = Bool(has_initial_state.raw_load(b))
@@ -1521,11 +1525,11 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_cpu[
                         gt * x_strides[0] + h * x_strides[1] + p * x_strides[2]
                     )
                 )
-            ).cast[DType.float32]()
+            ).cast[.float32]()
 
             var dt_val = Scalar[kernel_dtype](
                 dt.raw_load(UInt32(gt * dt_strides[0] + h * dt_strides[1]))
-            ).cast[DType.float32]()
+            ).cast[.float32]()
             if has_dt_bias:
                 dt_val += dt_bias_val
             if dt_softplus_bool:
@@ -1534,8 +1538,8 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_cpu[
             var dA = exp2(A_val * dt_val)
             var dt_x = dt_val * x_val
 
-            var B_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
-            var C_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
+            var B_vals = SIMD[.float32, MAX_DSTATE](0.0)
+            var C_vals = SIMD[.float32, MAX_DSTATE](0.0)
             comptime for n in range(DSTATE):
                 B_vals[n] = Scalar[kernel_dtype](
                     B.raw_load(
@@ -1545,7 +1549,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_cpu[
                             + n * B_strides[2]
                         )
                     )
-                ).cast[DType.float32]()
+                ).cast[.float32]()
                 C_vals[n] = Scalar[kernel_dtype](
                     C.raw_load(
                         UInt32(
@@ -1554,7 +1558,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_cpu[
                             + n * C_strides[2]
                         )
                     )
-                ).cast[DType.float32]()
+                ).cast[.float32]()
 
             state = state * dA + B_vals * dt_x
 
@@ -1577,7 +1581,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_inplace_cpu[
             )
             ssm_pool.raw_store(off, state[n])
 
-    sync_parallelize[worker](batch * nheads * head_dim, ctx)
+    sync_parallelize(worker, batch * nheads * head_dim, ctx)
 
 
 def mamba2_ssd_chunk_scan_varlen_fwd_cpu[
@@ -1597,11 +1601,11 @@ def mamba2_ssd_chunk_scan_varlen_fwd_cpu[
     C: TileTensor[mut=False, kernel_dtype, ...],
     D: TileTensor[mut=False, kernel_dtype, ...],
     dt_bias: TileTensor[mut=False, kernel_dtype, ...],
-    initial_states: TileTensor[mut=False, DType.float32, ...],
+    initial_states: TileTensor[mut=False, .float32, ...],
     y: TileTensor[mut=True, kernel_dtype, ...],
-    final_states: TileTensor[mut=True, DType.float32, ...],
-    query_start_loc: TileTensor[mut=False, DType.int32, ...],
-    has_initial_state: TileTensor[mut=False, DType.bool, ...],
+    final_states: TileTensor[mut=True, .float32, ...],
+    query_start_loc: TileTensor[mut=False, .int32, ...],
+    has_initial_state: TileTensor[mut=False, .bool, ...],
     x_strides: Strides3D,
     dt_strides: Strides2D,
     A_strides: Strides1D,
@@ -1624,8 +1628,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_cpu[
     var has_init_tensor = Int(has_initial_state.dim[0]()) > 0
     var dt_softplus_bool = Bool(Int(dt_softplus) != 0)
 
-    @__parameter
-    def worker(idx: Int):
+    def worker(idx: Int) {imm}:
         var b, remaining = divmod(idx, nheads * head_dim)
         var h, p = divmod(remaining, head_dim)
 
@@ -1648,15 +1651,15 @@ def mamba2_ssd_chunk_scan_varlen_fwd_cpu[
         if has_dt_bias:
             dt_bias_val = Scalar[kernel_dtype](
                 dt_bias.raw_load(UInt32(h * dt_bias_strides[0]))
-            ).cast[DType.float32]()
+            ).cast[.float32]()
 
         var D_val = Float32(0.0)
         if has_D:
             D_val = Scalar[kernel_dtype](
                 D.raw_load(UInt32(h * D_strides[0]))
-            ).cast[DType.float32]()
+            ).cast[.float32]()
 
-        var state = SIMD[DType.float32, MAX_DSTATE](0.0)
+        var state = SIMD[.float32, MAX_DSTATE](0.0)
         var use_initial = False
         if has_init_tensor:
             use_initial = Bool(has_initial_state.raw_load(b))
@@ -1679,11 +1682,11 @@ def mamba2_ssd_chunk_scan_varlen_fwd_cpu[
                         gt * x_strides[0] + h * x_strides[1] + p * x_strides[2]
                     )
                 )
-            ).cast[DType.float32]()
+            ).cast[.float32]()
 
             var dt_val = Scalar[kernel_dtype](
                 dt.raw_load(UInt32(gt * dt_strides[0] + h * dt_strides[1]))
-            ).cast[DType.float32]()
+            ).cast[.float32]()
             if has_dt_bias:
                 dt_val += dt_bias_val
             if dt_softplus_bool:
@@ -1692,8 +1695,8 @@ def mamba2_ssd_chunk_scan_varlen_fwd_cpu[
             var dA = exp2(A_val * dt_val)
             var dt_x = dt_val * x_val
 
-            var B_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
-            var C_vals = SIMD[DType.float32, MAX_DSTATE](0.0)
+            var B_vals = SIMD[.float32, MAX_DSTATE](0.0)
+            var C_vals = SIMD[.float32, MAX_DSTATE](0.0)
             comptime for n in range(DSTATE):
                 B_vals[n] = Scalar[kernel_dtype](
                     B.raw_load(
@@ -1703,7 +1706,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_cpu[
                             + n * B_strides[2]
                         )
                     )
-                ).cast[DType.float32]()
+                ).cast[.float32]()
                 C_vals[n] = Scalar[kernel_dtype](
                     C.raw_load(
                         UInt32(
@@ -1712,7 +1715,7 @@ def mamba2_ssd_chunk_scan_varlen_fwd_cpu[
                             + n * C_strides[2]
                         )
                     )
-                ).cast[DType.float32]()
+                ).cast[.float32]()
 
             state = state * dA + B_vals * dt_x
 
@@ -1734,4 +1737,4 @@ def mamba2_ssd_chunk_scan_varlen_fwd_cpu[
             )
             final_states.raw_store(off, state[n])
 
-    sync_parallelize[worker](batch * nheads * head_dim, ctx)
+    sync_parallelize(worker, batch * nheads * head_dim, ctx)

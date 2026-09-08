@@ -35,13 +35,13 @@ Example:
     x = Tensor.ones((4, 8))
     y = F.matmul(x, x.T)
 
-.. warning::
+.. caution::
 
     Experimental. The public API is not stable; names and module structure
     may change.
 """
 
-from . import functional, random, tensor
+from . import functional, random, tensor, tree_utils
 from .tensor import Tensor
 
-__all__ = ["Tensor", "functional", "random", "tensor"]
+__all__ = ["Tensor", "functional", "random", "tensor", "tree_utils"]
