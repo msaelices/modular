@@ -13,17 +13,16 @@
 """Correction warp group logic for FA4 (SM100 Flash Attention)."""
 
 from std.sys import size_of
-from std.gpu import thread_idx
-from std.gpu.primitives.id import cluster_dim
-from std.gpu.globals import WARPGROUP_SIZE
-from std.gpu.compute.arch.tcgen05 import (
+from max.gpu import thread_idx
+from max.gpu.globals import WARPGROUP_SIZE
+from max.gpu.compute.arch.tcgen05 import (
     tcgen05_ld,
     tcgen05_st,
     tcgen05_store_wait,
     tcgen05_fence_before,
 )
-from std.gpu.primitives.warp import _vote_nvidia_helper
-from std.gpu.sync import umma_arrive_leader_cta
+from max.gpu.primitives.warp import _vote_nvidia_helper
+from max.gpu.sync import umma_arrive_leader_cta
 from linalg.matmul.gpu.sm100_structured.structured_kernels.tmem import (
     TmemAddress,
 )
@@ -32,6 +31,7 @@ from nn.attention.gpu.nvidia.sm100.attention_utils import (
     mul_ftz,
     splitk_window,
     splitk_partition_idx,
+    splitk_num_partitions,
 )
 from nn.attention.mha_mask import MHAMask
 from .smem import SM100AttentionSMem
@@ -40,14 +40,18 @@ from .smem import SM100AttentionSMem
 @always_inline
 def fa4_correction[
     qkv_dtype: DType,
-    rope_dtype: DType,
-    scale_dtype: DType,
+    rope_dtype_: Optional[DType],
+    scale_dtype_: Optional[DType],
     MaskType: MHAMask,
     //,
     config: FA4Config[
-        qkv_dtype, rope_dtype=rope_dtype, scale_dtype=scale_dtype
+        qkv_dtype, rope_dtype_=rope_dtype_, scale_dtype_=scale_dtype_
     ],
     page_size: Int,
+    # Workspace (traditional/unfused) split-K: window the KV by a RUNTIME
+    # partition count even at `config.splitk_partitions == 1`. Defaulted so
+    # every non-workspace caller (incl. MLA) is byte-identical.
+    workspace_split: Bool = False,
 ](
     smem: SM100AttentionSMem[config],
     tmem_addr: UInt32,
@@ -55,6 +59,7 @@ def fa4_correction[
     score_row: UInt32,
     num_keys: UInt32,
     mask: MaskType,
+    ws_num_partitions: UInt32 = 1,
 ):
     comptime accum_type = DType.float32
     comptime assert size_of[accum_type]() == 4
@@ -74,32 +79,35 @@ def fa4_correction[
 
     # `tmem_addr` passed in by register (read once post-barrier in the kernel
     # prologue); do NOT re-read `smem.tmem_addr_ptr()` here.
-    o0_tmem = TmemAddress(tmem_addr + UInt32(config.TMEM_O0))
-    o1_tmem = TmemAddress(tmem_addr + UInt32(config.TMEM_O1))
+    var o0_tmem = TmemAddress(tmem_addr + UInt32(config.TMEM_O0))
+    var o1_tmem = TmemAddress(tmem_addr + UInt32(config.TMEM_O1))
     var correction_smem_arg = smem.correction_smem()
 
-    pipeline_c0 = mbars.consumer_c0()
-    pipeline_c1 = mbars.consumer_c1()
+    var pipeline_c0 = mbars.consumer_c0()
+    var pipeline_c1 = mbars.consumer_c1()
 
     comptime BM_mask: Int = config.PairBM_eff()
     comptime num_q: Int = config.num_q
 
     # Pure O-rescale arithmetic (online-softmax correction of a previously
     # accumulated O tile by `c`). Depends only on `o_tmem`, `c_pair` and
-    # comptime `config.ov_depth` — no pipeline / warp-group state — so it is
-    # shared verbatim by BOTH the single-O loop below and the two-WG
+    # comptime `config.correction_o_cols()` — no pipeline / warp-group state —
+    # so it is shared verbatim by BOTH the single-O loop below and the two-WG
     # `_correction_step` closure further down. `@always_inline` => inlining
     # it back into either caller reproduces the identical instruction stream
     # (2-O / DeepSeek / MHA codegen is unchanged).
-    @parameter
+    #
+    # Walks `correction_o_cols()` -- the PHYSICAL extent of one O accumulator,
+    # not the logical depth. See its docstring: under shared-key the logical
+    # depth runs 4x past the accumulator and silently corrupts.
+    @__parameter
     @always_inline
-    def _rescale_o(o_tmem: TmemAddress, c_pair: SIMD[DType.float32, 2]):
-        comptime batch_size = 16 if config.ov_depth % 16 == 0 else 8
-        comptime assert config.ov_depth % batch_size == 0
+    def _rescale_o(o_tmem: TmemAddress, c_pair: SIMD[.float32, 2]):
+        comptime o_cols = config.correction_o_cols()
+        comptime batch_size = 16 if o_cols % 16 == 0 else 8
+        comptime assert o_cols % batch_size == 0
         # output is BM x depth
-        comptime load_iters, load_remainder = divmod(
-            config.ov_depth, 2 * batch_size
-        )
+        comptime load_iters, load_remainder = divmod(o_cols, 2 * batch_size)
         comptime assert load_iters > 1
         comptime assert (load_remainder == batch_size) or (load_remainder == 0)
 
@@ -124,13 +132,13 @@ def fa4_correction[
                 pack=False,
                 width=batch_size,
             ]((o_tmem + b1_offset).addr)
-            var o_b0_scaled = InlineArray[Scalar[accum_type], batch_size](
+            var o_b0_scaled = Array[Scalar[accum_type], batch_size](
                 uninitialized=True
             )
 
             comptime for _i in range(0, batch_size, 2):
                 var pair = mul_ftz(
-                    SIMD[DType.float32, 2](o_b0[_i], o_b0[_i + 1]),
+                    SIMD[.float32, 2](o_b0[_i], o_b0[_i + 1]),
                     c_pair,
                 )
                 o_b0_scaled[_i] = pair[0]
@@ -139,7 +147,7 @@ def fa4_correction[
                 (o_tmem + b0_offset0).addr, o_b0_scaled
             )
 
-            comptime if b0_offset1 + batch_size <= config.ov_depth:
+            comptime if b0_offset1 + batch_size <= o_cols:
                 o_b0 = tcgen05_ld[
                     datapaths=32,
                     bits=32,
@@ -148,13 +156,13 @@ def fa4_correction[
                     pack=False,
                     width=batch_size,
                 ]((o_tmem + b0_offset1).addr)
-            var o_b1_scaled = InlineArray[Scalar[accum_type], batch_size](
+            var o_b1_scaled = Array[Scalar[accum_type], batch_size](
                 uninitialized=True
             )
 
             comptime for _i in range(0, batch_size, 2):
                 var pair = mul_ftz(
-                    SIMD[DType.float32, 2](o_b1[_i], o_b1[_i + 1]),
+                    SIMD[.float32, 2](o_b1[_i], o_b1[_i + 1]),
                     c_pair,
                 )
                 o_b1_scaled[_i] = pair[0]
@@ -165,13 +173,13 @@ def fa4_correction[
 
         comptime if load_remainder > 0:
             comptime offset = 2 * batch_size * load_iters
-            var o_b0_scaled_rem = InlineArray[
-                Scalar[accum_type], load_remainder
-            ](uninitialized=True)
+            var o_b0_scaled_rem = Array[Scalar[accum_type], load_remainder](
+                uninitialized=True
+            )
 
             comptime for _i in range(0, load_remainder, 2):
                 var pair = mul_ftz(
-                    SIMD[DType.float32, 2](o_b0[_i], o_b0[_i + 1]),
+                    SIMD[.float32, 2](o_b0[_i], o_b0[_i + 1]),
                     c_pair,
                 )
                 o_b0_scaled_rem[_i] = pair[0]
@@ -184,6 +192,8 @@ def fa4_correction[
             ]((o_tmem + offset).addr, o_b0_scaled_rem)
         tcgen05_store_wait()
         tcgen05_fence_before()
+
+    var change: Bool
 
     # ---- single-O correction (1Q wide-V) ----
     # Wide V forces single-O (aliased O0), so only WG0 runs: it folds EVERY
@@ -218,16 +228,14 @@ def fa4_correction[
             change = _vote_nvidia_helper(c_scalar < 1.0) != 0
             pipeline_o_so.wait()
             if change:
-                _rescale_o(
-                    o0_tmem_so, SIMD[DType.float32, 2](c_scalar, c_scalar)
-                )
+                _rescale_o(o0_tmem_so, SIMD[.float32, 2](c_scalar, c_scalar))
 
             pipeline_o_so.release()
             pipeline_c0_so.release()
         return
 
     # Two-WG (2Q and standard 1Q) O consumer — unchanged.
-    pipeline_o = mbars.consumer_o()
+    var pipeline_o = mbars.consumer_o()
 
     # Per-WG main-loop commit counts (= softmax's main-loop iters after
     # peel, = MMA's post-peel P@V commits per side).
@@ -242,8 +250,10 @@ def fa4_correction[
     # Split-K (1Q): slice the combined tile count to this partition's window
     # before the per-WG c0/c1 split. Identical window to the other warps
     # (total_iters == last_masked_set_end for check_mask==False masks).
-    comptime if config.num_q == 1 and config.splitk_partitions > 1:
-        var _np: UInt32 = UInt32(cluster_dim.x)
+    comptime if config.num_q == 1 and (
+        config.splitk_partitions > 1 or workspace_split
+    ):
+        var _np = splitk_num_partitions[config](ws_num_partitions)
         var _w = splitk_window(
             total_iters_runtime,
             _np,
@@ -257,6 +267,11 @@ def fa4_correction[
         # softmax stages a neutral identity; terminal `cluster_sync()` still runs.
         if total_iters_runtime == 0:
             return
+    # All-masked row (valid_length 0): total_iters == 0, so `c0_iters` underflows
+    # and this warp waits on a tile the producer never posts. Split-K is guarded
+    # above; guard the non-split path here.
+    if total_iters_runtime == 0:
+        return
     var c0_iters: UInt32
     var c1_iters: UInt32
     comptime if num_q == 1:
@@ -280,7 +295,7 @@ def fa4_correction[
     # of the main loop (i=0 then i=1) for the WG0+WG1-paired tail, and
     # once more after the main loop for any extra c0-only iter (1Q
     # odd-T case where WG0 has one more main-loop commit than WG1).
-    @parameter
+    @__parameter
     @always_inline
     def _correction_step[i: Int]():
         # correct
@@ -303,7 +318,7 @@ def fa4_correction[
             else:
                 o_tmem = o1_tmem
 
-            _rescale_o(o_tmem, SIMD[DType.float32, 2](c_scalar, c_scalar))
+            _rescale_o(o_tmem, SIMD[.float32, 2](c_scalar, c_scalar))
 
         comptime if config.pair_cta:
             umma_arrive_leader_cta(pipeline_o.consumer_mbar())

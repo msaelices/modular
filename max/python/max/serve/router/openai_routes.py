@@ -36,10 +36,12 @@ from typing import (
     overload,
 )
 
+import numpy as np
+import numpy.typing as npt
+import opentelemetry.trace as otel_trace
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from jinja2.exceptions import UndefinedError
-from llguidance import LLMatcher
 from max.pipelines.context import (
     GenerationStatus,
     SamplingParams,
@@ -47,10 +49,8 @@ from max.pipelines.context import (
     TextGenerationResponseFormat,
 )
 from max.pipelines.context.exceptions import InputError
+from max.pipelines.context.outputs import GenerationOutput
 from max.pipelines.lib import PipelineConfig
-from max.pipelines.lib.pipeline_variants.structured_output_backend import (
-    GrammarValidator,
-)
 from max.pipelines.lib.tool_parsing import create as create_tool_parser
 from max.pipelines.lib.tool_parsing import (
     maybe_name_from_tool,
@@ -61,8 +61,11 @@ from max.pipelines.lora import LoRAOperation, LoRARequest, LoRAStatus
 from max.pipelines.modeling.types import (
     ImageContentPart,
     MessageContent,
+    OpenResponsesRequest,
     ParsedToolCallDelta,
     ParsedToolResponse,
+    PipelineOutput,
+    PipelineTask,
     PipelineTokenizer,
     RequestID,
     TextContentPart,
@@ -72,8 +75,11 @@ from max.pipelines.modeling.types import (
     TextGenerationRequestTool,
     VideoContentPart,
 )
+from max.pipelines.request import OpenResponsesRequestBody
+from max.pipelines.request.open_responses import OutputAudioContent
 from max.profiler import Tracer, traced
 from max.serve.config import Settings
+from max.serve.media import WAV_MEDIA_TYPE, encode_wav_bytes
 from max.serve.parser import (
     LlamaToolParser,
     ToolParser,
@@ -84,7 +90,11 @@ from max.serve.parser.tool_call_normalization import (
     _normalize_tools_parameters,
     normalize_response_format_schema,
 )
-from max.serve.parser.tool_call_validation import check_tool_call_conformance
+from max.serve.parser.tool_call_validation import (
+    check_response_format_conformance,
+    check_tool_call_conformance,
+)
+from max.serve.pipelines.general_handler import GeneralPipelineHandler
 from max.serve.pipelines.llm import (
     TokenGeneratorOutput,
     TokenGeneratorPipeline,
@@ -115,6 +125,7 @@ from max.serve.schemas.openai import (
     CreateCompletionResponse,
     CreateEmbeddingRequest,
     CreateEmbeddingResponse,
+    CreateSpeechRequest,
     Embedding,
     Error,
     ErrorResponse,
@@ -127,8 +138,10 @@ from max.serve.schemas.openai import (
     TopLogprob,
     UnloadLoraRequest,
 )
+from max.serve.telemetry.common import request_trace_ctx
 from max.serve.telemetry.metrics import METRICS
 from max.serve.telemetry.stopwatch import StopWatch
+from max.serve.worker_interface import RequestQueueFull
 from openai.types.chat.chat_completion_chunk import (
     ChoiceDeltaToolCall,
     ChoiceDeltaToolCallFunction,
@@ -146,6 +159,7 @@ from openai.types.chat.chat_completion_stream_options_param import (
     ChatCompletionStreamOptionsParam,
 )
 from openai.types.create_embedding_response import Usage as EmbeddingUsage
+from opentelemetry import propagate as otel_propagate
 from PIL import Image
 from pydantic import BaseModel, Field, ValidationError
 from sse_starlette.sse import EventSourceResponse
@@ -153,10 +167,78 @@ from starlette.datastructures import State
 
 _T = TypeVar("_T")
 
+
+async def _start_stream(
+    stream: AsyncGenerator[_T, None],
+) -> tuple[JSONResponse | None, AsyncGenerator[_T, None]]:
+    """Resolves the first chunk before the caller starts the SSE response.
+
+    A request rejected after admission (an uncompilable grammar) is reported
+    by the generator yielding a ``JSONResponse``, which the caller can return
+    as the HTTP status instead of emitting inside an already-200 stream.
+
+    Returns that error response, if the stream opened with one, and a stream
+    that replays the chunk this consumed.
+    """
+    iterator = stream.__aiter__()
+    try:
+        first = await iterator.__anext__()
+    except StopAsyncIteration:
+
+        async def empty() -> AsyncGenerator[_T, None]:
+            return
+            yield  # unreachable; makes this an async generator
+
+        return None, empty()
+
+    async def chained() -> AsyncGenerator[_T, None]:
+        yield first
+        async for item in iterator:
+            yield item
+
+    if isinstance(first, JSONResponse):
+        return first, chained()
+    return None, chained()
+
+
 router = APIRouter(prefix="/v1")
 logger = logging.getLogger("max.serve")
+_tracer = otel_trace.get_tracer("max.serve")
 
-_CLIENT_DISCONNECTED_STATUS_CODE = 499
+
+def _batch_id(
+    chunks: Sequence[TokenGeneratorOutput], *, last: bool = False
+) -> int | None:
+    """Return the first -- or with ``last``, the last -- non-None batch_id.
+
+    Scans from whichever end is being asked for so ``next`` short-circuits on
+    the first hit, rather than walking every chunk of a long generation.
+    """
+    return next(
+        (
+            c.batch_id
+            for c in (reversed(chunks) if last else chunks)
+            if c.batch_id is not None
+        ),
+        None,
+    )
+
+
+def _set_batch_id_attributes(
+    span: otel_trace.Span, chunks: Sequence[TokenGeneratorOutput]
+) -> None:
+    """Tag ``span`` with the batch ids bounding ``chunks``, when known.
+
+    Only for handlers that retain the whole chunk list; the streaming
+    handlers track the two ids as they go rather than holding every chunk.
+    """
+    first_id = _batch_id(chunks)
+    last_id = _batch_id(chunks, last=True)
+    if first_id is not None:
+        span.set_attribute("max.first_batch_id", first_id)
+    if last_id is not None:
+        span.set_attribute("max.last_batch_id", last_id)
+
 
 # Default tool-name charset (OpenAI's); a parser may widen it via VALID_TOOL_NAME_RE.
 _DEFAULT_VALID_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -235,10 +317,6 @@ def _merge_tool_call_deltas(
         if delta.arguments is not None:
             acc.arguments.append(delta.arguments)
     return [acc.to_chunk() for acc in merged.values()]
-
-
-class _ClientDisconnectedError(RuntimeError):
-    """Raised when a non-streaming request disconnects before completion."""
 
 
 def record_request_start() -> None:
@@ -369,6 +447,62 @@ def get_pipeline(request: Request, model_name: str) -> TokenGeneratorPipeline:
     return pipeline
 
 
+def _get_audio_handler(
+    request: Request, model_name: str
+) -> GeneralPipelineHandler:
+    """Returns the handler serving audio generation, or refuses the request.
+
+    The audio routes share ``app.state.handler`` with the OpenResponses API,
+    which every task populates -- so the served task, not the handler's
+    presence, is what says whether this endpoint means anything here.
+
+    Raises:
+        HTTPException: 404 if the served model is not an audio model.
+        ValueError: If ``model_name`` names a model this server is not serving.
+    """
+    app_state: State = request.app.state
+    if getattr(app_state, "task", None) != PipelineTask.AUDIO_GENERATION:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "This server is not serving an audio generation model, so "
+                "/v1/audio/speech is unavailable."
+            ),
+        )
+
+    handler: GeneralPipelineHandler = app_state.handler
+    if model_name and model_name != handler.model_name:
+        raise ValueError(
+            f"Unknown model '{model_name}', currently serving "
+            f"'{handler.model_name}'."
+        )
+    return handler
+
+
+def _content_before_tool_call_marker(parser: ToolParser, response: str) -> str:
+    """Truncates ``response`` at the parser's first structural tool-call marker.
+
+    Used when ``parse_complete`` raises with a marker present — e.g. a
+    ``max_tokens`` truncation landing mid tool-call block, so the marker was
+    emitted but no complete block exists. Surfacing the raw response would
+    leak the literal marker into ``message.content``; instead return only the
+    content before the first marker. Structural parsers expose their markers
+    as ``SECTION_BEGIN``/``CALL_BEGIN`` class attributes; for parsers without
+    them (e.g. the JSON-based Llama parser), or when no marker is present
+    (a genuinely unexpected parser error), the response is returned unchanged.
+    """
+    cut = len(response)
+    for attr in ("SECTION_BEGIN", "CALL_BEGIN"):
+        marker = getattr(parser, attr, "")
+        if isinstance(marker, str) and marker:
+            idx = response.find(marker)
+            if idx != -1:
+                cut = min(cut, idx)
+    if cut == len(response):
+        return response
+    return response[:cut].rstrip()
+
+
 @dataclass
 class OpenAIChatResponseGenerator(
     OpenAIResponseGenerator[CreateChatCompletionResponse]
@@ -382,6 +516,7 @@ class OpenAIChatResponseGenerator(
         tools: list[TextGenerationRequestTool] | None = None,
         fold_reasoning_into_content: bool = False,
         emit_reasoning_content: bool = False,
+        response_format_json_schema: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(pipeline)
         self.stream_options = stream_options
@@ -403,18 +538,28 @@ class OpenAIChatResponseGenerator(
         # schema-conformance logging (see tool_call_validation). The raw
         # client schema is kept so it matches what callers validate against.
         self._tool_schemas: dict[str, dict[str, Any]] = {}
+        # Every declared tool name, including parameter-less tools that have no
+        # schema. The conformance check uses this to tell a legitimate call to a
+        # schemaless tool apart from a hallucinated (unknown) tool.
+        self._tool_names: set[str] = set()
         for t in tools or []:
             name = maybe_name_from_tool(t)
+            if not name:
+                continue
+            self._tool_names.add(name)
             fn = t.get("function")
-            if (
-                name
-                and isinstance(fn, dict)
-                and isinstance(fn.get("parameters"), dict)
-            ):
+            if isinstance(fn, dict) and isinstance(fn.get("parameters"), dict):
                 self._tool_schemas[name] = fn["parameters"]
         # Per-call streaming accumulators for end-of-stream conformance check.
         self._stream_tool_names: dict[int, str] = {}
         self._stream_tool_args: dict[int, list[str]] = {}
+        # Schema behind response_format json_schema/json_object, used only for
+        # observability-only conformance logging of the final content (the
+        # response_format counterpart of _tool_schemas). Captured before any
+        # combined tools+response_format grammar rewrite discards it.
+        self._response_format_json_schema = response_format_json_schema
+        # Pre-<think>-fold content accumulator for the end-of-stream check.
+        self._stream_response_content: list[str] = []
 
     def _log_tool_call_conformance(
         self,
@@ -422,18 +567,57 @@ class OpenAIChatResponseGenerator(
         request_id: str,
         is_streaming: bool,
     ) -> None:
-        results = check_tool_call_conformance(calls, self._tool_schemas)
+        results = check_tool_call_conformance(
+            calls, self._tool_schemas, self._tool_names
+        )
         for result in results:
             if result.outcome == "valid":
                 continue
+            # Count by the bounded outcome only; the function name and failing
+            # JSON paths stay in the log line to keep label cardinality bounded.
+            METRICS.tool_call_conformance_error(result.outcome)
             logger.warning(
-                "tool_call_conformance req=%s stream=%s fn=%s outcome=%s errors=%s",
+                "tool_call_conformance req=%s stream=%s fn=%s outcome=%s "
+                "errors=%s additional=%d",
                 request_id,
                 is_streaming,
                 result.function,
                 result.outcome,
                 ",".join(result.errors) if result.errors else "-",
+                result.additional_error_count,
             )
+
+    def _log_response_format_conformance(
+        self,
+        content: str,
+        request_id: str,
+        is_streaming: bool,
+        finish_reason: str | None,
+    ) -> None:
+        """Checks final content against the response_format schema.
+
+        Observability-only: never mutates the response and never raises into
+        the request path. Only the failing validator keywords and JSON paths
+        are logged, never content values."""
+        assert self._response_format_json_schema is not None
+        result = check_response_format_conformance(
+            content, self._response_format_json_schema
+        )
+        if result.outcome == "valid":
+            return
+        # Count by the bounded outcome only; the failing JSON paths and
+        # finish_reason stay in the log line to keep label cardinality bounded.
+        METRICS.response_format_conformance_error(result.outcome)
+        logger.warning(
+            "response_format_conformance req=%s stream=%s outcome=%s "
+            "finish_reason=%s errors=%s additional=%d",
+            request_id,
+            is_streaming,
+            result.outcome,
+            finish_reason,
+            ",".join(result.errors) if result.errors else "-",
+            result.additional_error_count,
+        )
 
     def _fold_reasoning_delta(
         self, reasoning_text: str | None, content_text: str | None
@@ -485,6 +669,14 @@ class OpenAIChatResponseGenerator(
     ) -> AsyncGenerator[str | JSONResponse, None]:
         self.logger.debug("Streaming: Start: %s", request)
         record_request_start()
+        request_span = _tracer.start_span(
+            "max.request",
+            context=request_trace_ctx.get(),
+            attributes={
+                "gen_ai.request.model": request.model_name,
+                "max.request_id": str(request.request_id),
+            },
+        )
         request_timer = StopWatch(start_ns=request.timestamp_ns)
         n_reasoning_tokens = 0
         n_tokens = 0
@@ -492,6 +684,8 @@ class OpenAIChatResponseGenerator(
         n_cached_prompt_tokens = 0
         status_code = 200
         has_emitted_tool_calls = False
+        final_finish_reason: str | None = None
+        self._stream_response_content.clear()
 
         # Reset parser state for new streaming session
         if self.parse_tool_calls:
@@ -509,8 +703,18 @@ class OpenAIChatResponseGenerator(
         self._think_opened = False
         self._think_closed = False
 
+        _first_batch_id: int | None = None
+        _last_batch_id: int | None = None
+        # Until a payload is emitted the response is not yet a 200, so a
+        # failure can still be answered with a real HTTP status.
+        emitted = False
+
         try:
             async for chunk in token_generator:
+                if chunk.batch_id is not None:
+                    if _first_batch_id is None:
+                        _first_batch_id = chunk.batch_id
+                    _last_batch_id = chunk.batch_id
                 self.logger.debug(
                     "Streaming: %s, TOKENS: %d, %s%s",
                     request.request_id,
@@ -614,6 +818,13 @@ class OpenAIChatResponseGenerator(
                     elif tool_call_chunks:
                         content = None
 
+                    # Accumulate pre-fold content for the end-of-stream
+                    # response_format conformance check, matching the
+                    # non-streaming path, which validates the message before
+                    # any <think> fold.
+                    if content and self._response_format_json_schema:
+                        self._stream_response_content.append(content)
+
                     # MiniMax ``reasoning_split=False``: fold reasoning into the
                     # content stream wrapped in ``<think>...</think>`` and drop
                     # the dedicated reasoning field. Tool-call deltas are left
@@ -631,6 +842,8 @@ class OpenAIChatResponseGenerator(
                         allow_none=True,
                         has_tool_calls=has_emitted_tool_calls,
                     )
+                    if finish_reason is not None:
+                        final_finish_reason = finish_reason
                     # While tokens are captured and hidden during tool-call
                     # generation, the resolved delta can be empty: the parser
                     # consumed the chunk (merged_stream_content is not None) but
@@ -649,23 +862,57 @@ class OpenAIChatResponseGenerator(
                         n_reasoning_tokens += chunk.reasoning_token_count or 0
                         n_tokens += chunk.token_count
                         continue
-                    reasoning_kwargs = {self._reasoning_field: reasoning}
-                    choices = [
-                        ChatCompletionStreamResponseChoice(
-                            index=0,
-                            delta=ChatCompletionStreamResponseDelta(
+                    # CENG-892: never emit reasoning and content in the same
+                    # delta, and emit content only after the reasoning
+                    # fragment. A boundary chunk can carry both a reasoning
+                    # tail and the first content tokens; some downstream
+                    # consumers can't parse a delta with both fields set, so
+                    # split it into an ordered reasoning-then-content pair.
+                    deltas: list[ChatCompletionStreamResponseDelta] = []
+                    if reasoning:
+                        # Pass the non-reasoning fields explicitly so the
+                        # dynamic reasoning-key unpacking type-checks: with
+                        # them fixed, mypy can only route the dict into
+                        # reasoning / reasoning_content (both str | None).
+                        deltas.append(
+                            ChatCompletionStreamResponseDelta(
+                                role="assistant",
+                                content=None,
+                                function_call=None,
+                                refusal=None,
+                                tool_calls=None,
+                                **{self._reasoning_field: reasoning},
+                            )
+                        )
+                    # Content (with any tool-call fragment) is emitted last so
+                    # a terminal finish_reason / logprobs ride the content
+                    # delta. Emit it even when empty if there was no reasoning
+                    # delta, so a bare finish_reason chunk is still produced.
+                    if content or tool_call_chunks or not deltas:
+                        deltas.append(
+                            ChatCompletionStreamResponseDelta(
                                 content=content,
                                 function_call=None,
                                 role="assistant",
                                 refusal=None,
-                                tool_calls=tool_call_chunks
-                                if tool_call_chunks
-                                else None,
-                                **reasoning_kwargs,
-                            ),
-                            logprobs=logprobs_response,
-                            finish_reason=finish_reason,
+                                tool_calls=tool_call_chunks or None,
+                            )
                         )
+                    # finish_reason and logprobs belong on the final delta
+                    # only; the earlier reasoning delta is non-terminal.
+                    last_idx = len(deltas) - 1
+                    choices = [
+                        ChatCompletionStreamResponseChoice(
+                            index=0,
+                            delta=delta,
+                            logprobs=logprobs_response
+                            if i == last_idx
+                            else None,
+                            finish_reason=finish_reason
+                            if i == last_idx
+                            else None,
+                        )
+                        for i, delta in enumerate(deltas)
                     ]
                 elif chunk.status.is_done:
                     # Terminal chunk with no visible delta — emit the final
@@ -675,6 +922,7 @@ class OpenAIChatResponseGenerator(
                         allow_none=False,
                         has_tool_calls=has_emitted_tool_calls,
                     )
+                    final_finish_reason = finish_reason
 
                     choices = [
                         ChatCompletionStreamResponseChoice(
@@ -697,29 +945,35 @@ class OpenAIChatResponseGenerator(
                     n_tokens += chunk.token_count
                     continue
 
-                # Each chunk is expected to have the same id
-                # https://platform.openai.com/docs/api-reference/chat/streaming
-                # Don't include usage in regular chunks when streaming
-                # https://platform.openai.com/docs/api-reference/chat/create#chat_create-stream_options
-                response = CreateChatCompletionStreamResponse(
-                    id=str(request.request_id),
-                    choices=choices,
-                    created=int(datetime.now().timestamp()),
-                    model=request.model_name,
-                    object="chat.completion.chunk",
-                    system_fingerprint=None,
-                    usage=None,
-                    service_tier=None,
-                )
                 n_reasoning_tokens += chunk.reasoning_token_count or 0
                 n_tokens += chunk.token_count
-                # Omit unset (None) fields so each delta carries only what
-                # changed, matching the OpenAI streaming spec. Without this a
-                # delta serializes tool_calls/function_call/refusal as null on
-                # every chunk, so a client reading the first tool_calls-bearing
-                # delta sees null instead of the real tool-call fragment.
-                payload = response.model_dump_json(exclude_none=True)
-                yield payload
+                # A boundary chunk yields an ordered reasoning-then-content
+                # pair (see CENG-892 above); every other case yields one
+                # choice. Emit each as its own SSE chunk so a single delta
+                # never carries both reasoning and content.
+                for choice in choices:
+                    # Each chunk is expected to have the same id
+                    # https://platform.openai.com/docs/api-reference/chat/streaming
+                    # Don't include usage in regular chunks when streaming
+                    # https://platform.openai.com/docs/api-reference/chat/create#chat_create-stream_options
+                    response = CreateChatCompletionStreamResponse(
+                        id=str(request.request_id),
+                        choices=[choice],
+                        created=int(datetime.now().timestamp()),
+                        model=request.model_name,
+                        object="chat.completion.chunk",
+                        system_fingerprint=None,
+                        usage=None,
+                        service_tier=None,
+                    )
+                    # Omit unset (None) fields so each delta carries only what
+                    # changed, matching the OpenAI streaming spec. Without this
+                    # a delta serializes tool_calls/function_call/refusal as
+                    # null on every chunk, so a client reading the first
+                    # tool_calls-bearing delta sees null instead of the real
+                    # tool-call fragment.
+                    emitted = True
+                    yield response.model_dump_json(exclude_none=True)
 
             # TODO: (MODELS-1117) determine whether to break out reasoning tokens into a separate metric
             logger.debug(
@@ -727,6 +981,18 @@ class OpenAIChatResponseGenerator(
                 request,
                 n_reasoning_tokens + n_tokens,
             )
+
+            # End-of-stream response_format conformance check. Skipped when
+            # the model emitted tool calls: a combined tools+response_format
+            # grammar is single-shot (one tool section OR one schema JSON), so
+            # tool-call output owes nothing to the response_format schema.
+            if self._response_format_json_schema and not has_emitted_tool_calls:
+                self._log_response_format_conformance(
+                    "".join(self._stream_response_content),
+                    request_id=str(request.request_id),
+                    is_streaming=True,
+                    finish_reason=final_finish_reason,
+                )
 
             # If `include_usage=True`, send a final chunk with usage statistics
             if self.stream_options and self.stream_options.get("include_usage"):
@@ -754,12 +1020,12 @@ class OpenAIChatResponseGenerator(
                     usage=final_usage,
                     service_tier=None,
                 )
+                emitted = True
                 yield final_response.model_dump_json()
 
+            emitted = True
             yield "[DONE]"
         except Exception as e:
-            # Note that for SSE, the server will have already responded with a
-            # 200 when establishing the connection.
             if isinstance(e, InputError):
                 status_code = 400
                 logger.warning(
@@ -779,8 +1045,31 @@ class OpenAIChatResponseGenerator(
                     code=str(status_code), message=str(e), param="", type=""
                 )
             )
-            yield error_response.model_dump_json()
+            if emitted:
+                yield error_response.model_dump_json()
+            else:
+                yield JSONResponse(
+                    status_code=status_code,
+                    content=error_response.model_dump(),
+                )
         finally:
+            request_span.set_attribute(
+                "gen_ai.usage.output_tokens", n_reasoning_tokens + n_tokens
+            )
+            request_span.set_attribute(
+                "gen_ai.usage.input_tokens", n_prompt_tokens
+            )
+            if final_finish_reason is not None:
+                request_span.set_attribute(
+                    "gen_ai.response.finish_reasons", [final_finish_reason]
+                )
+            if _first_batch_id is not None:
+                request_span.set_attribute(
+                    "max.first_batch_id", _first_batch_id
+                )
+            if _last_batch_id is not None:
+                request_span.set_attribute("max.last_batch_id", _last_batch_id)
+            request_span.end()
             record_request_end(
                 request.request_path,
                 request_timer.elapsed_ms,
@@ -798,11 +1087,20 @@ class OpenAIChatResponseGenerator(
             )
         request = requests[0]
         record_request_start()
+        request_span = _tracer.start_span(
+            "max.request",
+            context=request_trace_ctx.get(),
+            attributes={
+                "gen_ai.request.model": request.model_name,
+                "max.request_id": str(request.request_id),
+            },
+        )
         n_reasoning_tokens = 0
         n_tokens = 0
         n_prompt_tokens = 0
         n_cached_prompt_tokens = 0
         request_timer = StopWatch(start_ns=request.timestamp_ns)
+        completed_outputs: list[TokenGeneratorOutput] = []
 
         try:
             completed_outputs = await self.pipeline.all_tokens(request)
@@ -916,10 +1214,27 @@ class OpenAIChatResponseGenerator(
                             parsed, logprobs=logprobs
                         )
                 except Exception as e:
-                    # If parser fails, handle as traditional text
+                    # If parser fails, handle as traditional text. Structural
+                    # parsers raise intentionally when a marker is present but
+                    # no complete block parses (e.g. max_tokens truncation
+                    # mid-block); don't leak the raw marker into content.
                     logging.warning(f"Parsing for tool use failed: {e}")
+                    response_message = _content_before_tool_call_marker(
+                        self.parser, response_message
+                    )
 
             if not response_choices:
+                # Text (non-tool-call) response: check final content against
+                # the response_format schema. Tool-call responses owe nothing
+                # to the schema -- a combined tools+response_format grammar is
+                # single-shot (one tool section OR one schema JSON).
+                if self._response_format_json_schema:
+                    self._log_response_format_conformance(
+                        response_message,
+                        request_id=str(request.request_id),
+                        is_streaming=False,
+                        finish_reason=finish_reason,
+                    )
                 self._handle_text_response(
                     response_message,
                     response_choices,
@@ -945,21 +1260,17 @@ class OpenAIChatResponseGenerator(
                             reasoning_message,
                         )
 
-            usage = None
-            if n_reasoning_tokens > 0 or n_tokens > 0:
-                usage = CompletionUsage(
-                    prompt_tokens=n_prompt_tokens,
-                    completion_tokens=n_reasoning_tokens + n_tokens,
-                    total_tokens=n_prompt_tokens
-                    + n_reasoning_tokens
-                    + n_tokens,
-                    prompt_tokens_details=PromptTokensDetails(
-                        cached_tokens=n_cached_prompt_tokens,
-                    ),
-                    completion_tokens_details=CompletionTokensDetails(
-                        reasoning_tokens=n_reasoning_tokens,
-                    ),
-                )
+            usage = CompletionUsage(
+                prompt_tokens=n_prompt_tokens,
+                completion_tokens=n_reasoning_tokens + n_tokens,
+                total_tokens=n_prompt_tokens + n_reasoning_tokens + n_tokens,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=n_cached_prompt_tokens,
+                ),
+                completion_tokens_details=CompletionTokensDetails(
+                    reasoning_tokens=n_reasoning_tokens,
+                ),
+            )
 
             response = CreateChatCompletionResponse(
                 id=str(request.request_id),
@@ -974,6 +1285,14 @@ class OpenAIChatResponseGenerator(
 
             return response
         finally:
+            request_span.set_attribute(
+                "gen_ai.usage.output_tokens", n_reasoning_tokens + n_tokens
+            )
+            request_span.set_attribute(
+                "gen_ai.usage.input_tokens", n_prompt_tokens
+            )
+            _set_batch_id_attributes(request_span, completed_outputs)
+            request_span.end()
             record_request_end(
                 request.request_path,
                 request_timer.elapsed_ms,
@@ -1080,6 +1399,14 @@ class OpenAIEmbeddingsResponseGenerator:
 
         record_request_start()
         metrics_req = requests[0]
+        request_span = _tracer.start_span(
+            "max.request",
+            context=request_trace_ctx.get(),
+            attributes={
+                "gen_ai.request.model": self.pipeline.model_name,
+                "max.request_id": str(metrics_req.request_id),
+            },
+        )
         request_timer = StopWatch(start_ns=metrics_req.timestamp_ns)
 
         try:
@@ -1107,6 +1434,7 @@ class OpenAIEmbeddingsResponseGenerator:
             )
             return response
         finally:
+            request_span.end()
             record_request_end(
                 metrics_req.request_path,
                 request_timer.elapsed_ms,
@@ -1358,10 +1686,14 @@ async def openai_parse_chat_completion_request(
                     else:
                         message_content.append(dict(content_part))
                 elif part_type == "text":
-                    if wrap_content:
-                        message_content.append(
-                            TextContentPart(text=content_part["text"])
+                    text = content_part.get("text")
+                    if text is None:
+                        raise InputError(
+                            "Content part of type 'text' must include a "
+                            "'text' field."
                         )
+                    if wrap_content:
+                        message_content.append(TextContentPart(text=text))
                     else:
                         message_content.append(dict(content_part))
             messages.append(
@@ -1467,6 +1799,52 @@ def _get_target_endpoint(
     return body_target_endpoint
 
 
+_CACHE_SALT_MAX_LEN = 512
+
+
+def _get_cache_salt(
+    request: Request,
+    body_cache_salt: str | None,
+    use_client_cache_salt: bool,
+) -> str | None:
+    """Extract cache_salt from header or body.
+
+    Header takes precedence over body parameter.
+    Uses the header name 'X-Cache-Salt'. Not authenticated by MAX Serve --
+    a trusted gateway must set it from session identity, not raw clients.
+    Ignored entirely unless use_client_cache_salt is True.
+
+    Args:
+        request: FastAPI Request object
+        body_cache_salt: cache_salt from the request body
+        use_client_cache_salt: whether to honor cache_salt at all
+
+    Returns:
+        cache_salt value from header if present, otherwise from body,
+        or None if use_client_cache_salt is False
+
+    Raises:
+        HTTPException: if the header value exceeds _CACHE_SALT_MAX_LEN
+            (the body field enforces the same cap via its pydantic schema).
+    """
+    if not use_client_cache_salt:
+        return None
+
+    header_cache_salt = request.headers.get("X-Cache-Salt")
+    if header_cache_salt:
+        if len(header_cache_salt) > _CACHE_SALT_MAX_LEN:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"X-Cache-Salt header exceeds {_CACHE_SALT_MAX_LEN} "
+                    "characters."
+                ),
+            )
+        return header_cache_salt
+
+    return body_cache_salt
+
+
 def _resolve_grammar_constraints(
     tools: list[TextGenerationRequestTool] | None,
     tool_choice: str | dict[str, Any] | None,
@@ -1552,7 +1930,14 @@ def _resolve_grammar_constraints(
     # When tools are forced, constrain to tool calls only.
     if response_format is not None and not tools_forced:
         if response_format.type == "json_schema":
-            response_format_schema = response_format.json_schema or None
+            # An explicit ``{}`` ("any valid JSON value") is a real schema to OR
+            # into the tool-call alternation, distinct from an absent schema;
+            # ``is not None`` preserves it where ``or None`` would drop it.
+            response_format_schema = (
+                response_format.json_schema
+                if response_format.json_schema is not None
+                else None
+            )
 
     # enforce_from_start: True for required/named OR auto+response_format
     # False for auto without response_format (conditional enforcement)
@@ -1573,6 +1958,7 @@ async def openai_create_chat_completion(
     request: Request,
 ) -> CreateChatCompletionResponse | EventSourceResponse | Response:
     request_id = request.state.request_id
+    request_trace_ctx.set(otel_propagate.extract(request.headers))
     try:
         completion_request = await _parse_openai_request_body(
             request, request_id, CreateChatCompletionRequest
@@ -1634,7 +2020,15 @@ async def openai_create_chat_completion(
         response_format = _create_response_format(
             completion_request.response_format,
             enable_response_format_schema=pipeline_config.sampling.enable_structured_output,
-            grammar_validator=request.app.state.grammar_validator,
+        )
+        # Keep the user's schema for the observability-only conformance check
+        # of the final content: a combined tools+response_format request
+        # replaces ``response_format`` below with a type="grammar" one whose
+        # json_schema is empty.
+        response_format_json_schema = (
+            response_format.json_schema
+            if response_format is not None and response_format.json_schema
+            else None
         )
 
         # For architectures with a grammar-based tool parser (e.g., Kimi),
@@ -1695,7 +2089,7 @@ async def openai_create_chat_completion(
                 response_format = TextGenerationResponseFormat(
                     type="grammar",
                     grammar=grammar,
-                    json_schema={},
+                    json_schema=None,
                     grammar_enforced=enforce_from_start,
                     tools_forced=tools_forced,
                     requires_structured_output_flag=response_format_schema
@@ -1710,24 +2104,20 @@ async def openai_create_chat_completion(
                     enforce_from_start,
                 )
 
-        # Admission-time validation. Rejects a tool-call grammar the active
-        # backend cannot compile with an InputError (HTTP 400) here.
-        grammar_validator = request.app.state.grammar_validator
-        if (
-            grammar_validator is not None
-            and response_format is not None
-            and response_format.type == "grammar"
-            and response_format.grammar is not None
-        ):
-            grammar_validator.check_tool_grammar(response_format.grammar)
-
         stream_options = None
         if completion_request.stream:
             stream_options = completion_request.stream_options
-        # Parse tool calls when tools are provided. With combined grammar support,
-        # the model can output either tool calls or structured content. The parser
-        # will detect which format was used and handle accordingly.
-        parse_tool_calls = tools is not None
+        # Parse tool calls when tools are provided. With combined grammar
+        # support, the model can output either tool calls or structured
+        # content, and the parser detects which format was used. MiniMax M3
+        # (identified by its tool parser) also parses a request that declares
+        # no ``tools``, because its inventory can be established by the
+        # conversation history alone; other models are unaffected.
+        # ``tool_choice="none"`` (which clears ``tools``) opts out.
+        parse_tool_calls = (
+            tools is not None
+            or pipeline_config.runtime.tool_parser == "minimax_m3"
+        ) and completion_request.tool_choice != "none"
         # MiniMax ``reasoning_split=False`` folds reasoning back into the
         # ``content`` field wrapped in ``<think>...</think>``. Gated to MiniMax
         # M3 (identified by its reasoning parser) so other models are unaffected.
@@ -1743,6 +2133,7 @@ async def openai_create_chat_completion(
             tools=tools,
             fold_reasoning_into_content=fold_reasoning_into_content,
             emit_reasoning_content=pipeline_config.runtime.emit_reasoning_content,
+            response_format_json_schema=response_format_json_schema,
         )
         # Use request-level sampling params if provided, else server defaults.
         temp = (
@@ -1814,34 +2205,17 @@ async def openai_create_chat_completion(
                     " field."
                 )
 
-        # Map OpenRouter's ``reasoning`` toggle onto the chat-template thinking
-        # flags. Templates are inconsistent about the key name, so set both
-        # ``enable_thinking`` and ``thinking``.
-        if completion_request.reasoning is not None:
-            reasoning = completion_request.reasoning
-            enable_thinking = (
-                reasoning.enabled
-                if reasoning.enabled is not None
-                else reasoning.effort is not None
-            )
-            chat_template_kwargs = dict(
-                completion_request.chat_template_kwargs or {}
-            )
-            chat_template_kwargs.setdefault("enable_thinking", enable_thinking)
-            chat_template_kwargs.setdefault("thinking", enable_thinking)
-            completion_request.chat_template_kwargs = chat_template_kwargs
-
         # When the orchestrator has already tokenized the prompt for
         # KV cache-aware routing, pass the token IDs directly so MAX Serve
         # skips re-tokenization. ``messages`` and ``prompt`` are mutually
         # exclusive on TextGenerationRequest, so omit ``messages`` in that
         # case. If both are sent on the wire, ``prompt_tokens`` wins.
         prompt_token_ids = completion_request.prompt_tokens
-        chat_template_options = completion_request.chat_template_kwargs
+        chat_template_options = completion_request.resolved_chat_template_kwargs
         token_request = TextGenerationRequest(
             request_id=RequestID(request_id),
             model_name=completion_request.model,
-            prompt=prompt_token_ids if prompt_token_ids else None,
+            prompt=prompt_token_ids or None,
             messages=[] if prompt_token_ids else request_messages,
             images=request_images,
             decoded_images=request_decoded_images,
@@ -1856,24 +2230,28 @@ async def openai_create_chat_completion(
                 request, completion_request.target_endpoint
             ),
             dkv_cache_hint=completion_request.dkv_cache_hint,
-            cache_salt=completion_request.cache_salt,
+            cache_salt=_get_cache_salt(
+                request,
+                completion_request.cache_salt,
+                request.app.state.settings.use_client_cache_salt,
+            ),
             chat_template_options=chat_template_options,
         )
 
         if completion_request.stream:
-            # Await the submit so a failed handoff surfaces as an HTTP error
-            # before the SSE headers are sent, rather than as an error chunk
-            # inside an already-200 stream.
-            token_stream = await response_generator.stream(token_request)
+            # Resolve the submit and first chunk before the SSE headers go
+            # out, so a failed handoff is an HTTP error.
+            error, token_stream = await _start_stream(
+                await response_generator.stream(token_request)
+            )
+            if error is not None:
+                return error
             # We set a large timeout for ping otherwise benchmarking scripts
             # such as sglang will fail in parsing the ping message.
             return EventSourceResponse(token_stream, ping=100000, sep="\n")
 
         response = await response_generator.complete([token_request])
         return response
-    except _ClientDisconnectedError:
-        logger.info("Client disconnected for request %s", request_id)
-        return Response(status_code=_CLIENT_DISCONNECTED_STATUS_CODE)
     except JSONDecodeError as e:
         logger.exception("JSONDecodeError in request %s", request_id)
         raise HTTPException(status_code=400, detail="Missing JSON.") from e
@@ -1960,36 +2338,9 @@ def _validate_tool_function_name(
         )
 
 
-def _validate_json_schema(json_schema: dict[str, Any]) -> None:
-    """Validate that a JSON schema can be compiled to a grammar.
-
-    This catches invalid schemas (recursive $ref, unsupported constructs)
-    early in the HTTP request handler, returning a 400 error instead of
-    crashing the model worker process later during constrained decoding.
-
-    Raises:
-        InputError: If a grammar cannot be created from the JSON schema.
-    """
-    if not json_schema:
-        return
-
-    try:
-        grammar = LLMatcher.grammar_from_json_schema(json_schema)
-    except Exception as e:
-        raise InputError(
-            f"Failed to create a grammar from the JSON schema: {e}"
-        ) from e
-    error = LLMatcher.validate_grammar(grammar)
-    if error:
-        raise InputError(
-            f"Invalid grammar created from the JSON schema: {error}"
-        )
-
-
 def _create_response_format(
     response_format: ResponseFormat | None,
     enable_response_format_schema: bool,
-    grammar_validator: GrammarValidator | None = None,
 ) -> TextGenerationResponseFormat | None:
     """Convert OpenAI response format to TextGenerationResponseFormat.
 
@@ -2045,28 +2396,24 @@ def _create_response_format(
     # to ``max_length`` (the runaway-output incident).
     json_schema = normalize_response_format_schema(json_schema)
 
-    # Validate against the active backend, which compiles the schema and checks
-    # grammar validity (rejecting what the worker can't compile with an InputError).
-    # Fall back to the backend-agnostic check when there is no validator.
-    if json_schema:
-        if grammar_validator is not None:
-            grammar_validator.check_json_schema(json.dumps(json_schema))
-        else:
-            _validate_json_schema(json_schema)
+    # Not compiled here: the model worker owns the single compile.
 
-    # Enforce grammar from the first token only when there is an actual
-    # schema to enforce. The json_schema can also be used to create a grammar,
-    # hence we need to specify that the grammar should constrain from the
-    # start if there's a json_schema present here.
+    # A json_schema/json_object response_format ALWAYS requests enforcement,
+    # even when the schema is an explicit ``{}`` / boolean ``true`` ("any valid
+    # JSON value"). Deriving enforcement from ``bool(json_schema)`` would treat
+    # that empty-but-present schema as "no schema" and leave the output
+    # unconstrained (trailing prose after a valid value). Take the intent from
+    # the request type instead; the empty schema compiles to xgrammar's
+    # any-value grammar, which forces exactly one well-formed JSON value.
     # TODO: improve the field naming here; grammar_enforced should be constrain_with_bitmask.
     return TextGenerationResponseFormat(
         type=response_type,
         json_schema=json_schema,
         grammar=None,
-        grammar_enforced=bool(json_schema),
+        grammar_enforced=True,
         tools_forced=False,
         requires_structured_output_flag=True,
-        has_json_schema=bool(json_schema),
+        has_json_schema=True,
     )
 
 
@@ -2075,6 +2422,7 @@ async def openai_create_embeddings(
     request: Request,
 ) -> CreateEmbeddingResponse | Response:
     request_id = request.state.request_id
+    request_trace_ctx.set(otel_propagate.extract(request.headers))
 
     # First try-catch: request parsing (client fault → 400)
     try:
@@ -2115,9 +2463,6 @@ async def openai_create_embeddings(
             )
             for idx, input_text in enumerate(embedding_inputs)
         ]
-    except _ClientDisconnectedError:
-        logger.info("Client disconnected for request %s", request_id)
-        return Response(status_code=_CLIENT_DISCONNECTED_STATUS_CODE)
     except JSONDecodeError as e:
         logger.warning("JSONDecodeError in request %s: %s", request_id, e)
         raise HTTPException(status_code=400, detail="Missing JSON.") from e
@@ -2145,9 +2490,10 @@ async def openai_create_embeddings(
     try:
         response = await response_generator.encode(embedding_requests)
         return response
-    except _ClientDisconnectedError:
-        logger.info("Client disconnected for request %s", request_id)
-        return Response(status_code=_CLIENT_DISCONNECTED_STATUS_CODE)
+    except RequestQueueFull:
+        # Admission was rejected (full worker queue); let the central handler
+        # map it to HTTP 429 rather than the generic 500 below.
+        raise
     except Exception as e:
         logger.exception(
             "Exception during response generation in request %s", request_id
@@ -2155,6 +2501,189 @@ async def openai_create_embeddings(
         raise HTTPException(
             status_code=500, detail="Internal server error."
         ) from e
+
+
+def _speech_as_open_responses_request(
+    speech_request: CreateSpeechRequest, request_id: str
+) -> OpenResponsesRequest:
+    """Restates a speech request in the form audio tokenizers take.
+
+    Every audio checkpoint owns its prompt contract through
+    ``AudioGenerationTokenizer``, which reads an
+    :class:`OpenResponsesRequest`. Translating here rather than tokenizing in
+    the route keeps one path to a context, so this endpoint and
+    ``/v1/responses`` cannot disagree about what a prompt is.
+
+    Args:
+        speech_request: The validated request.
+        request_id: Id to carry through to the worker.
+
+    Returns:
+        The equivalent OpenResponses request.
+    """
+    body = OpenResponsesRequestBody.model_validate(
+        {
+            "model": speech_request.model,
+            # ``instructions`` describes the audio; ``input`` is the text the
+            # audio renders, which a singing model takes as lyrics.
+            "input": speech_request.instructions or "",
+            "seed": speech_request.seed,
+            "provider_options": {
+                "audio": {
+                    "lyrics": speech_request.input,
+                    "audio_duration": speech_request.audio_duration,
+                    "steps": speech_request.steps,
+                    "guidance_scale": speech_request.guidance_scale,
+                    "audio_format": "wav",
+                }
+            },
+        }
+    )
+    return OpenResponsesRequest(
+        request_id=RequestID(value=request_id), body=body
+    )
+
+
+def _validate_speech_request(speech_request: CreateSpeechRequest) -> None:
+    """Rejects a speech request this server cannot answer as asked.
+
+    Answering an unsupported option by ignoring it is worse than refusing it:
+    a client that asked for mp3 and got WAV bytes under an ``audio/wav``
+    header has no way to notice.
+
+    Raises:
+        ValueError: On a request that asks for something unsupported.
+    """
+    if speech_request.response_format not in (None, "wav"):
+        raise ValueError(
+            f"response_format '{speech_request.response_format}' is not "
+            "supported; this server returns WAV. Omit the field or pass 'wav'."
+        )
+    if speech_request.stream_format == "sse":
+        raise ValueError(
+            "Streaming is not supported for audio generation: the model "
+            "produces a whole waveform in one pass."
+        )
+    if speech_request.speed is not None and speech_request.speed != 1.0:
+        raise ValueError(
+            "'speed' is not supported; ask for a duration with "
+            "'audio_duration' instead."
+        )
+    if not speech_request.instructions:
+        raise ValueError(
+            "'instructions' must describe the audio to generate (style, "
+            "instrumentation, mood). A generative audio model has no default "
+            "voice to fall back on."
+        )
+
+
+def _waveform_from_output(
+    output: GenerationOutput,
+) -> tuple[npt.NDArray[np.float32], int]:
+    """Pulls the raw waveform and its rate out of a generation's output.
+
+    Returns:
+        The ``[channels, samples]`` waveform and its sample rate.
+
+    Raises:
+        ValueError: If the pipeline returned something other than one piece of
+            raw audio, which means the served model is not an audio model.
+    """
+    audio = [c for c in output.output if isinstance(c, OutputAudioContent)]
+    if len(audio) != 1:
+        raise ValueError(
+            f"Expected one audio output from the model, got {len(audio)}."
+        )
+    content = audio[0]
+    if content.samples is None or content.sample_rate is None:
+        raise ValueError(
+            "The model returned audio without raw samples, which this "
+            "endpoint needs in order to encode a WAV."
+        )
+    return content.samples, content.sample_rate
+
+
+@router.post("/audio/speech", response_model=None)
+async def openai_create_speech(request: Request) -> Response:
+    """Generates audio from text, returning a WAV body.
+
+    OpenAI's speech endpoint is a plain request/response with binary output,
+    which is also how a generative audio model works: one pass, one waveform,
+    no streaming.
+    """
+    request_id = request.state.request_id
+    request_trace_ctx.set(otel_propagate.extract(request.headers))
+
+    # Request parsing and validation (client fault -> 400).
+    try:
+        speech_request = CreateSpeechRequest.model_validate_json(
+            await request.body()
+        )
+        _validate_speech_request(speech_request)
+        handler = _get_audio_handler(request, speech_request.model)
+        logger.debug(
+            "Processing path, %s, req-id, %s, for model, %s.",
+            request.url.path,
+            request_id,
+            speech_request.model,
+        )
+        open_responses_request = _speech_as_open_responses_request(
+            speech_request, request_id
+        )
+    except JSONDecodeError as e:
+        logger.warning("JSONDecodeError in request %s: %s", request_id, e)
+        raise HTTPException(status_code=400, detail="Missing JSON.") from e
+    except ValidationError as e:
+        logger.warning(
+            "Request validation error in request %s: %s", request_id, e
+        )
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except InputError as e:
+        logger.warning(
+            "Input validation error in request %s: %s", request_id, str(e)
+        )
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except ValueError as e:
+        logger.warning("Value error in request %s: %s", request_id, str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    # Generation (server fault -> 500), except for the input errors a
+    # checkpoint's own tokenizer raises when it reads the assembled prompt.
+    try:
+        final_output: PipelineOutput | None = None
+        async for chunk in handler.next(open_responses_request):
+            final_output = chunk
+            if chunk.is_done:
+                break
+        if not isinstance(final_output, GenerationOutput):
+            raise ValueError(
+                "Expected generated audio from the model, got "
+                f"{type(final_output).__name__}."
+            )
+        samples, sample_rate = _waveform_from_output(final_output)
+        payload = encode_wav_bytes(samples, sample_rate)
+    except InputError as e:
+        logger.warning(
+            "Input validation error in request %s: %s", request_id, str(e)
+        )
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RequestQueueFull:
+        # Admission was rejected (full worker queue); the central handler maps
+        # this to HTTP 429 rather than the generic 500 below.
+        raise
+    except Exception as e:
+        logger.exception(
+            "Exception during response generation in request %s", request_id
+        )
+        raise HTTPException(
+            status_code=500, detail="Internal server error."
+        ) from e
+
+    return Response(
+        content=payload,
+        media_type=WAV_MEDIA_TYPE,
+        headers={"Content-Disposition": 'attachment; filename="speech.wav"'},
+    )
 
 
 class CompletionResponseStreamChoice(BaseModel):
@@ -2347,13 +2876,28 @@ class OpenAICompletionResponseGenerator(
     ) -> AsyncGenerator[str | ErrorResponse | JSONResponse, None]:
         logger.debug("Streaming: Start: %s", request)
         record_request_start()
+        request_span = _tracer.start_span(
+            "max.request",
+            context=request_trace_ctx.get(),
+            attributes={
+                "gen_ai.request.model": request.model_name,
+                "max.request_id": str(request.request_id),
+            },
+        )
         request_timer = StopWatch(start_ns=request.timestamp_ns)
         n_reasoning_tokens = 0
         n_tokens = 0
         n_prompt_tokens = 0
         n_cached_prompt_tokens = 0
+        final_finish_reason: str | None = None
+        _first_batch_id: int | None = None
+        _last_batch_id: int | None = None
         try:
             async for chunk in token_generator:
+                if chunk.batch_id is not None:
+                    if _first_batch_id is None:
+                        _first_batch_id = chunk.batch_id
+                    _last_batch_id = chunk.batch_id
                 chunk_total_tokens = (
                     chunk.reasoning_token_count or 0
                 ) + chunk.token_count
@@ -2389,13 +2933,14 @@ class OpenAICompletionResponseGenerator(
                         )
                     ]
                 elif chunk.status.is_done:
+                    final_finish_reason = get_finish_reason_from_status(
+                        chunk.status, allow_none=False
+                    )
                     choices = [
                         CompletionResponseStreamChoice(
                             index=0,
                             text="",
-                            finish_reason=get_finish_reason_from_status(
-                                chunk.status, allow_none=False
-                            ),
+                            finish_reason=final_finish_reason,
                         )
                     ]
                 else:
@@ -2478,6 +3023,23 @@ class OpenAICompletionResponseGenerator(
                 content={"detail": "Value error", "message": str(e)},
             )
         finally:
+            request_span.set_attribute(
+                "gen_ai.usage.output_tokens", n_reasoning_tokens + n_tokens
+            )
+            request_span.set_attribute(
+                "gen_ai.usage.input_tokens", n_prompt_tokens
+            )
+            if final_finish_reason is not None:
+                request_span.set_attribute(
+                    "gen_ai.response.finish_reasons", [final_finish_reason]
+                )
+            if _first_batch_id is not None:
+                request_span.set_attribute(
+                    "max.first_batch_id", _first_batch_id
+                )
+            if _last_batch_id is not None:
+                request_span.set_attribute("max.last_batch_id", _last_batch_id)
+            request_span.end()
             record_request_end(
                 request.request_path,
                 request_timer.elapsed_ms,
@@ -2491,11 +3053,20 @@ class OpenAICompletionResponseGenerator(
         # we assume that all entries in `requests` came from the same http
         # request and timestamp, request id, path should all be the same.
         record_request_start()
+        request_span = _tracer.start_span(
+            "max.request",
+            context=request_trace_ctx.get(),
+            attributes={
+                "gen_ai.request.model": requests[0].model_name,
+                "max.request_id": str(requests[0].request_id),
+            },
+        )
         n_reasoning_tokens = 0
         n_tokens = 0
         n_prompt_tokens = 0
         n_cached_prompt_tokens = 0
         request_timer = StopWatch(start_ns=requests[0].timestamp_ns)
+        req_output_list: list[list[TokenGeneratorOutput]] = []
 
         try:
             req_output_list = await asyncio.gather(
@@ -2557,6 +3128,15 @@ class OpenAICompletionResponseGenerator(
             )
             return response
         finally:
+            request_span.set_attribute(
+                "gen_ai.usage.output_tokens", n_reasoning_tokens + n_tokens
+            )
+            request_span.set_attribute(
+                "gen_ai.usage.input_tokens", n_prompt_tokens
+            )
+            all_outputs = [c for req in req_output_list for c in req]
+            _set_batch_id_attributes(request_span, all_outputs)
+            request_span.end()
             record_request_end(
                 requests[0].request_path,
                 request_timer.elapsed_ms,
@@ -2615,6 +3195,7 @@ async def openai_create_completion(
     Public benchmarking such as vLLM use this endpoint.
     """
     http_req_id = request.state.request_id
+    request_trace_ctx.set(otel_propagate.extract(request.headers))
     try:
         completion_request = await _parse_openai_request_body(
             request, http_req_id, CreateCompletionRequest
@@ -2714,7 +3295,11 @@ async def openai_create_completion(
                     request, completion_request.target_endpoint
                 ),
                 dkv_cache_hint=completion_request.dkv_cache_hint,
-                cache_salt=completion_request.cache_salt,
+                cache_salt=_get_cache_salt(
+                    request,
+                    completion_request.cache_salt,
+                    request.app.state.settings.use_client_cache_salt,
+                ),
             )
             token_requests.append(tgr)
 
@@ -2723,10 +3308,13 @@ async def openai_create_completion(
                 raise NotImplementedError(
                     "Streaming responses for multiple prompts is not supported"
                 )
-            # Await the submit so a failed handoff surfaces as an HTTP error
-            # before the SSE headers are sent, rather than as an error chunk
-            # inside an already-200 stream.
-            token_stream = await response_generator.stream(token_requests[0])
+            # Resolve the submit and first chunk before the SSE headers go
+            # out, so a failed handoff is an HTTP error.
+            error, token_stream = await _start_stream(
+                await response_generator.stream(token_requests[0])
+            )
+            if error is not None:
+                return error
             # We set a large timeout for ping otherwise benchmarking scripts
             # such as sglang will fail in parsing the ping message.
             return EventSourceResponse(
@@ -2740,9 +3328,6 @@ async def openai_create_completion(
         # the wrong id.  Overwrite with the http id.
         resp.id = http_req_id
         return resp
-    except _ClientDisconnectedError:
-        logger.info("Client disconnected for request %s", http_req_id)
-        return Response(status_code=_CLIENT_DISCONNECTED_STATUS_CODE)
     except JSONDecodeError as e:
         logger.exception("JSONDecodeError for request %s", http_req_id)
         raise HTTPException(status_code=400, detail="Missing JSON.") from e
@@ -2781,8 +3366,15 @@ def _resolve_max_model_len(request: Request) -> int | None:
 
     Returns the smallest length the tokenizer and model can handle, so clients
     can avoid overflowing the model's context.
+
+    A multi-component checkpoint (diffusion, audio) has no main model to ask
+    and no single context length to report either, so its memory plan carries
+    no planned length and this reports none.
     """
-    max_model_len = get_app_pipeline_config(request.app).model.max_length
+    memory_plan = request.app.state.memory_plan
+    max_model_len = (
+        memory_plan.planned_max_length if memory_plan is not None else None
+    )
     if max_model_len is None:
         return None
 
@@ -2887,11 +3479,10 @@ async def load_lora_adapter(
             raise HTTPException(
                 status_code=409, detail=response.message
             )  # Conflict
-        elif response.status == LoRAStatus.LOAD_INVALID_PATH:
-            raise HTTPException(
-                status_code=400, detail=response.message
-            )  # Bad Request
-        elif response.status == LoRAStatus.LOAD_INVALID_ADAPTER:
+        elif response.status in (
+            LoRAStatus.LOAD_INVALID_PATH,
+            LoRAStatus.LOAD_INVALID_ADAPTER,
+        ):
             raise HTTPException(
                 status_code=400, detail=response.message
             )  # Bad Request

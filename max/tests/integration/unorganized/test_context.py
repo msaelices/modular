@@ -488,6 +488,26 @@ def test_context_serializable() -> None:
     assert dataclass_equal(msgpack_decoded, original_context)
 
 
+def test_dkv_cache_hint_survives_serialization() -> None:
+    # The hint is carried, never read, so the only thing MAX owes it is that
+    # the bytes reaching the model worker are the bytes that arrived on the
+    # request (CLIN-1630). Its predecessor needed a tagged msgspec struct to
+    # cross this boundary; raw bytes need nothing, and this pins that.
+    hint = b'{"version":2,"instances":[{"instance_name":"dkv-peer"}]}'
+    original_context = TextContext(
+        request_id=RequestID(),
+        max_length=50,
+        tokens=TokenBuffer(np.array([0, 1, 2, 3, 4], dtype=np.int64)),
+        dkv_cache_hint=hint,
+    )
+
+    serialize = msgpack_numpy_encoder()
+    deserialize = msgpack_numpy_decoder(TextContext)
+    decoded = deserialize(serialize(original_context))
+
+    assert decoded.dkv_cache_hint == hint
+
+
 def test_context_tuple_serializable() -> None:
     # Test that we can encode a tuple of (str, TextContext) with Pickle
     original_context = TextContext(
@@ -631,15 +651,73 @@ def test_text_context_update_with_future_token() -> None:
 
     assert context.tokens.all.tolist() == [0, 1, 2, 3, 4, 5, FUTURE_TOKEN]
     assert context.status == GenerationStatus.ACTIVE
-    with pytest.raises(
-        ValueError,
-        match=r"Attempted to create generation output while future token is not yet realized",
-    ):
-        context.to_generation_output()
+    # The unrealized placeholder is held back from the output; only the
+    # realized prefix streams. (Previously this raised; the consumed window
+    # is now clamped to the realized prefix so an in-flight forward's
+    # placeholder can never leak into a response.)
+    output = context.to_generation_output()
+    assert output.tokens == [5]
+    assert FUTURE_TOKEN not in output.tokens
 
     context.realize_future_token(42)
     assert context.tokens.all.tolist() == [0, 1, 2, 3, 4, 5, 42]
     assert context.status == GenerationStatus.END_OF_SEQUENCE
+    assert context.to_generation_output().tokens == [42]
+
+
+def test_text_context_future_token_skipped_during_chunked_prefill() -> None:
+    """Chunked-prefill continuations must not write a future-token placeholder.
+
+    The overlap pipeline calls ``update_with_future_token`` on every context in
+    the batch each step, including requests still in (chunked) prefill. For an
+    actively-chunked context, ``advance_token_buffer`` advances the chunk and
+    early-returns WITHOUT writing a ``FUTURE_TOKEN``, so a later chunked step
+    must not raise "Cannot have multiple future tokens."
+    """
+    context = TextContext(
+        max_length=50,
+        tokens=TokenBuffer(np.array([0, 1, 2, 3, 4, 5, 6, 7], dtype=np.int64)),
+        eos_tracker=EOSTracker(eos_token_ids={42}),
+    )
+
+    context.tokens.chunk(4)
+    assert context.tokens.actively_chunked
+    context.update_with_future_token()
+    assert context.tokens.generated_length == 0
+    assert FUTURE_TOKEN not in context.tokens.all.tolist()
+
+    context.tokens.chunk(2)
+    assert context.tokens.actively_chunked
+    context.update_with_future_token()
+    assert context.tokens.generated_length == 0
+    assert FUTURE_TOKEN not in context.tokens.all.tolist()
+
+    assert not context.tokens.actively_chunked
+    context.update_with_future_token()
+    assert context.tokens.all.tolist()[-1] == FUTURE_TOKEN
+
+    context.realize_future_token(9)
+    assert context.tokens.all.tolist()[-1] == 9
+
+
+def test_text_context_last_realized_token() -> None:
+    """last_realized_token skips an unrealized overlap placeholder."""
+    context = TextContext(
+        max_length=50,
+        tokens=TokenBuffer(np.array([0, 1, 2, 3, 4], dtype=np.int64)),
+        eos_tracker=EOSTracker(eos_token_ids={42}),
+    )
+    assert context.last_realized_token == 4
+
+    context.update(5)
+    assert context.last_realized_token == 5
+
+    context.update_with_future_token()
+    assert context.tokens.all.tolist()[-1] == FUTURE_TOKEN
+    assert context.last_realized_token == 5
+
+    context.realize_future_token(6)
+    assert context.last_realized_token == 6
 
 
 def test_text_context_update_with_preemption_and_future_token() -> None:
@@ -1229,3 +1307,61 @@ def test_pixel_context_tuple_serializable() -> None:
 
     assert msgpack_decoded[0] == original_tuple[0]
     assert dataclass_equal(msgpack_decoded[1], original_tuple[1])
+
+
+_VISION_TOKEN_ID = 98
+
+
+def _windowed_vision_context(
+    image_spans: list[tuple[int, int]],
+    seq_len: int,
+) -> TextAndVisionContext:
+    """Build a TextAndVisionContext with ``(start, end)`` images."""
+    tokens = np.ones(seq_len, dtype=np.int64)
+    images = []
+    for start, end in image_spans:
+        tokens[start:end] = _VISION_TOKEN_ID
+        images.append(
+            ImageMetadata(
+                start_idx=start,
+                end_idx=end,
+                pixel_values=np.zeros((2, 3), dtype=np.float32),
+            )
+        )
+    return TextAndVisionContext(
+        tokens=TokenBuffer(tokens),
+        max_length=4096,
+        vision_token_ids=[_VISION_TOKEN_ID],
+        images=images,
+    )
+
+
+def test_next_images_in_window_drops_images_ahead_of_window() -> None:
+    context = _windowed_vision_context([(4, 8), (12, 16), (20, 24)], seq_len=30)
+    # Nothing processed yet, full window: all three images unencoded.
+    assert len(context.next_images_in_window) == 3
+
+    # Chunk the active window to [0, 16): the third image (start_idx=20) is
+    # ahead of the window and must be dropped from the tail.
+    context.tokens.chunk(16)
+    windowed = context.next_images_in_window
+    assert [img.start_idx for img in windowed] == [4, 12]
+
+    # next_images_in_window is a prefix of next_images (drops only the tail).
+    assert [img.start_idx for img in windowed] == [
+        img.start_idx for img in context.next_images[: len(windowed)]
+    ]
+
+
+def test_next_images_in_window_includes_bisected_images_whole() -> None:
+    context = _windowed_vision_context([(4, 8), (12, 16), (20, 24)], seq_len=30)
+    # The chunk boundary bisects the second image (12..16): it overlaps the
+    # window, so it is included whole (the encoder cannot split an image).
+    context.tokens.chunk(14)
+    assert [img.start_idx for img in context.next_images_in_window] == [4, 12]
+
+    # A processed prefix that bisects the second image: it still overlaps the
+    # window [14, 30), so it stays; the fully-behind first image is dropped.
+    behind = _windowed_vision_context([(4, 8), (12, 16), (20, 24)], seq_len=30)
+    behind.tokens.skip_processing(14)
+    assert [img.start_idx for img in behind.next_images_in_window] == [12, 20]

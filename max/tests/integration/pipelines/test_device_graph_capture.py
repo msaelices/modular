@@ -21,7 +21,7 @@ captured graph; ``replay`` copies inputs into the captured buffers and replays.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, cast
 from unittest.mock import MagicMock
@@ -33,7 +33,7 @@ from max.engine import Model
 from max.graph import DeviceRef
 from max.nn.kv_cache import AttnKeyInterface, BatchCharacteristics, MHAAttnKey
 from max.nn.kv_cache.utils import MultiAttnKey
-from max.pipelines.lib import ModelInputs, ModelOutputs
+from max.pipelines.lib import MemoryPlan, ModelInputs, ModelOutputs
 from max.pipelines.lib.graph_capture import ServeGraphCaptureRunner
 from max.pipelines.lib.interfaces import UnifiedEagleOutputs
 from test_common.mocks.pipeline_config import (
@@ -126,6 +126,8 @@ def _make_runner(
     num_speculative_tokens: int = 0,
     kv_params: MagicMock | None = None,
     warmup_model_inputs: Any = None,
+    verify_widths: Sequence[int] | None = None,
+    width_lookup: Sequence[int] | None = None,
 ) -> ServeGraphCaptureRunner:
     return ServeGraphCaptureRunner(
         model=cast(Model, model),
@@ -134,6 +136,8 @@ def _make_runner(
         max_cache_length_upper_bound=10,
         max_batch_size=max_batch_size,
         num_speculative_tokens=num_speculative_tokens,
+        verify_widths=verify_widths,
+        width_lookup=width_lookup,
     )
 
 
@@ -182,8 +186,8 @@ def capture_model() -> CapturePipelineModel:
         quantization_encoding=MagicMock(),
         max_batch_size=4,
         max_length=128,
+        device_graph_capture=True,
     )
-    pipeline_config.runtime.device_graph_capture = True
     return CapturePipelineModel(
         pipeline_config=pipeline_config,
         session=MagicMock(),
@@ -192,6 +196,13 @@ def capture_model() -> CapturePipelineModel:
         weights=MagicMock(),
         adapter=None,
         return_logits=MagicMock(),
+        # The value the mock's clamp derived before plans became required:
+        # min(MOCK_MODEL_MAX_SEQ_LEN, max_length=128).
+        memory_plan=MemoryPlan(
+            planned_max_batch_size=4,
+            footprint=0,
+            planned_max_length=128,
+        ),
     )
 
 
@@ -317,7 +328,9 @@ def test_align_q_mismatch_raises() -> None:
     runner._recorded_cache_lengths = [10]
     runner._records = {_bc(1, 1, 10): _gk(num_partitions=10, q_max_seq_len=1)}
 
-    with pytest.raises(RuntimeError, match=r"q_max_seq_len=2 != 1"):
+    with pytest.raises(
+        RuntimeError, match=r"verify width 1, which is not captured"
+    ):
         runner.align(_bc(1, 2, 5))
 
 
@@ -374,7 +387,7 @@ def test_warmup_records_and_captures(
     }
     assert runner._records == expected_keys
     assert set(runner.graph_entries) == set(expected_keys.values())
-    for _key, (_inputs, outputs) in runner.graph_entries.items():
+    for _inputs, outputs in runner.graph_entries.values():
         assert isinstance(outputs, expected_type)
 
 

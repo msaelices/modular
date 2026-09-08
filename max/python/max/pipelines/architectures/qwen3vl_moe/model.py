@@ -43,13 +43,13 @@ from max.nn.layer import Module
 from max.nn.transformer import ReturnLogits
 from max.pipelines.lib import (
     AlwaysSignalBuffersMixin,
-    CompilationTimer,
     KVCacheConfig,
     ModelInputs,
     ModelOutputs,
+    MultiGraphPipelineModelWithKVCache,
     PipelineConfig,
-    PipelineModelWithKVCache,
 )
+from max.pipelines.lib.memory_estimation import MemoryPlan
 
 from .batch_processor import Qwen3VLMoeBatchProcessor
 from .context import Qwen3VLTextAndVisionContext
@@ -129,7 +129,7 @@ class Qwen3VLInputs(ModelInputs):
 
 class Qwen3VLModel(
     AlwaysSignalBuffersMixin,
-    PipelineModelWithKVCache[Qwen3VLTextAndVisionContext],
+    MultiGraphPipelineModelWithKVCache[Qwen3VLTextAndVisionContext],
 ):
     """A Qwen3VL pipeline model for multimodal text generation."""
 
@@ -138,7 +138,7 @@ class Qwen3VLModel(
         Qwen3VLMoeBatchProcessor
     )
 
-    vision_model: Model
+    vision_model: Model | None
     """The compiled vision model for processing images."""
 
     language_model: Model
@@ -154,6 +154,8 @@ class Qwen3VLModel(
         devices: list[Device],
         kv_cache_config: KVCacheConfig,
         weights: Weights,
+        *,
+        memory_plan: MemoryPlan,
         adapter: WeightsAdapter | None = None,
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
         max_batch_size: int = 1,
@@ -164,9 +166,10 @@ class Qwen3VLModel(
             devices,
             kv_cache_config,
             weights,
-            adapter,
-            return_logits,
+            adapter=adapter,
+            return_logits=return_logits,
             max_batch_size=max_batch_size,
+            memory_plan=memory_plan,
         )
 
         self.model_config = None
@@ -174,13 +177,7 @@ class Qwen3VLModel(
 
         self.vision_model, self.language_model = self.load_model(session)
 
-    # TODO: Seems like a common pattern. Implement in a base class?
-    def load_model(self, session: InferenceSession) -> tuple[Model, Model]:
-        """Loads the compiled Qwen3VL models into the MAX Engine session.
-
-        Returns:
-            A tuple of (vision_model, language_model).
-        """
+    def _load_state_dict(self) -> dict[str, Any]:
         # Validate SafetensorWeights requirement
         if not isinstance(self.weights, SafetensorWeights):
             raise ValueError(
@@ -198,7 +195,6 @@ class Qwen3VLModel(
                 dict(self.weights.items())
             )
 
-        # Split state dict into vision and language model components
         vision_state_dict: dict[str, WeightData] = {}
         llm_state_dict: dict[str, WeightData] = {}
         for key, value in model_state_dict.items():
@@ -211,15 +207,23 @@ class Qwen3VLModel(
                     f"Key: {key} is not part of the vision or language model"
                 )
 
+        self._vision_weights_dict = vision_state_dict
+        self._language_weights_dict = llm_state_dict
+        return model_state_dict
+
+    def _create_model_config(
+        self, model_state_dict: dict[str, WeightData]
+    ) -> Qwen3VLConfig:
         # Generate Qwen3VL config from HuggingFace config
         qwen3vl_config = Qwen3VLConfig.initialize_from_config(
             pipeline_config=self.pipeline_config,
             huggingface_config=self.huggingface_config,
+            max_seq_len=self.max_seq_len,
         )
         qwen3vl_config.finalize(
             huggingface_config=self.huggingface_config,
-            llm_state_dict=llm_state_dict,
-            vision_state_dict=vision_state_dict,
+            llm_state_dict=self._language_weights_dict,
+            vision_state_dict=self._vision_weights_dict,
             return_logits=self.return_logits,
         )
         self.model_config = qwen3vl_config
@@ -229,33 +233,17 @@ class Qwen3VLModel(
         self.model.load_state_dict(
             model_state_dict, weight_alignment=1, strict=True
         )
-
-        # Build and compile vision + language models in parallel
-        with CompilationTimer("vision + language model") as timer:
-            graph_module = GraphModule()
-            vision_graph = self._build_vision_graph(
-                qwen3vl_config, vision_state_dict, module=graph_module
-            )
-            language_graph = self._build_language_graph(
-                qwen3vl_config, llm_state_dict, module=graph_module
-            )
-            timer.mark_build_complete()
-            combined_registry = {**vision_state_dict, **llm_state_dict}
-            models = session.load_all(
-                graph_module, weights_registry=combined_registry
-            )
-            vision_model = models[vision_graph.name]
-            language_model = models[language_graph.name]
-
-        return vision_model, language_model
+        return qwen3vl_config
 
     def _build_vision_graph(
         self,
         config: Qwen3VLConfig,
         state_dict: dict[str, WeightData],
-        module: GraphModule | None = None,
-    ) -> Graph:
+        module: GraphModule,
+    ) -> tuple[Graph, dict[str, WeightData]]:
         """Build the vision model graph for processing images."""
+        del state_dict
+        assert isinstance(config, Qwen3VLConfig)
         assert isinstance(self.model, Qwen3VL)
         vision_encoder = self.model.vision_encoder
 
@@ -340,18 +328,16 @@ class Qwen3VLModel(
         # Build the vision graph
         with Graph(
             "qwen3vl_vision",
-            input_types=tuple(
-                [
-                    *pixel_values_types,
-                    *weights_types,
-                    *indices_types,
-                    *vision_rot_pos_ids_types,
-                    *max_grid_size_types,
-                    *grid_thw_types,
-                    *cu_seqlens_types,
-                    *max_seqlen_types,
-                    *signals.input_types(),
-                ]
+            input_types=(
+                *pixel_values_types,
+                *weights_types,
+                *indices_types,
+                *vision_rot_pos_ids_types,
+                *max_grid_size_types,
+                *grid_thw_types,
+                *cu_seqlens_types,
+                *max_seqlen_types,
+                *signals.input_types(),
             ),
             module=module,
         ) as graph:
@@ -413,7 +399,7 @@ class Qwen3VLModel(
                 ]
             )
 
-            return graph
+            return graph, self._vision_weights_dict
 
     def _language_graph_input_types(self) -> tuple[Type[Any], ...]:
         """Generate input types for the language model graph."""
@@ -511,9 +497,11 @@ class Qwen3VLModel(
         self,
         config: Qwen3VLConfig,
         state_dict: dict[str, WeightData],
-        module: GraphModule | None = None,
-    ) -> Graph:
+        module: GraphModule,
+    ) -> tuple[Graph, dict[str, WeightData]]:
         """Build the language model graph for text generation with image embeddings."""
+        del state_dict
+        assert isinstance(config, Qwen3VLConfig)
         assert isinstance(self.model, Qwen3VL)
         language_model = self.model.language_model
         assert language_model is not None, "Language model must be initialized"
@@ -604,7 +592,7 @@ class Qwen3VLModel(
 
             graph.output(*outputs)
 
-        return graph
+        return graph, self._language_weights_dict
 
     def execute(self, model_inputs: ModelInputs) -> ModelOutputs:
         """Executes the Qwen3VL model with the prepared inputs."""
@@ -617,6 +605,7 @@ class Qwen3VLModel(
         image_embeddings: list[Buffer]
         deepstack_image_embeddings: list[Buffer]
         if model_inputs.has_vision_inputs:
+            assert self.vision_model is not None
             assert model_inputs.image_token_indices is not None
             assert model_inputs.pixel_values is not None
             assert model_inputs.vision_position_ids is not None

@@ -32,7 +32,7 @@ kernels can reuse them:
 defends against the classic Lamport write-after-read hazard, so the kernel body
 and any future consumer share identical generation semantics.
 
-See `.agentwork/kernels/designs/lamport-allreduce.md` (KERN-2870), section
+See the internal Lamport allreduce design doc, section
 "Design > 1. Shared sentinel primitive", for the protocol context.
 """
 
@@ -91,9 +91,7 @@ def _sentinel_bits[
         The negative-zero bit pattern as the matching unsigned-integer scalar.
     """
     comptime assert (
-        dtype == DType.bfloat16
-        or dtype == DType.float16
-        or dtype == DType.float32
+        dtype == .bfloat16 or dtype == .float16 or dtype == .float32
     ), (
         "Lamport sentinel supports bfloat16, float16, and float32 only; fp8"
         " transport is out of scope (>8 lanes/pack and the coarse sentinel"
@@ -184,9 +182,7 @@ def set_neg_zero[dtype: DType, width: Int]() -> SIMD[dtype, width]:
         pack_bytes % 4 == 0
     ), "Lamport sentinel pack must be a multiple of 4 bytes"
     comptime n_u32 = pack_bytes // 4
-    return bitcast[dtype, width](
-        SIMD[DType.uint32, n_u32](LAMPORT_SENTINEL_U32)
-    )
+    return bitcast[dtype, width](SIMD[.uint32, n_u32](LAMPORT_SENTINEL_U32))
 
 
 struct LamportGeneration:

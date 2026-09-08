@@ -10,18 +10,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""KS64: `fused_silu_mxfp4` direct `scale_4d` emission.
+"""KS64: `fused_silu_mx` direct `scale_4d` emission.
 
 The MXFP4 down-projection grouped matmul consumes the activation E8M0 scale in
 the per-expert fixed-stride `scale_4d` slot layout (`Shuffler.scale_4d_byte_off`).
 Today that layout is produced by a standalone kernel
-(`preshuffle_grouped_scale_4d_gpu`, traced `mxfp4_preshuffle_grouped_scale_4d_kernel_KS64`)
-that runs *serially* after `fused_silu_mxfp4` writes the scale row-major. The
+(`preshuffle_grouped_scale_4d_gpu`, traced
+`block_scaled_preshuffle_grouped_scale_4d_kernel_KS64`) that runs *serially*
+after `fused_silu_mx` writes the scale row-major. The
 fusion (KS64/down-proj) has `fused_silu` write the scale DIRECTLY in
 the slot layout behind a `comptime fuse_a_scale_preshuffle` flag, deleting the
 separate kernel from the critical path.
 
-This test drives the REAL `fused_silu_mxfp4_kernel` two ways and asserts the
+This test drives the REAL `fused_silu_mx_kernel` two ways and asserts the
 produced slot buffers are byte-for-byte equal:
 
   reference (fuse_a_scale_preshuffle=False): fused_silu writes raw [tokens, K/32]
@@ -43,20 +44,20 @@ Currently MI355X-only.
 
 Usage (after editing ep_comm.mojo, plain `mojo` is shadowed by the installed
 shmem package — use bmojo / bazel):
-  ./bazelw run //KGEN/tools/mojo -- \\
+  ./bazelw run //Mojo/tools/mojo -- \\
       max/kernels/test/gpu/shmem/test_mxfp4_fused_silu_scale_fusion.mojo
 """
 
-from std.gpu.host import DeviceContext, HostBuffer
-from std.gpu.host.info import MI355X
-from std.math import align_up, exp
+from max.gpu.host import DeviceContext, HostBuffer
+from max.gpu.host.info import MI355X
+from std.math import align_up, exp, isfinite
 from std.random import random_float64, seed
 
 from layout import Coord, Idx, TileTensor, row_major
 from linalg.fp4_utils import E2M1_TO_FLOAT32, MXFP4_SF_VECTOR_SIZE
 from linalg.matmul.gpu.amd import Shuffler
 
-from shmem.ep_comm import fused_silu_mxfp4_kernel
+from shmem.ep_comm import fused_silu_mx_kernel
 
 from std.testing import assert_equal
 
@@ -67,7 +68,7 @@ from std.testing import assert_equal
 
 
 def _fill_random_bf16(
-    buf: HostBuffer[DType.bfloat16],
+    buf: HostBuffer[.bfloat16],
     n: Int,
     lo: Float64 = -4.0,
     hi: Float64 = 4.0,
@@ -80,7 +81,7 @@ def _fill_random_bf16(
 
 
 def _build_routing(
-    a_offsets_host: HostBuffer[DType.uint32],
+    a_offsets_host: HostBuffer[.uint32],
     num_tokens_by_expert: List[Int],
 ):
     """Ragged per-expert prefix sums: row_offsets[0]=0, row_offsets[e+1]=sum."""
@@ -151,19 +152,17 @@ def _run_fusion_check[
     comptime hw = ctx.default_device_info
 
     # --- Host inputs: synthesized ragged BF16 activation + ragged routing. ---
-    var input_h = ctx.enqueue_create_host_buffer[DType.bfloat16](
+    var input_h = ctx.enqueue_create_host_buffer[.bfloat16](
         total_tokens * input_dim
     )
-    var a_off_h = ctx.enqueue_create_host_buffer[DType.uint32](n_off)
+    var a_off_h = ctx.enqueue_create_host_buffer[.uint32](n_off)
     ctx.synchronize()
     _fill_random_bf16(input_h, total_tokens * input_dim)
     _build_routing(a_off_h, num_tokens_by_expert)
 
     # --- Device buffers. ---
-    var input_d = ctx.enqueue_create_buffer[DType.bfloat16](
-        total_tokens * input_dim
-    )
-    var a_off_d = ctx.enqueue_create_buffer[DType.uint32](n_off)
+    var input_d = ctx.enqueue_create_buffer[.bfloat16](total_tokens * input_dim)
+    var a_off_d = ctx.enqueue_create_buffer[.uint32](n_off)
     ctx.enqueue_copy(input_d, input_h)
     ctx.enqueue_copy(a_off_d, a_off_h)
 
@@ -174,7 +173,7 @@ def _run_fusion_check[
         a_off_d, row_major[n_off]()
     )
 
-    # The fused_silu_mxfp4_kernel is monomorphic over layout types; bind the
+    # The fused_silu_mx_kernel is monomorphic over layout types; bind the
     # comptime params (dtypes, layouts, threads/SMs) and `fuse_a_scale_preshuffle`.
     comptime out_layout = type_of(
         TileTensor[origin=MutAnyOrigin](
@@ -192,7 +191,7 @@ def _run_fusion_check[
         )
     ).LayoutType
 
-    comptime kernel_ref = fused_silu_mxfp4_kernel[
+    comptime kernel_ref = fused_silu_mx_kernel[
         DType.uint8,
         DType.float8_e8m0fnu,
         DType.bfloat16,
@@ -205,7 +204,7 @@ def _run_fusion_check[
         fuse_a_scale_preshuffle=False,
         clamp_activation=clamp_activation,
     ]
-    comptime kernel_fused = fused_silu_mxfp4_kernel[
+    comptime kernel_fused = fused_silu_mx_kernel[
         DType.uint8,
         DType.float8_e8m0fnu,
         DType.bfloat16,
@@ -221,13 +220,11 @@ def _run_fusion_check[
 
     # ---- Path A (reference): fused_silu writes raw [tokens, scale_K], then
     #      the standalone preshuffle kernel rearranges into slots. ----
-    var raw_out_d = ctx.enqueue_create_buffer[DType.uint8](
-        total_tokens * output_dim
-    )
-    var raw_scales_d = ctx.enqueue_create_buffer[DType.float8_e8m0fnu](
+    var raw_out_d = ctx.enqueue_create_buffer[.uint8](total_tokens * output_dim)
+    var raw_scales_d = ctx.enqueue_create_buffer[.float8_e8m0fnu](
         total_tokens * scale_K
     )
-    var ref_d = ctx.enqueue_create_buffer[DType.uint8](slot_bytes)
+    var ref_d = ctx.enqueue_create_buffer[.uint8](slot_bytes)
     ref_d.enqueue_fill(UInt8(0))
 
     ctx.enqueue_function[kernel_ref](
@@ -239,7 +236,7 @@ def _run_fusion_check[
         ),
         input_tt,
         a_off_tt,
-        0,  # max_padded_M unused when fuse_a_scale_preshuffle=False
+        Int32(0),  # max_padded_M unused when fuse_a_scale_preshuffle=False
         alpha,
         limit,
         grid_dim=hw.sm_count,
@@ -269,13 +266,11 @@ def _run_fusion_check[
     )
 
     # ---- Path B (fused): fused_silu writes the slot layout directly. ----
-    var fused_out_d = ctx.enqueue_create_buffer[DType.uint8](
+    var fused_out_d = ctx.enqueue_create_buffer[.uint8](
         total_tokens * output_dim
     )
-    var fused_scales_d = ctx.enqueue_create_buffer[DType.float8_e8m0fnu](
-        slot_bytes
-    )
-    fused_scales_d.enqueue_fill(Scalar[DType.float8_e8m0fnu](0))
+    var fused_scales_d = ctx.enqueue_create_buffer[.float8_e8m0fnu](slot_bytes)
+    fused_scales_d.enqueue_fill(Float8_e8m0fnu(0))
 
     ctx.enqueue_function[kernel_fused](
         TileTensor[origin=MutAnyOrigin](
@@ -290,7 +285,7 @@ def _run_fusion_check[
         ),
         input_tt,
         a_off_tt,
-        max_padded_M,
+        Int32(max_padded_M),
         alpha,
         limit,
         grid_dim=hw.sm_count,
@@ -298,8 +293,8 @@ def _run_fusion_check[
     )
 
     # --- Compare byte for byte over the full slot region. ---
-    var ref_host = ctx.enqueue_create_host_buffer[DType.uint8](slot_bytes)
-    var fused_host = ctx.enqueue_create_host_buffer[DType.uint8](slot_bytes)
+    var ref_host = ctx.enqueue_create_host_buffer[.uint8](slot_bytes)
+    var fused_host = ctx.enqueue_create_host_buffer[.uint8](slot_bytes)
     ctx.enqueue_copy(ref_host, ref_d)
     ctx.enqueue_copy(fused_host, fused_scales_d.unsafe_ptr().bitcast[UInt8]())
     ctx.synchronize()
@@ -362,20 +357,21 @@ def _run_activation_probe[
     comptime hw = ctx.default_device_info
 
     # One expert over all tokens (activation is per-element).
-    var input_h = ctx.enqueue_create_host_buffer[DType.bfloat16](
+    var input_h = ctx.enqueue_create_host_buffer[.bfloat16](
         num_tokens * input_dim
     )
-    var a_off_h = ctx.enqueue_create_host_buffer[DType.uint32](n_off)
+    var a_off_h = ctx.enqueue_create_host_buffer[.uint32](n_off)
     ctx.synchronize()
     # > limit so both clamps fire.
     _fill_random_bf16(input_h, num_tokens * input_dim, -12.0, 12.0)
+    for h in range(MXFP4_SF_VECTOR_SIZE):
+        input_h[h] = BFloat16(-3.0e38)
+        input_h[h + hidden_size] = BFloat16(7.0)
     a_off_h[0] = UInt32(0)
     a_off_h[1] = UInt32(num_tokens)
 
-    var input_d = ctx.enqueue_create_buffer[DType.bfloat16](
-        num_tokens * input_dim
-    )
-    var a_off_d = ctx.enqueue_create_buffer[DType.uint32](n_off)
+    var input_d = ctx.enqueue_create_buffer[.bfloat16](num_tokens * input_dim)
+    var a_off_d = ctx.enqueue_create_buffer[.uint32](n_off)
     ctx.enqueue_copy(input_d, input_h)
     ctx.enqueue_copy(a_off_d, a_off_h)
 
@@ -397,7 +393,7 @@ def _run_activation_probe[
         )
     ).LayoutType
 
-    comptime kernel = fused_silu_mxfp4_kernel[
+    comptime kernel = fused_silu_mx_kernel[
         DType.uint8,
         DType.float8_e8m0fnu,
         DType.bfloat16,
@@ -411,12 +407,12 @@ def _run_activation_probe[
         clamp_activation=True,
     ]
 
-    var out_d = ctx.enqueue_create_buffer[DType.uint8](num_tokens * output_dim)
-    var scales_d = ctx.enqueue_create_buffer[DType.float8_e8m0fnu](
+    var out_d = ctx.enqueue_create_buffer[.uint8](num_tokens * output_dim)
+    var scales_d = ctx.enqueue_create_buffer[.float8_e8m0fnu](
         num_tokens * scale_K
     )
     out_d.enqueue_fill(UInt8(0))
-    scales_d.enqueue_fill(Scalar[DType.float8_e8m0fnu](0))
+    scales_d.enqueue_fill(Float8_e8m0fnu(0))
 
     ctx.enqueue_function[kernel](
         TileTensor[origin=MutAnyOrigin](
@@ -427,17 +423,17 @@ def _run_activation_probe[
         ),
         input_tt,
         a_off_tt,
-        0,  # max_padded_M unused when fuse_a_scale_preshuffle=False
+        Int32(0),  # max_padded_M unused when fuse_a_scale_preshuffle=False
         alpha,
         limit,
         grid_dim=hw.sm_count,
         block_dim=hw.max_thread_block_size,
     )
 
-    var out_host = ctx.enqueue_create_host_buffer[DType.uint8](
+    var out_host = ctx.enqueue_create_host_buffer[.uint8](
         num_tokens * output_dim
     )
-    var scales_host = ctx.enqueue_create_host_buffer[DType.float8_e8m0fnu](
+    var scales_host = ctx.enqueue_create_host_buffer[.float8_e8m0fnu](
         num_tokens * scale_K
     )
     ctx.enqueue_copy(out_host, out_d)
@@ -449,7 +445,7 @@ def _run_activation_probe[
     var max_ratio = Float32(0.0)
     for m in range(num_tokens):
         for h in range(hidden_size):
-            var gate = input_h[m * input_dim + h].cast[DType.float32]()
+            var gate = input_h[m * input_dim + h].cast[.float32]()
             var up = input_h[m * input_dim + h + hidden_size].cast[
                 DType.float32
             ]()
@@ -457,7 +453,7 @@ def _run_activation_probe[
             var g_c = min(gate, limit)
             var u_c = min(max(up, -limit), limit)
             var sig = 1.0 / (1.0 + exp(-(g_c * alpha)))
-            var expected = (u_c + 1.0) * g_c * sig
+            var expected = g_c * sig * (u_c + 1.0)
 
             # Dequant: low nibble=even elem, high=odd; E2M1 value * block scale
             # (E8M0->f32 = 2^(byte-127), the scale fed to cvt.scalef32.pk.fp4).
@@ -470,6 +466,8 @@ def _run_activation_probe[
             var dequant = fp4 * s
 
             var err = abs(dequant - expected)
+            if not isfinite(dequant):
+                violations += 1
             # ~1 quant step (= block scale). 1.10x covers the 4->6 midpoint
             # (err==1.0*S) + transcendental jitter, still fails a wrong clamp.
             var tol = 1.10 * s
@@ -550,7 +548,7 @@ def main() raises:
     _run_fusion_check[hidden_size=3072, NUM_ACTIVE=5](
         "ks96-plainsilu-mixed", [3, 33, 0, 17, 64], 0, ctx
     )
-    print("All fused_silu_mxfp4 scale-fusion checks passed.")
+    print("All fused_silu_mx scale-fusion checks passed.")
 
     # Clamp-math correctness gate (byte-equivalence can't catch it).
     # M3 constants: alpha=1.702, limit=7.0.
@@ -560,4 +558,4 @@ def main() raises:
     _run_activation_probe[hidden_size=2048](
         "ks64-activation-probe", 96, 1.702, 7.0, ctx
     )
-    print("All fused_silu_mxfp4 activation probes passed.")
+    print("All fused_silu_mx activation probes passed.")

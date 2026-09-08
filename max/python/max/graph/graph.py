@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import inspect
+import io
 import itertools
 import traceback
 from collections import OrderedDict
@@ -27,7 +28,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, TypeGuard, TypeVar, cast
 
-from max import _core, mlir
+from max import mlir
 from max._core import Attribute as _Attribute
 from max._core import Block, OpBuilder, Operation
 from max._core import Type as _Type
@@ -62,11 +63,18 @@ from .type import (
 from .value import BufferValue, TensorValue, TensorValueLike, Value, _ChainValue
 from .weight import Weight
 
-# Read from the max-debug.source-tracebacks config key (covers the
-# MODULAR_DEBUG=source-tracebacks env var, modular.cfg, and the
-# Graph.debug.source_tracebacks Python setter via Config overrides).
-_SOURCE_TRACEBACKS_ENABLED = _InferenceSession.debug.source_tracebacks
 CURRENT_GRAPH: ContextVar[Graph] = ContextVar("CURRENT_GRAPH")
+# Stack of active Graph.profile_scope() scopes, outermost first. Each entry is
+# a (name, color) tuple; color is None when unset. A tuple (not a list) so
+# entering/exiting a scope is a ContextVar set()/reset() rather than a
+# mutation shared across contexts.
+# NOTE: this is a single module-level ContextVar, not scoped per Graph.
+# Building a nested Graph while a sibling graph's profile_scope is active will
+# inherit that scope's label; this is not currently supported and should be
+# avoided.
+_CURRENT_PROFILE_SCOPES: ContextVar[tuple[tuple[str, str | None], ...]] = (
+    ContextVar("_CURRENT_PROFILE_SCOPES", default=())
+)
 _KERNEL_LIBRARY_PATHS_ATTR_NAME = "_kernel_library_paths"
 _DEVICE_INFO_MAPPING_ATTR_NAME = "mo.device_info_mapping"
 
@@ -167,7 +175,10 @@ class _DeviceChainMap(OrderedDict[DeviceRef, _ChainValue]):
             return chain
 
         merged = self._graph._add_op_generated(
-            _mo.ChainCreateOp, result=_mo.ChainType(), inputs=unique_chains
+            _mo.ChainCreateOp,
+            result=_mo.ChainType(),
+            inputs=unique_chains,
+            attach_profile_scopes=False,
         )[0]
         assert isinstance(merged, _ChainValue)
         self[DeviceRef.CPU()] = merged
@@ -278,6 +289,26 @@ class KernelLibrary:
         else:
             self._analysis.verify_custom_op(custom_op)
 
+    def has_shape_function(self, kernel: str) -> bool:
+        """Returns whether *kernel* registers a shape function.
+
+        A kernel that registers no shape function has no way to compute its
+        output shape at run time, so the graph compiler rejects a
+        data-dependent output dimension declared for it.
+
+        Args:
+            kernel: The registered name of the kernel to check.
+
+        Returns:
+            ``True`` if a shape function is registered for *kernel*.
+
+        Raises:
+            KeyError: If no kernel named *kernel* is in the library.
+        """
+        if kernel not in self:
+            raise KeyError(f"no kernel named {kernel!r} in the kernel library")
+        return self._analysis.has_shape_function(kernel)
+
 
 _default_custom_extensions: tuple[Path, ...] = ()
 
@@ -347,24 +378,44 @@ class _GraphWeight:
     value: TensorValue
 
 
-def _location(ignore_frames: int = 1):  # noqa: ANN202
+def _location(
+    ignore_frames: int = 1, attach_profile_scopes: bool = True
+) -> mlir.Location:
     """Creates an MLIR Location with the current Python call stack."""
     if not mlir.Context.current:
         raise RuntimeError("Can't create location: No MLIR context active")
 
-    if not _SOURCE_TRACEBACKS_ENABLED:
-        return mlir.Location.unknown()
+    # Read the live config value rather than caching at import time: the
+    # flag can be flipped after import via Graph.debug.source_tracebacks,
+    # InferenceSession.debug.sensible_mode, or MODULAR_DEBUG, and each
+    # graph op must honor the setting at the moment it is created.
+    if not _InferenceSession.debug.source_tracebacks:
+        location: mlir.Location = mlir.Location.unknown()
+    else:
+        # Extract the stack into summaries
+        # - Avoids reference cycles
+        # - Doesn't keep references to closures
 
-    # Extract the stack into summaries
-    # - Avoids reference cycles
-    # - Doesn't keep references to closures
+        # Always remove at least _location
+        tb = traceback.extract_stack()[: -(ignore_frames + 1)]
+        location = (
+            _graph.frame_loc(mlir.Context.current, tb)
+            if tb
+            else mlir.Location.unknown()
+        )
 
-    # Always remove at least _location
-    tb = traceback.extract_stack()[: -(ignore_frames + 1)]
-    if not tb:
-        return mlir.Location.unknown()
+    if attach_profile_scopes:
+        # Wrap outermost scope first, so the innermost scope ends up as the
+        # outermost ProfileScopeLocationAttr and the location assembly reads
+        # in nesting order. This runs regardless of source-traceback capture:
+        # profile_scope labels are a distinct, always-on mechanism riding the
+        # same Location, not a feature of the debug traceback.
+        for name, color in _CURRENT_PROFILE_SCOPES.get():
+            location = _graph.profile_scope_location(
+                mlir.Context.current, name, location, color
+            )
 
-    return _graph.frame_loc(mlir.Context.current, tb)
+    return location
 
 
 def _to_mlir(o: Any) -> Any:
@@ -376,6 +427,40 @@ def _to_mlir(o: Any) -> Any:
     elif isinstance(o, dict):
         return {k: _to_mlir(v) for k, v in o.items()}
     return o
+
+
+# MLIR assembly text must be read and written through the ``max.mlir`` bindings
+# rather than ``max._core``. ``_core`` static-links its own LLVM, so its textual
+# float parser and printer compare ``llvm::APFloat`` semantics against their own
+# copy of the ``APFloatBase::sem*`` statics and never match the ones the
+# attribute was built against. That silently turns f64 constants into denormal
+# garbage and aborts on any f32 that MLIR spells as a hex literal. ``max.mlir``
+# resolves MLIR from ``libmax``, the copy that owns the context, so a round-trip
+# through it agrees with itself. See GEX-4052.
+
+
+def _asm_via_cmlir(op: Operation) -> str:
+    """Serializes an operation to MLIR assembly text.
+
+    The cmlir wrapper is a non-owning view onto ``op``, so whatever owns ``op``
+    keeps owning it.
+    """
+    return str(mlir.Operation._CAPICreate(op._CAPIPtr))
+
+
+def _parse_module_via_cmlir(
+    asm: str, context: mlir.Context
+) -> builtin.ModuleOp:
+    """Parses MLIR assembly text into a typed ``builtin.ModuleOp``.
+
+    Parses in ``max.mlir``, then moves the module into ``max._core`` as
+    bytecode, which is a lossless transport between the two. The result is
+    detached, matching what ``_core.parse_module`` returns.
+    """
+    parsed = mlir.Module.parse(asm, context)
+    bytecode = io.BytesIO()
+    parsed.operation.write_bytecode(bytecode)
+    return Operation.from_bytecode(bytecode.getvalue(), context)
 
 
 def _set_output_param_decls(op: Operation, params: dict[str, None]) -> None:
@@ -405,8 +490,9 @@ def _set_output_param_decls(op: Operation, params: dict[str, None]) -> None:
         )
     )
     names = [parameter.name for parameter in result_parameters]
-    # Track any newly declared parameters.
-    if new_params := dict.fromkeys(names - params.keys()):
+    # Track newly declared parameters. Not `names - params.keys()`: set order
+    # is per-process hash order and lands in the MEF cache key (MXF-584).
+    if new_params := dict.fromkeys(n for n in names if n not in params):
         params.update(new_params)
         si64 = kgen.SIMDType(1, kgen._KGENDType.get_int(64, True))
         # We can't overload the setter yet, so the interface annotation is wrong
@@ -430,14 +516,41 @@ class Module:
 
     .. code-block:: python
 
+        import numpy as np
+        from max.driver import Accelerator, CPU, accelerator_count
+        from max.dtype import DType
+        from max.engine import InferenceSession
+        from max.graph import DeviceRef, Graph, Module, ops
+
+        device = Accelerator() if accelerator_count() > 0 else CPU()
+        device_ref = DeviceRef.from_device(device)
+
         module = Module()
-        with Graph("encoder", input_types=encoder_inputs, module=module) as encoder:
-            ...
-        with Graph("decoder", input_types=decoder_inputs, module=module) as decoder:
-            ...
-        models = session.load_all(module, weights_registry=weights)
-        encoder = models[encoder.name]
-        decoder = models[decoder.name]
+        with Graph("encoder", input_types=[], module=module) as encoder:
+            encoder.output(
+                ops.constant(
+                    np.array([1.0, 2.0, 3.0], dtype=np.float32),
+                    DType.float32,
+                    device=device_ref,
+                )
+            )
+        with Graph("decoder", input_types=[], module=module) as decoder:
+            decoder.output(
+                ops.constant(
+                    np.array([4.0, 5.0, 6.0], dtype=np.float32),
+                    DType.float32,
+                    device=device_ref,
+                )
+            )
+
+        models = InferenceSession(devices=[device]).load_all(module)
+        (enc_out,) = models[encoder.name].execute()
+        (dec_out,) = models[decoder.name].execute()
+
+    .. invisible-code-block: python
+
+        np.testing.assert_allclose(enc_out.to_numpy(), [1.0, 2.0, 3.0])
+        np.testing.assert_allclose(dec_out.to_numpy(), [4.0, 5.0, 6.0])
 
     The wrapped MLIR module is exposed as :attr:`mlir_module` for code that
     must reach the underlying representation (graph compiler internals,
@@ -501,9 +614,16 @@ class Module:
         Returns:
             The module's MLIR assembly text.
         """
-        if source_locations:
-            return _graph.to_mlir_with_source_locations(self.mlir_module)
-        return self.mlir_module.asm()
+        if not source_locations:
+            return _asm_via_cmlir(self.mlir_module)
+
+        # The materialized locations come back as bytecode; reparsing through
+        # max.mlir is what puts the printing in the right LLVM image.
+        with_locations = mlir.Module.parse(
+            _graph.source_locations_bytecode(self.mlir_module),
+            self.mlir_module.context,
+        )
+        return with_locations.operation.get_asm(enable_debug_info=True)
 
 
 class GraphDebugConfig:
@@ -589,7 +709,7 @@ class Graph:
     These examples only use the :obj:`max.graph` package, but most models also
     use :class:`~max.nn.Module` and other building blocks from :obj:`max.nn`.
     To learn more, see `Build a model graph with Module
-    </max/develop/modules>`_.
+    </develop/modules>`_.
 
     Args:
         name: A name for the graph.
@@ -600,7 +720,7 @@ class Graph:
             include :class:`BufferType` instances for mutable in-place inputs.
         path: The path to a saved graph (internal use only).
         custom_extensions: The extensions to load for the model. Supports paths
-            to ``.mojoc``/``.mojopkg`` or ``.mojo`` sources with custom ops.
+            to ``.mojoc`` or ``.mojo`` sources with custom ops.
         kernel_library: Optional pre-built kernel library to use. Defaults to
             ``None`` (a new library is created from ``custom_extensions`` if
             needed).
@@ -639,7 +759,7 @@ class Graph:
     def __init__(
         self,
         name: str,
-        forward: Callable[..., None | Value[Any] | Iterable[Value[Any]]]
+        forward: Callable[..., Value[Any] | Iterable[Value[Any]] | None]
         | None = None,
         input_types: Iterable[Type[Any]] = (),
         path: Path | None = None,
@@ -648,6 +768,7 @@ class Graph:
         kernel_library: KernelLibrary | None = None,
         module: Module | None = None,
         strict_device_placement: DevicePlacementPolicy = DevicePlacementPolicy.Warn,
+        is_device_graph: bool = False,
         **kwargs,
     ) -> None:
         self.name = name
@@ -703,7 +824,10 @@ class Graph:
         # ordering constraints (e.g., host→device transfers for staging).
         self._always_ready_chain = _ChainValue(
             self._add_op_generated(
-                _mo.ChainCreateOp, result=_mo.ChainType(), inputs=[]
+                _mo.ChainCreateOp,
+                result=_mo.ChainType(),
+                inputs=[],
+                attach_profile_scopes=False,
             )[0]
         )
         self._update_chain(self._always_ready_chain)
@@ -732,6 +856,10 @@ class Graph:
         self._import_kernels(extensions)
 
         self._subgraphs = {}
+
+        # If we're building a device graph, annotate the graph appropriately.
+        if is_device_graph:
+            op.is_device_graph = builtin.UnitAttr()
 
         if forward is not None:
             # If the forward method was passed stage the graph directly in the
@@ -770,12 +898,13 @@ class Graph:
     def add_subgraph(
         self,
         name: str,
-        forward: Callable[..., None | Value[Any] | Iterable[Value[Any]]]
+        forward: Callable[..., Value[Any] | Iterable[Value[Any]] | None]
         | None = None,
         input_types: Iterable[Type[Any]] = (),
         path: Path | None = None,
         custom_extensions: Iterable[Path] = [],
         devices: Iterable[DeviceRef] = [],
+        is_device_graph: bool = False,
     ) -> Graph:
         """Creates a reusable subgraph for the current graph.
 
@@ -830,9 +959,11 @@ class Graph:
                 type is added automatically for operation sequencing.
             path: An optional path to a saved subgraph definition to load
                 from disk.
-            custom_extensions: Paths to custom op libraries (``.mojoc``/``.mojopkg``
+            custom_extensions: Paths to custom op libraries (``.mojoc``
                 files or Mojo source directories) to load for the subgraph.
             devices: Devices this subgraph targets.
+            is_device_graph: Should the subgraph be synthesized to a device graph
+                for device graph based execution.
 
         Returns:
             A :class:`Graph` instance registered as a subgraph of this graph.
@@ -845,6 +976,7 @@ class Graph:
             # *args,
             custom_extensions=custom_extensions,
             module=self.module,
+            is_device_graph=is_device_graph,
             # **kwargs,
         )
 
@@ -852,6 +984,10 @@ class Graph:
         op = Operation._from_cmlir(subgraph._mlir_op)
         assert isinstance(op, _mo.GraphOp)
         op.is_subgraph = builtin.UnitAttr()
+
+        # If we're building a device graph, annotate the graph appropriately.
+        if is_device_graph:
+            op.is_device_graph = builtin.UnitAttr()
 
         # Union callee's existing params  with the caller's params.
         # This may over-declare but is deterministic and comprehensive.
@@ -894,6 +1030,50 @@ class Graph:
         per-device ordering (for example, host→device transfers for staging).
         """
         return self._always_ready_chain
+
+    @contextlib.contextmanager
+    def profile_scope(
+        self, name: str, color: str | None = None
+    ) -> Generator[None]:
+        """Labels every op created within this block for profiling.
+
+        Ops created while the scope is active carry ``name`` in their MLIR
+        location, which downstream NVTX tracing surfaces as a ``[name]``
+        suffix on the op's own per-kernel trace name. Scopes nest: entering a
+        second :meth:`profile_scope` while the first is still active labels
+        ops with both names, outermost scope first (for example
+        ``kernel_name [draft_forward/target_forward]``).
+
+        ``color`` is only used by the optional in-region range bracketing
+        mechanism (``max-debug.profile-scope-tracing``); it never appears on
+        the per-kernel trace name, regardless of what was given.
+
+        .. code-block:: python
+
+            from max.graph import Graph
+            with Graph("main") as graph:
+                with graph.profile_scope("draft_forward", color="orange"):
+                    ...  # ops here trace as "kernel_name [draft_forward]"
+
+        Args:
+            name: The scope label to attach to every op created inside this
+                block.
+            color: Optional NVTX color name for the in-region range bracketing
+                mechanism. Has no effect on the per-kernel trace name. Invalid
+                values are silently ignored by the backend.
+
+        Note:
+            Scopes are tracked in a single module-level ContextVar. Do not
+            construct a second nested :class:`Graph` while a sibling graph's
+            ``profile_scope`` is still active; labels would leak between the
+            two graphs.
+        """
+        current = _CURRENT_PROFILE_SCOPES.get()
+        token = _CURRENT_PROFILE_SCOPES.set((*current, (name, color)))
+        try:
+            yield
+        finally:
+            _CURRENT_PROFILE_SCOPES.reset(token)
 
     def __enter__(self) -> Graph:
         self._context_state.append(state := self._enter())
@@ -1007,11 +1187,16 @@ class Graph:
         return self._current_block
 
     def _add_op_generated(
-        self, op_type: type[Operation], *args, **kwargs
+        self,
+        op_type: type[Operation],
+        *args,
+        attach_profile_scopes: bool = True,
+        **kwargs,
     ) -> list[Value[Any]]:
         """Wrapper for clients that only require the op results."""
+        location = _location(attach_profile_scopes=attach_profile_scopes)
         try:
-            with _location() as location, self._capturing_mlir_diagnostics():
+            with self._capturing_mlir_diagnostics():
                 builder = OpBuilder(Block._from_cmlir(self._current_block).end)
                 op = op_type(
                     builder, location, *_to_mlir(args), **_to_mlir(kwargs)
@@ -1044,6 +1229,7 @@ class Graph:
         op,  # noqa: ANN001
         *args,
         _ip: mlir.InsertionPoint | None = None,
+        attach_profile_scopes: bool = True,
         **kwargs,
     ) -> tuple[list[Value[Any]], mlir.OpView]:
         # Convert args from instances of Python graph-api Value() to mlir.Value
@@ -1071,7 +1257,7 @@ class Graph:
         # Construct and insert an op in the body of the graph
         # Insertion point is where the op is to be created in the IR structure
         # location contains info about the source of the op (e.g. file, line)
-        with ip, _location():
+        with ip, _location(attach_profile_scopes=attach_profile_scopes):
             try:
                 with self._capturing_mlir_diagnostics():
                     results = op(*unwrapped_args, **unwrapped_kwargs)
@@ -1207,7 +1393,10 @@ class Graph:
         )
 
         self._add_op_generated(
-            _mo.OutputOp, mlir_values, _kgen.ParameterExprArrayAttr([])
+            _mo.OutputOp,
+            mlir_values,
+            _kgen.ParameterExprArrayAttr([]),
+            attach_profile_scopes=False,
         )
 
         # Set the result_names metadata on the staged op, which is needed by
@@ -1269,7 +1458,7 @@ class Graph:
         with open(path) as f:
             context = default_mlir_context()
             with _location():
-                self._module = _core.parse_module(f.read(), context)
+                self._module = _parse_module_via_cmlir(f.read(), context)
                 # Set the mo.graph op, which is the first operation in the
                 # module body block.
                 self._mlir_op = mlir.Operation._CAPICreate(
@@ -1377,6 +1566,10 @@ class Graph:
             is_placeholder=weight._placeholder,
             has_alias=weight._has_alias,
             _ip=mlir.InsertionPoint.at_block_begin(self._graph_body),
+            # A weight is compile-time data, not a compute op belonging to
+            # whatever profile_scope happens to be active at first use; see
+            # ops.constant()/constant_external() for the same rule.
+            attach_profile_scopes=False,
         )[0]
 
         const_external_op = weight_tensor._mlir_value.owner

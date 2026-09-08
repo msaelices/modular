@@ -37,6 +37,7 @@ from layout import (
     IntTuple,
     Layout,
     MixedLayout,
+    DefaultEngine,
     RuntimeLayout,
     RuntimeTuple,
     TensorLayout,
@@ -44,17 +45,17 @@ from layout import (
     UNKNOWN_VALUE,
     row_major,
 )
-from layout.tensor_storage import TensorStorage
+from layout.tensor_engine import TensorEngine
 from layout.tile_io import copy_sram_to_dram
-from std.gpu.memory import fence_async_view_proxy
+from max.gpu.memory import fence_async_view_proxy
 from std.collections import OptionalReg
 from ....structuring import RegTile
 from structured_kernels.smem_types import reg_tile_to_tile_tensor
 from layout.swizzle import Swizzle
-from std.gpu import lane_id
-from std.gpu.globals import WARP_SIZE, WARPGROUP_SIZE
+from max.gpu import lane_id
+from max.gpu.globals import WARP_SIZE, WARPGROUP_SIZE
 
-from std.gpu.compute.mma import st_matrix
+from max.gpu.compute.mma import st_matrix
 from std.memory import bitcast
 from layout.tensor_core_async import st_matrix_n_layout, st_matrix_m_layout
 from ....utils import elementwise_epilogue_type, elementwise_compute_lambda_type
@@ -154,12 +155,7 @@ trait SMemTileWriter(TrivialRegisterPassable):
     @always_inline
     def write_tile(
         self,
-        src: TileTensor[
-            mut=True,
-            dtype=Self._dtype,
-            address_space=AddressSpace.SHARED,
-            ...,
-        ],
+        src: TileTensor[mut=True, Self._dtype, address_space=.SHARED, ...],
         coords: Tuple[Int, Int],
     ):
         """Write a tile from shared memory to global memory.
@@ -172,7 +168,7 @@ trait SMemTileWriter(TrivialRegisterPassable):
 
 
 struct TileWriterTMA[
-    tma_origin: ImmutOrigin,
+    tma_origin: ImmOrigin,
     dtype: DType,
     tma_rank: Int,
     tile_shape: IndexList[tma_rank],
@@ -217,12 +213,7 @@ struct TileWriterTMA[
     @always_inline
     def write_tile(
         self,
-        src: TileTensor[
-            mut=True,
-            dtype=Self._dtype,
-            address_space=AddressSpace.SHARED,
-            ...,
-        ],
+        src: TileTensor[mut=True, Self._dtype, address_space=.SHARED, ...],
         coords: Tuple[Int, Int],
     ):
         """Write a tile using TMA hardware acceleration.
@@ -252,7 +243,7 @@ struct TileWriterThreadwise[
     dtype: DType,
     dst_layout: TensorLayout,
     dst_origin: MutOrigin,
-    dst_storage: TensorStorage,
+    dst_engine: TensorEngine,
     dst_linear_idx_type: DType,
     //,
     thread_layout: MixedLayout,
@@ -260,15 +251,38 @@ struct TileWriterThreadwise[
     half_tile: Bool = False,  # Handle masked x2 case,
     swapAB: Bool = False,
 ](SMemTileWriter, TrivialRegisterPassable):
+    """Writes shared-memory tiles to global memory using per-thread vectorized stores.
+
+    Implements `SMemTileWriter` without hardware TMA: each thread reads a
+    SIMD-width chunk from a swizzled shared-memory tile and writes it directly
+    to the destination global tensor. Supports an optional A/B swap mapping and
+    a half-tile mode for the x2 masked-consumer case.
+
+    Parameters:
+        dtype: Data type of the source and destination tiles (inferred).
+        dst_layout: Layout of the destination global tensor (inferred).
+        dst_origin: Origin type of the destination global tensor (inferred).
+        dst_engine: Engine of the destination global tensor (inferred).
+        dst_linear_idx_type: Linear index type for the destination tensor
+            (inferred).
+        thread_layout: Layout mapping threads across the tile for vectorized
+            stores.
+        simd_size: SIMD vector width, in elements, used for vectorized stores.
+        half_tile: Whether to write only half the tile for the masked x2
+            consumer case (defaults to False).
+        swapAB: Whether to transpose the A and B matrix mapping (defaults to
+            False).
+    """
+
     comptime _dtype = Self.dtype
 
     comptime DstType = TileTensor[
         mut=True,
-        dtype=Self.dtype,
+        Self.dtype,
         LayoutType=Self.dst_layout,
         origin=Self.dst_origin,
-        Storage=Self.dst_storage,
-        address_space=AddressSpace.GENERIC,
+        Engine=Self.dst_engine,
+        address_space=.GENERIC,
         linear_idx_type=Self.dst_linear_idx_type,
     ]
     var dst: Self.DstType
@@ -292,12 +306,7 @@ struct TileWriterThreadwise[
     @always_inline
     def write_tile(
         self,
-        src: TileTensor[
-            mut=True,
-            dtype=Self._dtype,
-            address_space=AddressSpace.SHARED,
-            ...,
-        ],
+        src: TileTensor[mut=True, Self._dtype, address_space=.SHARED, ...],
         coords: Tuple[Int, Int],
     ):
         """Write a tile using thread-distributed stores.
@@ -461,8 +470,8 @@ struct FragmentToSMemWriter[
 
     comptime st_matrix_rt_layout_type = RuntimeLayout[
         Self.st_matrix_layout_regular if not Self.swapAB else Self.st_matrix_layout_transpose,
-        element_type=DType.int32,
-        linear_idx_type=DType.int32,
+        element_type=.int32,
+        linear_idx_type=.int32,
     ]
 
     comptime st_matrix_tile_layout_regular = row_major[
@@ -475,10 +484,10 @@ struct FragmentToSMemWriter[
     @__allow_legacy_any_origin_fields
     var c_tile: TileTensor[
         mut=True,
-        dtype=Self.c_type,
+        Self.c_type,
         LayoutType=Self.c_tile_layout,
         origin=MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
     ]
     var warp_group_thread_idx: Int
     var local_warp_group_idx: Int
@@ -489,10 +498,10 @@ struct FragmentToSMemWriter[
         out self,
         c_tile: TileTensor[
             mut=True,
-            dtype=Self.c_type,
+            Self.c_type,
             LayoutType=Self.c_tile_layout,
             origin=MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
         ],
         warp_group_thread_idx: Int,
         local_warp_group_idx: Int,
@@ -543,9 +552,10 @@ struct FragmentToSMemWriter[
         self,
         smem_tile: TileTensor[
             mut=True,
-            dtype=Self.c_type,
+            Self.c_type,
             origin=MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
+            Engine=DefaultEngine[element_width=1],
             ...,
         ],
         data: SIMD[Self.c_type, elements_per_op],
@@ -564,14 +574,14 @@ struct FragmentToSMemWriter[
         comptime packed_width = elements_per_op // 2  # BF16 pairs packed as float32
 
         # Pack BF16 pairs into float32 (hardware requirement)
-        var packed_data = bitcast[DType.float32, packed_width](data)
+        var packed_data = bitcast[.float32, packed_width](data)
 
         # Get swizzled offset for bank conflict avoidance
         var swizzled_offset = self._compute_swizzled_offset[n_frag, m_frag]()
 
         # Execute st.matrix hardware instruction
         st_matrix[simd_width=packed_width, transpose=Self.swapAB](
-            smem_tile.ptr + swizzled_offset, packed_data
+            smem_tile._storage + swizzled_offset, packed_data
         )
 
     @always_inline
@@ -599,12 +609,12 @@ struct FragmentToSMemWriter[
         comptime flat_tile_layout = row_major[1, elements_per_tile]()
         var dest_tile_flat = TileTensor[
             mut=True,
-            dtype=Self.c_type,
+            Self.c_type,
             LayoutType=type_of(flat_tile_layout),
             origin=MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
         ](
-            self.c_tile.ptr + tile_linear_idx * elements_per_tile,
+            self.c_tile._storage + tile_linear_idx * elements_per_tile,
             flat_tile_layout,
         )
 
@@ -672,7 +682,7 @@ struct RegisterToGMemWriter[
     c_type: DType,
     dst_layout: TensorLayout,
     dst_origin: MutOrigin,
-    dst_storage: TensorStorage,
+    dst_engine: TensorEngine,
     dst_linear_idx_type: DType,
     //,
     wgmma_shape: IndexList[3],
@@ -693,7 +703,7 @@ struct RegisterToGMemWriter[
         c_type: Output data type.
         dst_layout: Layout of the destination tensor.
         dst_origin: Origin type of the destination tensor.
-        dst_storage: Storage type of the destination tensor.
+        dst_engine: Engine of the destination tensor.
         dst_linear_idx_type: Linear index type for destination tensor.
         wgmma_shape: Shape of the WGMMA operation [M, N, K].
         num_consumer: Number of consumer warp groups.
@@ -717,11 +727,11 @@ struct RegisterToGMemWriter[
 
     comptime DstType = TileTensor[
         mut=True,
-        dtype=Self.c_type,
+        Self.c_type,
         LayoutType=Self.dst_layout,
         origin=Self.dst_origin,
-        Storage=Self.dst_storage,
-        address_space=AddressSpace.GENERIC,
+        Engine=Self.dst_engine,
+        address_space=.GENERIC,
         linear_idx_type=Self.dst_linear_idx_type,
     ]
     var dst: Self.DstType
@@ -974,7 +984,7 @@ struct RegisterToGMemWriter[
                         Self.c_type
                     ]()
 
-                    @parameter
+                    @__parameter
                     def epilogue_coordinates() -> Tuple[Int, Int]:
                         comptime if Self.swapAB:
                             # In swapAB mode, coordinates are transposed

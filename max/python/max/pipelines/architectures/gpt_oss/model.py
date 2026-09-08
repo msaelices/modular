@@ -29,13 +29,13 @@ from max.nn.transformer import ReturnLogits
 from max.pipelines.context import TextContext
 from max.pipelines.lib import (
     AlwaysSignalBuffersMixin,
-    CompilationTimer,
+    GraphPipelineModelWithKVCache,
     KVCacheConfig,
     ModelInputs,
     ModelOutputs,
     PipelineConfig,
-    PipelineModelWithKVCache,
 )
+from max.pipelines.lib.memory_estimation import MemoryPlan
 
 from .batch_processor import GptOssBatchProcessor
 from .gpt_oss import GptOss
@@ -68,7 +68,7 @@ class GptOssInputs(ModelInputs):
 
 
 class GptOssModel(
-    AlwaysSignalBuffersMixin, PipelineModelWithKVCache[TextContext]
+    AlwaysSignalBuffersMixin, GraphPipelineModelWithKVCache[TextContext]
 ):
     """A GPT OSS pipeline model for text generation.
 
@@ -85,6 +85,9 @@ class GptOssModel(
     model: Model
     """The compiled and initialized MAX Engine model ready for inference."""
 
+    # For text-only models, we should be using all the weights.
+    _strict_state_dict_loading = True
+
     def __init__(
         self,
         pipeline_config: PipelineConfig,
@@ -92,6 +95,8 @@ class GptOssModel(
         devices: list[Device],
         kv_cache_config: KVCacheConfig,
         weights: Weights,
+        *,
+        memory_plan: MemoryPlan,
         adapter: WeightsAdapter | None = None,
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
         max_batch_size: int = 1,
@@ -116,34 +121,32 @@ class GptOssModel(
             devices,
             kv_cache_config,
             weights,
-            adapter,
-            return_logits,
+            adapter=adapter,
+            return_logits=return_logits,
             max_batch_size=max_batch_size,
+            memory_plan=memory_plan,
         )
 
         self.model = self.load_model(session)
 
-    def load_model(self, session: InferenceSession) -> Model:
-        """Loads the compiled GPT OSS model into the MAX Engine session.
+    def _create_model_config(self, state_dict: dict[str, Any]) -> GptOssConfig:
+        model_config = GptOssConfig.initialize(
+            self.pipeline_config, max_seq_len=self.max_seq_len
+        )
+        model_config.finalize(
+            huggingface_config=self.huggingface_config,
+            state_dict=state_dict,
+            return_logits=self.return_logits,
+        )
+        return model_config
 
-        Args:
-            session: The MAX Engine inference session.
-
-        Returns:
-            The loaded MAX Engine model object.
-        """
-
-        with CompilationTimer("model") as timer:
-            graph = self._build_graph()
-            timer.mark_build_complete()
-            model = session.load(graph, weights_registry=self.state_dict)
-
-        return model
-
-    # For text-only models, we should be using all the weights.
-    _strict_state_dict_loading = True
-
-    def _build_graph(self):  # noqa: ANN202
+    def _build_graph_for_compile(
+        self,
+        session: InferenceSession,
+        state_dict: dict[str, Any],
+        model_config: GptOssConfig,
+    ) -> tuple[Graph, dict[str, Any]]:
+        del session
         device0 = self.devices[0]
         device_ref = DeviceRef(device0.label, device0.id)
         tokens_type = TensorType(
@@ -166,35 +169,13 @@ class GptOssModel(
             devices=(DeviceRef(d.label, d.id) for d in self.devices)
         )
 
-        huggingface_config = self.huggingface_config
-        if self.adapter:
-            state_dict = self.adapter(
-                dict(self.weights.items()),
-                huggingface_config=huggingface_config,
-                pipeline_config=self.pipeline_config,
-            )
-        else:
-            state_dict = {
-                key: value.data() for key, value in self.weights.items()
-            }
-        model_config = GptOssConfig.initialize(self.pipeline_config)
-        model_config.finalize(
-            huggingface_config=huggingface_config,
-            state_dict=state_dict,
-            return_logits=self.return_logits,
-        )
         nn_model = GptOss(model_config)
         nn_model.load_state_dict(
             state_dict,
             weight_alignment=1,
             strict=self._strict_state_dict_loading,
         )
-        self.state_dict = nn_model.state_dict(auto_initialize=False)
-
-        # Create signal types for distributed communication
-        signals = Signals(
-            devices=(DeviceRef(d.label, d.id) for d in self.devices)
-        )
+        weights_registry = nn_model.state_dict(auto_initialize=False)
 
         kv_inputs = self.kv_params.get_symbolic_inputs()
         flattened_kv_types = kv_inputs.flatten()
@@ -224,18 +205,21 @@ class GptOssModel(
             ]
             variadic_args = variadic_args[len(self.devices) :]
 
-            # Extract KV cache inputs
-            kv_cache = self._unflatten_kv_inputs(variadic_args)
+            # Extract KV cache inputs from the unified {sliding, global} tree.
+            kv_cache_local, kv_cache_global = (
+                self.kv_params.unflatten_basic_kv_tree(iter(variadic_args))
+            )
 
             outputs = nn_model(
                 tokens=tokens.tensor,
                 signal_buffers=signal_buffers,
-                kv_cache_inputs_per_dev=kv_cache,
+                sliding_kv_collections=kv_cache_local,
+                global_kv_collections=kv_cache_global,
                 return_n_logits=return_n_logits.tensor,
                 input_row_offsets=input_row_offsets,
             )
             graph.output(*outputs)
-        return graph
+        return graph, weights_registry
 
     def execute(self, model_inputs: ModelInputs) -> ModelOutputs:
         """Executes the GPT OSS model with the prepared inputs.

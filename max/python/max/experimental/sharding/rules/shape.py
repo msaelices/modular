@@ -523,7 +523,7 @@ def reshape_rule(x: TensorLayout, shape: Any) -> ActionSet:
             rows.append(
                 AxisAssignment(
                     (p,),
-                    Sharded(landings[k], even=p.even),
+                    Sharded(landings[k]),
                 )
             )
             continue
@@ -532,14 +532,12 @@ def reshape_rule(x: TensorLayout, shape: Any) -> ActionSet:
         # so the picker cannot guess a wrong target axis.
         route = _structural_split_route(k, x, new_shape)
         if route is not None:
-            rows.append(AxisAssignment((p,), Sharded(route, even=p.even)))
+            rows.append(AxisAssignment((p,), Sharded(route)))
             continue
         # ``-1`` shorthand: unique sharded source + unique ``-1`` in
         # target ⇒ land on the ``-1`` slot.
         if len(minus_one_axes) == 1 and len(sharded_src_axes) == 1:
-            rows.append(
-                AxisAssignment((p,), Sharded(minus_one_axes[0], even=p.even))
-            )
+            rows.append(AxisAssignment((p,), Sharded(minus_one_axes[0])))
     rows.append(AxisAssignment((P,), P))
     return build_action_set(
         rows,
@@ -837,7 +835,7 @@ def pad_rule(
     input: TensorLayout,
     paddings: Iterable[int],
     mode: str = "constant",
-    value: TensorLayout | int | float = 0,
+    value: TensorLayout | float = 0,
 ) -> ActionSet:
     """Strategies for ``pad``: sharding allowed on unpadded axes only."""
     pads = tuple(paddings)
@@ -939,14 +937,23 @@ def gather_nd_rule(
 
 
 def _scatter_rows(input: TensorLayout, axis: int) -> list[AxisAssignment]:
-    """Builds the menu for ``scatter`` / ``scatter_add``."""
+    """Builds the menu for ``scatter`` / ``scatter_add``.
+
+    Non-scatter axes are batch-like (``updates``/``indices`` share the
+    input's extent there), so all three operands shard together on them.
+    Replicating ``updates``/``indices`` against a sharded input would give
+    each device the full batch extent against a partial input shard, and the
+    scatter kernel would index outside the shard.
+    """
     in_r = input.rank
     a_axis = axis % in_r
     rows: list[AxisAssignment] = [AxisAssignment((R, R, R), R)]
     for ax in range(in_r):
         if ax == a_axis:
             continue
-        rows.append(AxisAssignment((Sharded(ax), R, R), Sharded(ax)))
+        rows.append(
+            AxisAssignment((Sharded(ax), Sharded(ax), Sharded(ax)), Sharded(ax))
+        )
     return rows
 
 

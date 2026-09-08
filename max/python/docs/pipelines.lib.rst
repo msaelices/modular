@@ -29,6 +29,7 @@ Configuration
    :template: autosummary/class.rst
 
    DenoisingCacheConfig
+   DenoisingCacheSettings
    KVConnectorConfig
    MAXConfig
    MAXModelConfigBase
@@ -66,17 +67,8 @@ Tokenizers
    :toctree: generated
    :template: autosummary/class.rst
 
+   AudioGenerationTokenizer
    PixelGenerationTokenizer
-
-LoRA
-----
-
-.. autosummary::
-   :nosignatures:
-   :toctree: generated
-   :template: autosummary/class.rst
-
-   LoRAManager
 
 Utilities
 ---------
@@ -88,7 +80,10 @@ Utilities
 
    CompilationTimer
    HuggingFaceRepo
+   MemoryPlan
    ModelManifest
+   RetrievedPipeline
+   VisionPreprocessCache
    WeightPathParser
 
 Functions

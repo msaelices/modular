@@ -24,7 +24,9 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import numpy.typing as npt
 from max.pipelines.context import (
+    FUTURE_TOKEN,
     GenerationStatus,
+    GrammarMatcher,
     LogProbabilities,
     StructuredOutputRegionDelimiters,
     TextGenerationContextType,
@@ -114,16 +116,18 @@ def calculate_num_steps(
 def build_response(
     context_batch: list[TextGenerationContextType],
     max_seq_len: int,
-    max_growth_per_step: int = 1,
 ) -> dict[RequestID, TextGenerationOutput]:
     """Build response from updated contexts.
+
+    Marks a context ``MAXIMUM_LENGTH`` only when it has no room for even one
+    more token. Callers that can append more than one token per step (e.g.
+    speculative decoding) are responsible for not overshooting the cap when
+    they commit tokens; see
+    :func:`update_spec_decode_context_and_prepare_responses`.
 
     Args:
         context_batch: The list of context objects.
         max_seq_len: The maximum sequence length.
-        max_growth_per_step: Maximum tokens that can be added in the next step.
-            For standard decoding this is 1. For speculative decoding this is
-            num_speculative_tokens + 1 (all drafts accepted + bonus token).
 
     Returns:
         Dictionary mapping request IDs to TextGenerationOutput objects.
@@ -135,9 +139,12 @@ def build_response(
             upper_bound=max_seq_len, default=context.max_length
         )
 
-        # Mark as done if the next step would exceed the max length.
+        # Mark done only when there is no room for even one more token. The
+        # per-step commit loop is responsible for not overshooting this cap.
+        # An already-terminated request keeps its status: EOS outranks the
+        # cap, matching ``TextContext.update``'s precedence.
         current_length = context.tokens.processed_length + 1
-        if current_length + max_growth_per_step > context_max_length:
+        if current_length >= context_max_length and not context.status.is_done:
             context.status = GenerationStatus.MAXIMUM_LENGTH
 
         output = context.to_generation_output()
@@ -260,38 +267,47 @@ def update_spec_decode_context_and_prepare_responses(
         if not ctx.tokens.generated_length:
             continue
 
+        # A spec-decode step can append up to num_speculative_tokens + 1
+        # tokens at once, which may cross max_seq_len. The KV pool carries
+        # num_draft_tokens slack beyond max_seq_len so the forward pass is
+        # safe, but committing past the limit would emit out-of-context
+        # tokens and push the next step past the pool. Cap the commit at the
+        # limit and mark the request done.
+        context_max_length = upper_bounded_default(
+            upper_bound=max_seq_len, default=ctx.max_length
+        )
+
         maybe_accepted_draft_tokens: list[int] = draft_tokens[
             batch_idx
         ].tolist()
         num_accept = num_accepted_draft_tokens[batch_idx]
         tokens = maybe_accepted_draft_tokens[:num_accept]
         tokens += [next_tokens[batch_idx]]
+        num_committed = 0
         for i, token in enumerate(tokens):
-            # The overlap scheduler leaves a FUTURE_TOKEN placeholder as the last
-            # generated token; realize_future_token overwrites it in place. Calling
-            # update() for that same index would append a duplicate (see
-            # update_context_and_prepare_responses with overwrite_future).
             if i == 0:
                 ctx.realize_future_token(token)
-                # For structured output, advance FSM with the realized token.
-                # realize_future_token only updates the token buffer, not the FSM.
-                # Skip when a CUDA host callback already advanced the FSM.
                 if ctx.matcher is not None and not skip_fsm_advance:
                     ctx.advance_fsm(token)
             elif ctx.is_done:
                 break
             else:
                 if skip_fsm_advance and ctx.matcher is not None:
-                    # Token buffer must still advance; FSM was already advanced
-                    # by the CUDA host callback. Only skip ctx.update() when
-                    # there is a matcher — unconstrained contexts must still
-                    # call ctx.update() so EOS detection fires normally.
                     ctx.advance_token_buffer(token)
                 else:
                     ctx.update(token)
 
+            num_committed = i + 1
+            if ctx.tokens.current_position >= context_max_length:
+                # Same EOS-outranks-cap precedence as build_response above.
+                if not ctx.status.is_done:
+                    ctx.status = GenerationStatus.MAXIMUM_LENGTH
+                break
+
         if track_phase:
-            for token in tokens:
+            # Only the committed prefix reached the buffer; tokens dropped by
+            # the length cap must not toggle the reasoning phase.
+            for token in tokens[:num_committed]:
                 if token == think_start_token_id:
                     ctx.in_reasoning_phase = True
                 elif token == think_end_token_id:
@@ -299,20 +315,13 @@ def update_spec_decode_context_and_prepare_responses(
 
         ctx.spec_decoding_state.maybe_accepted_draft_tokens = []
         if not ctx.is_done:
-            # Save draft tokens for verification in the next TG step.
-            # Skipped when is_done=True: the context produces no further TG
-            # steps so draft tokens are unnecessary.
             ctx.spec_decoding_state.draft_tokens_to_verify = next_draft_tokens[
                 batch_idx
             ].tolist()
 
-    # With speculative decoding, the next step can add up to
-    # num_speculative_tokens (all drafts accepted) + 1 (bonus token).
-    max_growth_per_step = num_speculative_tokens + 1
     result = build_response(
         context_batch=context_batch,
         max_seq_len=max_seq_len,
-        max_growth_per_step=max_growth_per_step,
     )
 
     # Clear draft tokens for contexts that won't be processed further.
@@ -336,35 +345,50 @@ def get_rope_theta(config: AutoConfig) -> float:
     return config.rope_theta
 
 
-def get_eos_tokens(hf_config: AutoConfig, eos_token_id: int) -> set[int]:
-    """Returns the set of end-of-sequence token IDs from config or fallback.
+@dataclass(frozen=True)
+class CommittedSpanSnapshot:
+    """Token-buffer state of one producing-batch row, captured at enqueue time.
 
-    Args:
-        hf_config: HuggingFace model configuration.
-        eos_token_id: Default EOS token id when not present in config.
-
-    Returns:
-        Set of EOS token ids to use for generation.
+    StructuredOutputHelper.advance_fsm_and_compute_bitmasks runs on an
+    AsyncRT worker while the main thread realizes the same batch's tokens into
+    ctx.tokens, so a worker-side read cannot tell "history before the
+    committed span" from "history including it" -- both end in a
+    FUTURE_TOKEN placeholder. Capturing on the main thread, before the
+    callback is enqueued, is what makes the answer unambiguous.
     """
-    # Expand eos tokens if more are provided in pipeline_config
-    if "eos_token_id" not in hf_config:
-        return set([eos_token_id])
 
-    hf_eos_tokens = hf_config.eos_token_id
-    if isinstance(hf_eos_tokens, int):
-        if hf_eos_tokens != eos_token_id:
-            msg = f"eos_token_id provided in huggingface config ({hf_eos_tokens}), does not match provided eos_token_id ({eos_token_id}), using provided eos_token_id"
-            logger.warning(msg)
-        return set([hf_eos_tokens])
-    elif isinstance(hf_eos_tokens, list):
-        if eos_token_id in hf_eos_tokens:
-            return set(hf_eos_tokens)
-        else:
-            return set([eos_token_id])
-    else:
-        msg = f"eos_token_id in huggingface_config is neither int or list: {hf_eos_tokens}"
-        logger.warning(msg)
-        return set([eos_token_id])
+    prior_generated: npt.NDArray[np.int64]
+    """Generated tokens preceding the committed span, placeholder-free.
+
+    Only the last EOSTracker.eos_sequence_lookback of them, since
+    that is all EOSTracker.first_eos_offset reads -- a bounded tail per
+    row, whatever the context length. Empty when the request configures
+    no multi-token stop sequence, which is the common case.
+
+    A copy, not a view: realize_future_token overwrites placeholder slots
+    of the context's token array in place.
+    """
+
+    @classmethod
+    def capture(
+        cls, context_batch: Sequence[TextGenerationContextType]
+    ) -> list[CommittedSpanSnapshot]:
+        """Captures one snapshot per row, in context_batch order."""
+        snapshots = []
+        for ctx in context_batch:
+            keep = ctx.eos_tracker.eos_sequence_lookback
+            gen = ctx.tokens.generated
+            end = len(gen)
+            if end > 0 and int(gen[-1]) == FUTURE_TOKEN:
+                end -= 1
+            snapshots.append(
+                cls(
+                    prior_generated=np.array(
+                        gen[max(0, end - keep) : end], dtype=np.int64
+                    )
+                )
+            )
+        return snapshots
 
 
 @dataclass
@@ -447,7 +471,7 @@ class StructuredOutputHelper:
             # Parsers that opt into enforcement-to-EOS get no end tag:
             # enforcement stays on after the section closes, so the
             # completed grammar masks everything but EOS and the turn
-            # ends with its single section (e.g. MiniMax-M3; CENG-718).
+            # ends with its single section (e.g. MiniMax-M3).
             if parser_cls.ENFORCE_TOOL_REGION_TO_EOS:
                 return (parser_cls.SECTION_BEGIN, None)
             return (parser_cls.SECTION_BEGIN, parser_cls.SECTION_END)
@@ -463,6 +487,7 @@ class StructuredOutputHelper:
         enable_structured_output: bool,
         tool_parser_name: str | None = None,
         backend_name: str | None = None,
+        any_whitespace: bool | None = None,
     ) -> StructuredOutputHelper:
         """Create a helper from a tokenizer.
 
@@ -475,6 +500,9 @@ class StructuredOutputHelper:
             backend_name: Structured-output backend to use. ``None`` (the
                 default, i.e. an unresolved ``SamplingConfig``) falls back to
                 ``"xgrammar"``.
+            any_whitespace: Whether ``response_format`` grammars accept
+                whitespace between JSON tokens. ``None`` (an unresolved
+                ``SamplingConfig``) falls back to ``False`` (compact JSON).
 
         Returns:
             A configured StructuredOutputHelper instance.
@@ -490,6 +518,9 @@ class StructuredOutputHelper:
             backend_name or DEFAULT_STRUCTURED_OUTPUT_BACKEND,
             tokenizer_delegate,
             vocab_size,
+            tool_parser_name=tool_parser_name,
+            stop_token_ids=tokenizer.eos_token_ids,
+            any_whitespace=bool(any_whitespace),
         )
 
         # Extract structural tags from tool parser if available
@@ -522,6 +553,37 @@ class StructuredOutputHelper:
             backend=backend,
             tool_call_region_delimiters=tool_call_region_delimiters,
         )
+
+    def build_matcher(
+        self, grammar: str | None, json_schema: str | None
+    ) -> GrammarMatcher:
+        """Builds a grammar matcher without touching context state.
+
+        Safe to call from any thread: it reads only the immutable backend,
+        which releases the GIL during the expensive step. ``grammar`` takes
+        precedence over ``json_schema``, matching :meth:`update_context`.
+        """
+        assert self.backend is not None
+        if grammar:
+            return self.backend.create_matcher(grammar)
+        assert json_schema is not None
+        compiled = self.backend.compile_json_schema(json_schema)
+        # No-op on xgrammar, which rejects unsatisfiable schemas at compile
+        # time; llguidance fails open without it.
+        self.backend.validate_grammar(compiled)
+        return self.backend.create_matcher(compiled)
+
+    def install_matcher(
+        self, context: TextGenerationContextType, matcher: GrammarMatcher
+    ) -> None:
+        """Installs a built matcher on a context.
+
+        Sets the tool region for grammar requests; cheap enough for the
+        decode thread.
+        """
+        context.set_matcher(matcher)
+        if context.grammar:
+            self.set_context_tool_region(context)
 
     def update_context(
         self,
@@ -577,9 +639,8 @@ class StructuredOutputHelper:
             assert self.backend is not None
             try:
                 with Tracer("tool_grammar_compile"):
-                    matcher = self.backend.create_matcher(context.grammar)
-                context.set_matcher(matcher)
-                self.set_context_tool_region(context)
+                    matcher = self.build_matcher(context.grammar, None)
+                self.install_matcher(context, matcher)
             except Exception as e:
                 raise InputError(
                     f"Grammar provided in request cannot be compiled. "
@@ -588,7 +649,7 @@ class StructuredOutputHelper:
 
         # Fall back to json_schema if no grammar
         # json_schema requires enable_response_format_schema (--enable-structured-output flag)
-        elif context.json_schema and context.matcher is None:
+        elif context.json_schema is not None and context.matcher is None:
             if not self.enable_response_format_schema:
                 raise InputError(
                     "json_schema provided but structured output is not enabled. "
@@ -597,9 +658,8 @@ class StructuredOutputHelper:
 
             assert self.backend is not None
             try:
-                grammar = self.backend.compile_json_schema(context.json_schema)
-                matcher = self.backend.create_matcher(grammar)
-                context.set_matcher(matcher)
+                matcher = self.build_matcher(None, context.json_schema)
+                self.install_matcher(context, matcher)
             except Exception as e:
                 raise InputError(
                     f"JSON schema provided in request cannot be compiled to "
@@ -642,7 +702,9 @@ class StructuredOutputHelper:
         Only fills the bitmask when the context has a matcher AND
         grammar_enforced is True. For conditional enforcement
         (tool_choice=auto), the bitmask is left unconstrained until
-        the tool call start token is detected.
+        the tool call start token is detected, and a matcher with no valid
+        continuation leaves it unconstrained too (see
+        :meth:`_fill_slot_unless_matcher_dead`).
 
         Args:
             context: Request context with a matcher.
@@ -650,9 +712,8 @@ class StructuredOutputHelper:
             index: Position in the bitmask for this request.
         """
         if context.matcher and context.grammar_enforced:
-            assert self.backend is not None
-            self.backend.fill_next_token_bitmask(
-                context.matcher, bitmask, index
+            self._fill_slot_unless_matcher_dead(
+                context, context.matcher, bitmask, index
             )
 
     def set_context_tool_region(
@@ -668,9 +729,12 @@ class StructuredOutputHelper:
             context: Request context with grammar state.
         """
         if self.tool_call_region_delimiters is not None:
+            end_token_ids = self.tool_call_region_delimiters.end_token_ids
+            if context.grammar_state.has_json_schema:
+                end_token_ids = None
             context.set_tool_region(
                 start_token_ids=self.tool_call_region_delimiters.start_token_ids,
-                end_token_ids=self.tool_call_region_delimiters.end_token_ids,
+                end_token_ids=end_token_ids,
             )
 
     def _tokens_for_consume(self, token: int, was_enforced: bool) -> list[int]:
@@ -688,6 +752,57 @@ class StructuredOutputHelper:
         if not was_enforced and delims and delims.start_token_ids:
             return list(delims.start_token_ids)
         return [token]
+
+    def _fill_slot_unless_matcher_dead(
+        self,
+        ctx: TextGenerationContextType,
+        matcher: GrammarMatcher,
+        bitmask: npt.NDArray[np.int32],
+        index: int,
+    ) -> None:
+        """Fill one bitmask slot, unless the matcher has no valid continuation.
+
+        A matcher that is stopped *without* accepting has erred: llguidance
+        leaves it stopped-and-not-accepting once a token is rejected, and
+        ``fill_next_token_bitmask`` then writes an all-zero row. That row offers
+        the sampler no candidate at all, and because the masked-out fill is
+        finite by design -- so a fully-masked row degrades to a uniform draw
+        rather than NaN -- the draw spreads across the whole vocabulary,
+        including any padded tail the model masked to ``-inf``. Leaving the slot
+        at its ``-1`` reset is strictly better: the request keeps generating
+        from the model's own distribution instead of a uniform one, and the
+        grammar was already unsatisfiable for this request.
+
+        A stopped matcher that *is* accepting is a completed grammar, not an
+        error. Its mask allows only EOS, which is correct and still applied --
+        a backend whose native fill call can't tolerate a stopped matcher
+        (see :meth:`XgrammarBackend.fill_next_token_bitmask`) is responsible
+        for computing that EOS-only mask itself, since llguidance's real,
+        frequently-hit case here is a normal successful completion, not an
+        error state.
+
+        Args:
+            ctx: The request context, for the report latch and diagnostics.
+            matcher: The matcher to read the mask from (a speculative copy on
+                the spec-decode path, the request's own matcher otherwise).
+            bitmask: The ``[rows, packed_vocab]`` bitmask to write into.
+            index: Row of ``bitmask`` to fill.
+        """
+        if matcher.is_stopped() and not matcher.is_accepting():
+            if not ctx.grammar_state.dead_matcher_reported:
+                ctx.grammar_state.dead_matcher_reported = True
+                logger.error(
+                    "Matcher for request %s is stopped without accepting, so "
+                    "it has no valid next token; leaving its bitmask "
+                    "unconstrained for the rest of the request. "
+                    "matcher_errors=%s matcher_warnings=%s",
+                    ctx.request_id,
+                    matcher.get_error(),
+                    matcher.get_grammar_warnings(),
+                )
+            return
+        assert self.backend is not None
+        self.backend.fill_next_token_bitmask(matcher, bitmask, index)
 
     def _speculatively_fill_bitmask_window(
         self,
@@ -710,16 +825,29 @@ class StructuredOutputHelper:
 
         Args:
             ctx: The request context.
-            drafts: ``[K]`` candidate draft tokens for the next batch.
-            bitmask_window: ``[K+1, packed_vocab]``, pre-initialized to
+            drafts: Candidate draft tokens for the next batch.
+            bitmask_window: ``[num_positions, packed_vocab]`` with
+                ``num_positions >= len(drafts)+1``, pre-initialized to
                 ``-1`` (unconstrained). Slot 0 is the position
                 immediately after the committed tokens; slot ``i+1`` is
                 the position after consuming ``drafts[i]``. Slots stay
-                ``-1`` wherever grammar enforcement is off.
+                ``-1`` wherever grammar enforcement is off, where the
+                matcher has no valid continuation (see
+                :meth:`_fill_slot_unless_matcher_dead`).
         """
         assert ctx.matcher is not None
         fsm_snap = ctx.snapshot_grammar_state()
 
+        # The window keeps the graph's static width while the realized draft
+        # width can shrink (a prefill->decode batch verifies zero drafts), so a
+        # wider window is normal; unreached slots keep their -1. Too narrow is a
+        # caller bug worth raising on.
+        if drafts.shape[0] + 1 > bitmask_window.shape[0]:
+            raise ValueError(
+                f"bitmask window has {bitmask_window.shape[0]} slots but "
+                f"{drafts.shape[0]} drafts were passed; the window must hold "
+                "at least one slot per draft plus the bonus slot."
+            )
         # Speculatively consume drafts on a throwaway copy of the matcher.
         # LLMatcher.rollback() is not a perfect inverse when the consumed
         # span crosses a grammar rule/repetition boundary — e.g.
@@ -727,13 +855,10 @@ class StructuredOutputHelper:
         # issue by taking a deep copy instead.
         matcher_copy = ctx.matcher.deep_copy()
 
-        assert self.backend is not None
         # Slot 0: state immediately after committed tokens.
         if ctx.grammar_enforced:
-            self.backend.fill_next_token_bitmask(
-                matcher_copy,
-                bitmask_window[0, :].reshape(1, -1),
-                0,
+            self._fill_slot_unless_matcher_dead(
+                ctx, matcher_copy, bitmask_window[0, :].reshape(1, -1), 0
             )
 
         vocab_size = self.vocab_size or 0
@@ -761,7 +886,8 @@ class StructuredOutputHelper:
                     break
 
             if consumed or ctx.grammar_enforced:
-                self.backend.fill_next_token_bitmask(
+                self._fill_slot_unless_matcher_dead(
+                    ctx,
                     matcher_copy,
                     bitmask_window[i + 1, :].reshape(1, -1),
                     0,
@@ -836,6 +962,7 @@ class StructuredOutputHelper:
         next_draft_tokens: npt.NDArray[np.int64],
         bitmask_out: npt.NDArray[np.int32],
         output_context_batch: list[TextGenerationContextType] | None = None,
+        committed_span_snapshots: Sequence[CommittedSpanSnapshot] | None = None,
     ) -> None:
         """Advance FSM through accepted tokens, then compute bitmasks for the next batch.
 
@@ -875,15 +1002,48 @@ class StructuredOutputHelper:
             accepted_draft_tokens: Draft tokens verified this batch, shape [batch, K].
             num_accepted: Count of accepted draft tokens per request, shape [batch].
             bonus_tokens: Bonus (target) tokens per request, shape [batch].
-            next_draft_tokens: Draft tokens for the next batch, shape [batch, K].
+            next_draft_tokens: Draft tokens for the next batch, shape
+                [batch, K], at the configured draft depth. Trimmed to the
+                consuming step's verify width, which may be narrower.
             bitmask_out: Packed int32 bitmask output, shape
-                [len(output_context_batch), K+1, packed_vocab]. Every row is
-                reset to -1 (unconstrained) before filling.
+                [len(output_context_batch), verify_width+1, packed_vocab],
+                where ``verify_width`` is how many drafts the consuming step
+                verifies. Every row is reset to -1 (unconstrained) before
+                filling.
             output_context_batch: Requests in the consuming batch's row order.
                 Defaults to ``context_batch`` when the batch did not change.
+            committed_span_snapshots: Per-context_batch-row token history
+                captured on the main thread at enqueue time. Required from an
+                async caller, whose ctx.tokens reads would otherwise race
+                the main thread's token realization; a synchronous caller may
+                omit it and have it captured here. A count mismatch is logged
+                and falls back to a worker-side read, never raised on.
         """
         if output_context_batch is None:
             output_context_batch = context_batch
+        if committed_span_snapshots is None:
+            committed_span_snapshots = CommittedSpanSnapshot.capture(
+                context_batch
+            )
+        elif len(committed_span_snapshots) != len(context_batch):
+            # Fall back to reading the buffer rather than raising: the batch is
+            # already marked FSM-advanced, so a raise would leave every row this
+            # loop had not reached stuck behind its request's emitted tokens.
+            # Reading here races the main thread's writes: the offset stays
+            # exact for a row with no multi-token stop sequence, whose history
+            # goes unread, and may be wrong for any other row.
+            logger.error(
+                "Async FSM advance got %d committed-span snapshots for %d "
+                "rows; falling back to a worker-side read. The end-of-sequence "
+                "offset may be wrong for a row whose stop sequence straddles "
+                "the newly committed tokens. Capture the snapshots from the "
+                "same batch, before enqueuing.",
+                len(committed_span_snapshots),
+                len(context_batch),
+            )
+            committed_span_snapshots = CommittedSpanSnapshot.capture(
+                context_batch
+            )
         # This method runs on an AsyncRT worker thread. The main thread
         # may try to access the same ``ctx.matcher`` via
         # ``compute_speculative_bitmasks`` for the next iter while this
@@ -907,23 +1067,6 @@ class StructuredOutputHelper:
                 # Advance the enforcement state machine through committed
                 # tokens, one at a time so special tokens (e.g. tool-call
                 # structural tags) can flip grammar enforcement mid-sequence.
-                # This mirrors the synchronous ``advance_fsm`` in
-                # ``context.py`` exactly:
-                #
-                #   * EOS-class tokens are not part of the grammar — they
-                #     signal end of generation. Skip the matcher so it
-                #     stays in a clean terminal state rather than getting
-                #     a spurious rejection.
-                #   * For everything else, gate on
-                #     ``update_enforcement_state``'s return value, not on
-                #     ``grammar_enforced``. The return value distinguishes
-                #     ``</think>`` (flip enforcement on, do NOT consume —
-                #     the thinking delimiter isn't grammar content) from
-                #     ``<|tool_calls_section_end|>`` (flip enforcement
-                #     off, DO consume — it's the grammar's terminal).
-                #   * If the matcher rejects, log and disable enforcement
-                #     for the rest of the request — continuing against a
-                #     desynced matcher produces schema-shaped nonsense.
                 n_accepted = int(num_accepted[ctx_idx])
                 bonus_token = int(bonus_tokens[ctx_idx])
                 committed_tokens = [
@@ -931,11 +1074,17 @@ class StructuredOutputHelper:
                     for j in range(n_accepted)
                 ]
                 committed_tokens.append(bonus_token)
-
+                eos_offset = ctx.eos_tracker.first_eos_offset(
+                    committed_span_snapshots[ctx_idx].prior_generated,
+                    committed_tokens,
+                )
                 for committed_idx, token in enumerate(committed_tokens):
-                    if token in ctx.eos_tracker.eos_token_ids:
+                    # Generation stops at the first terminating token; tokens
+                    # after it are never emitted, so disable enforcement and
+                    # stop rather than advancing the matcher through them.
+                    if committed_idx == eos_offset:
                         ctx.grammar_enforced = False
-                        continue
+                        break
                     was_enforced = ctx.grammar_enforced
                     if not ctx.update_enforcement_state(token):
                         continue
@@ -1026,9 +1175,13 @@ class StructuredOutputHelper:
                     continue
                 # A draft that flips enforcement on mid-window causes
                 # downstream slots to be constrained.
+                # The producing batch drafted the configured depth, but the
+                # consuming step may verify fewer, and the window is sized from
+                # what it verifies. Trim to the window's draft slots so a
+                # narrower consumer cannot overrun it.
                 self._speculatively_fill_bitmask_window(
                     ctx,
-                    drafts=next_draft_tokens[src],
+                    drafts=next_draft_tokens[src, : bitmask_out.shape[1] - 1],
                     bitmask_window=bitmask_out[out_idx],
                 )
 
@@ -1054,8 +1207,10 @@ class StructuredOutputHelper:
 
         Args:
             context_batch: List of generation contexts.
-            draft_tokens: Draft tokens to verify, shape [batch, K].
-            num_positions: Number of bitmask positions (K + 1, including bonus).
+            draft_tokens: Draft tokens to verify, shape
+                [batch, verify_width].
+            num_positions: Number of bitmask positions
+                (``verify_width + 1``, including bonus).
 
         Returns:
             Packed int32 bitmask array of shape
@@ -1103,7 +1258,7 @@ class StructuredOutputHelper:
             # Initialize matchers for contexts with json_schema or grammar
             for ctx in context_batch:
                 needs_matcher = ctx.matcher is None and (
-                    ctx.json_schema or ctx.grammar is not None
+                    ctx.json_schema is not None or ctx.grammar is not None
                 )
                 if needs_matcher:
                     self.update_context(
@@ -1128,3 +1283,11 @@ class StructuredOutputHelper:
         # Return the packed int32 bitmask directly; the GPU acceptance sampler
         # unpacks and applies it in a single fused pass.
         return packed_bitmask
+
+
+def get_structured_output_helper(
+    pipeline: object,
+) -> StructuredOutputHelper | None:
+    """Returns the pipeline's structured-output helper, if it exposes one."""
+    helper = getattr(pipeline, "_structured_output", None)
+    return helper if isinstance(helper, StructuredOutputHelper) else None

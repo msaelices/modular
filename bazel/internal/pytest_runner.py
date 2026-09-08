@@ -131,7 +131,7 @@ elif [[ "${{MODULAR_RR:-}}" == "1" ]]; then
 else
   env {pairs} \
       "$lldb_bin" \
-      --one-line-before-file 'plugin load bazel-bin/KGEN/libMojoLLDB.{extension}' \
+      --one-line-before-file 'plugin load bazel-bin/Mojo/libMojoLLDB.{extension}' \
       --one-line-before-file 'settings set target.launch-working-dir {pwd}' \
       -- {args}
 fi
@@ -156,8 +156,11 @@ fi
 
     __set_torch_memory_limit()
     namespace, unknown_args = __build_parser().parse_known_args(args)
+    xml_file = os.environ["XML_OUTPUT_FILE"]
+    if Path(xml_file).exists():
+        os.chmod(xml_file, mode=0o600)
     pytest_args = [
-        f"--junitxml={os.environ['XML_OUTPUT_FILE']}",
+        f"--junitxml={xml_file}",
         "-o",
         "xfail_strict=true",
         "-o",

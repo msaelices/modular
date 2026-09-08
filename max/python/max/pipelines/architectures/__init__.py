@@ -94,6 +94,9 @@ def register_all_models() -> None:
         ),
         _LazyArch("DFlashDraftModel", ".dflash_llama3", "dflash_llama_arch"),
         _LazyArch(
+            "DSparkDraftModel", ".dspark_draft", "dspark_speculators_draft_arch"
+        ),
+        _LazyArch(
             "DiffusionGemmaForBlockDiffusion",
             ".diffusion_gemma",
             "diffusion_gemma_arch",
@@ -112,12 +115,6 @@ def register_all_models() -> None:
             "LlamaForCausalLMEagle3", ".eagle_llama3", "eagle3_llama_arch"
         ),
         _LazyArch("LlamaForCausalLMEagle", ".eagle_llama3", "eagle_llama_arch"),
-        _LazyArch("ExaoneForCausalLM", ".exaone", "exaone_arch"),
-        _LazyArch(
-            "ExaoneForCausalLM_ModuleV3",
-            ".exaone_modulev3",
-            "exaone_modulev3_arch",
-        ),
         _LazyArch("Flux2Pipeline", ".flux2", "flux2_arch"),
         _LazyArch("Flux2KleinPipeline", ".flux2", "flux2_klein_arch"),
         _LazyArch(
@@ -152,6 +149,21 @@ def register_all_models() -> None:
             ".gemma4_assistant",
             "gemma4_assistant_arch",
         ),
+        _LazyArch(
+            "Gemma4DSparkModel",
+            ".unified_dspark_gemma4_12b",
+            "gemma4_dspark_draft_arch",
+        ),
+        _LazyArch(
+            "Gemma4ForConditionalGeneration_ModuleV3",
+            ".gemma4_modulev3",
+            "gemma4_modulev3_arch",
+        ),
+        _LazyArch(
+            "Gemma4UnifiedForConditionalGeneration_ModuleV3",
+            ".gemma4_modulev3",
+            "gemma4_unified_modulev3_arch",
+        ),
         _LazyArch("GlmMoeDsaForCausalLM", ".glm5_1", "glm5_1_arch"),
         _LazyArch("GptOssForCausalLM", ".gpt_oss", "gpt_oss_arch"),
         _LazyArch(
@@ -175,6 +187,14 @@ def register_all_models() -> None:
             "idefics3_modulev3_arch",
         ),
         _LazyArch("Ideogram4Pipeline", ".ideogram4", "ideogram4_arch"),
+        _LazyArch(
+            "InklingForConditionalGeneration", ".inkling", "inkling_arch"
+        ),
+        _LazyArch(
+            "UnifiedMTPInklingForConditionalGeneration",
+            ".unified_mtp_inkling",
+            "unified_mtp_inkling_arch",
+        ),
         _LazyArch("InternVLChatModel", ".internvl", "internvl_arch"),
         _LazyArch(
             "Eagle3DeepseekV2ForCausalLM", ".kimik2_5", "eagle3_kimik25_arch"
@@ -188,6 +208,16 @@ def register_all_models() -> None:
             "KimiK25ForConditionalGeneration", ".kimik2_5", "kimik2_5_arch"
         ),
         _LazyArch("KimiVLForConditionalGeneration", ".kimik2_5", "kimivl_arch"),
+        _LazyArch(
+            "KimiK25ForConditionalGeneration_ModuleV3",
+            ".kimik2_5_modulev3",
+            "kimik2_5_modulev3_arch",
+        ),
+        _LazyArch(
+            "KimiVLForConditionalGeneration_ModuleV3",
+            ".kimik2_5_modulev3",
+            "kimivl_modulev3_arch",
+        ),
         _LazyArch("LagunaForCausalLM", ".laguna", "laguna_arch"),
         _LazyArch("Lfm2ForCausalLM", ".lfm2", "lfm2_arch"),
         _LazyArch("LlamaForCausalLM", ".llama3", "llama_arch"),
@@ -204,6 +234,11 @@ def register_all_models() -> None:
         ),
         _LazyArch("MambaForCausalLM", ".mamba", "mamba_arch"),
         _LazyArch("MiniMaxM2ForCausalLM", ".minimax_m2", "minimax_m2_arch"),
+        _LazyArch(
+            "MiniMaxMusic3ModularPipeline",
+            ".minimax_music3",
+            "minimax_music3_arch",
+        ),
         _LazyArch("NemotronHForCausalLM", ".nemotron_h", "nemotron_h_arch"),
         _LazyArch("MistralForCausalLM", ".mistral", "mistral_arch"),
         _LazyArch(
@@ -279,9 +314,24 @@ def register_all_models() -> None:
             "unified_dflash_kimi_k25_arch",
         ),
         _LazyArch(
+            "UnifiedDflashGemma4_31BForCausalLM",
+            ".unified_dflash_gemma4_31b",
+            "unified_dflash_gemma4_31b_arch",
+        ),
+        _LazyArch(
             "UnifiedDflashLlama3ForCausalLM",
             ".unified_dflash_llama3",
             "unified_dflash_llama3_arch",
+        ),
+        _LazyArch(
+            "UnifiedDSparkGemma4_12BForCausalLM",
+            ".unified_dspark_gemma4_12b",
+            "unified_dspark_gemma4_12b_arch",
+        ),
+        _LazyArch(
+            "UnifiedDSparkGemma4_31BForCausalLM",
+            ".unified_dspark_gemma4_31b",
+            "unified_dspark_gemma4_31b_arch",
         ),
         _LazyArch(
             "UnifiedEagleLlama3ForCausalLM",
@@ -303,6 +353,11 @@ def register_all_models() -> None:
             ".unified_mtp_glm5_2",
             "unified_mtp_glm5_2_arch",
         ),
+        _LazyArch(
+            "UnifiedMTPQwen3_5ForConditionalGeneration",
+            ".unified_mtp_qwen3_5",
+            "unified_mtp_qwen3_5_arch",
+        ),
         _LazyArch("WanPipeline", ".wan", "wan_arch"),
         _LazyArch("WanImageToVideoPipeline", ".wan", "wan_i2v_arch"),
         _LazyArch("ZImagePipeline", ".z_image_modulev3", "z_image_arch"),
@@ -316,6 +371,14 @@ def register_all_models() -> None:
     # Optional: pull in private tool parsers.
     try:
         import tool_parsers  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        pass
+
+    # Optional: import the Kimi K3 model if available.
+    try:
+        from kimi_k3 import kimi_k3_arch  # type: ignore[import-not-found]
+
+        PIPELINE_REGISTRY.register(kimi_k3_arch)
     except ModuleNotFoundError:
         pass
 

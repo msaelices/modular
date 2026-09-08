@@ -11,14 +11,22 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+"""Expert-parallelism (EP) communication kernels for MoE token dispatch and combine.
+
+Implements the token dispatch (scatter) and combine (gather) collectives used
+in Mixture-of-Experts inference across multiple GPUs, including FP8 and FP4
+quantization paths for bandwidth-limited transfers.
+"""
+
 from std.math import align_up, ceildiv
 from std.math.uutils import uceildiv, udivmod, ufloordiv, umod
 from std.os import abort
-from std.atomic import Atomic, Ordering
+from std.atomic import Atomic, Ordering, fence
 from std.sys import is_amd_gpu, is_nvidia_gpu
 from std.sys.info import CompilationTarget, align_of, simd_width_of, size_of
 from std.ffi import c_size_t
 
+from linalg.block_scaled_utils import compute_mxfp8_block_scale
 from linalg.fp4_utils import (
     MXFP4_SF_VECTOR_SIZE,
     MXFP8_SF_VECTOR_SIZE,
@@ -31,37 +39,54 @@ from linalg.fp4_utils import (
     compute_mxfp4_even_scale,
     set_scale_factor,
 )
+from linalg.fp6_utils import (
+    MXFP6_SF_VECTOR_SIZE,
+    FP6Format,
+    compute_mxfp6_even_scale,
+    encode_f32_to_fp6,
+    pack_fp6_x4,
+)
+from linalg.mx_format import MXFormat
 from linalg.matmul.gpu.amd import Shuffler
 
-import std.gpu.primitives.warp as warp
+import max.gpu.primitives.warp as warp
 from std.collections import OptionalReg
-from std.gpu import (
-    PDL,
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
-    barrier,
     thread_idx,
     block_idx,
     grid_dim,
     lane_id,
     warp_id,
 )
-from std.gpu.host import get_gpu_target, DeviceBuffer, DeviceContext
-from std.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.gpu.memory import (
+from max.gpu.primitives.grid_controls import (
+    PDL,
+)
+from max.gpu.sync import barrier, named_barrier
+from max.gpu.host import get_gpu_target, DeviceBuffer, DeviceContext
+from max.gpu.host.nvidia.tma import TensorMapSwizzle
+from max.gpu.memory import (
     external_memory,
     fence_async_view_proxy,
     fence_mbarrier_init,
     cp_async_bulk_global_shared_cta,
     cp_async_bulk_shared_cluster_global,
 )
-from std.gpu.primitives import elect_one_sync
-from std.gpu.sync import (
+from max.gpu.primitives.cluster import elect_one_sync
+from max.gpu.sync import (
     syncwarp,
     cp_async_bulk_commit_group,
     cp_async_bulk_wait_group,
 )
-from layout import Coord, Idx, TensorLayout, TileTensor, row_major
+from layout import (
+    Coord,
+    Idx,
+    DefaultEngine,
+    TensorLayout,
+    TileTensor,
+    row_major,
+)
 from layout.tile_tensor import _get_index_type
 from layout.tile_layout import Layout
 from layout.tma_async import (
@@ -70,8 +95,8 @@ from layout.tma_async import (
     create_tensor_tile,
     _default_desc_shape,
 )
-from std.math import exp, recip
-from std.memory import stack_allocation
+from std.math import exp, isfinite, recip
+from std.memory import unsafe_stack_allocation
 from std.memory.unsafe import bitcast
 from shmem import SHMEM_SIGNAL_SET, SHMEMScope, shmem_put_nbi, shmem_signal_op
 
@@ -81,12 +106,12 @@ from std.utils.numerics import get_accum_type
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 
 comptime elementwise_epilogue_type = def[
-    dtype: DType, width: SIMDSize, *, alignment: Int = 1
+    dtype: DType, width: SIMDLength, *, alignment: Int = 1
 ](IndexList[2], SIMD[dtype, width]) capturing -> None
 
 comptime router_weights_wrapper_type = def[width: Int](
     token_idx: Int, topk_id: Int
-) capturing -> SIMD[DType.float32, width]
+) capturing -> SIMD[.float32, width]
 
 
 comptime input_scales_wrapper_type = def[dtype: DType](
@@ -127,8 +152,8 @@ def _DEVICE_SCOPE() -> StaticString:
 comptime DEVICE_SCOPE = _DEVICE_SCOPE()
 comptime BLOCK_SCOPE = _BLOCK_SCOPE()
 
-comptime _counter_atomic = Atomic[DType.int32, scope=DEVICE_SCOPE]
-comptime _signal_atomic = Atomic[DType.uint64]
+comptime _counter_atomic = Atomic[Int32, scope=DEVICE_SCOPE]
+comptime _signal_atomic = Atomic[UInt64]
 
 
 @always_inline
@@ -166,6 +191,14 @@ def block_prefix_sum[
 ](_val: Scalar[dtype]) -> Scalar[dtype]:
     """
     Performs a prefix sum (scan) operation across all threads in a block.
+
+    Parameters:
+        dtype: Element type of the values being scanned (inferred).
+        num_elements: Number of active threads in the block that contribute
+            values to the scan.
+
+    Args:
+        _val: The per-thread value to contribute to the inclusive prefix sum.
     """
     comptime n_elements_aligned = align_up(num_elements, WARP_SIZE)
     comptime n_warps = n_elements_aligned // WARP_SIZE
@@ -173,10 +206,10 @@ def block_prefix_sum[
         n_warps <= WARP_SIZE
     ), "Number of warps must be less than or equal to warp size"
 
-    var warp_prefix_sum = stack_allocation[
+    var warp_prefix_sum = unsafe_stack_allocation[
         n_warps,
         Scalar[dtype],
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
     ]()
 
     var val = Scalar[dtype](0)
@@ -205,23 +238,115 @@ def block_prefix_sum[
     return val
 
 
+comptime EP_COPY_SRC_WIDTH = 8
+"""Source elements a thread handles per copy item in the quantizing token
+formats. Hardcoded there rather than derived from `simd_width_of`, so the role
+split has to agree with it explicitly."""
+
+
+struct EPRoleSplit[block_size: Int, n_items: Int, flag: Bool = False]:
+    """Splits one dispatch CTA into a copy role and a publisher role.
+
+    The copy role carries the whole copy/quantize body for a token. The
+    publisher role issues no payload and no scale stores at all, so its warps
+    reach the send and the completion publication with an empty store history
+    instead of first draining a full token's worth of their own stores. That
+    empty history is the point of the split: it is what a CTA with more warps
+    than the copy loop needs gets for free, and what a CTA sized to the copy
+    loop does not.
+
+    Every role test in the dispatch path must come from here. A body that
+    re-derives its role from a bare `warp_id()` comparison or a literal thread
+    count can drift out of agreement with the other half of the split.
+
+    Parameters:
+        block_size: Number of threads in the dispatch CTA.
+        n_items: Number of copy items in one token.
+        flag: Caller opt-in. Off by default, which forces `enabled`
+            false and sends every consumer back to the stock strided body. The
+            geometry predicate below is an ADDITIONAL guard, never a
+            substitute: both the flag and the geometry must hold.
+    """
+
+    comptime n_warps = Self.block_size // WARP_SIZE
+    # The publisher role is what is held fixed; the copy role is whatever is
+    # left. Deriving it the other way round would make `n_copy_threads`
+    # independent of the CTA width and silently claim geometries the split was
+    # never measured on.
+    comptime n_publisher_warps = 4
+    comptime n_copy_warps = Self.n_warps - Self.n_publisher_warps
+    comptime n_copy_threads = Self.n_copy_warps * WARP_SIZE
+    comptime n_trips = 3
+
+    # Whether this (CTA width, token shape) pair may run the split at all.
+    # False sends every consumer back to the stock strided body, byte for byte.
+    #
+    # Two independent conditions, both required:
+    #   `flag`     -- the caller asked for the split. Default False, so every
+    #                 instantiation that does not name it keeps HEAD behaviour.
+    #   geometry   -- since `n_copy_threads == block_size - 128`, this reduces
+    #                 to `n_items == 3 * (block_size - 128)`: the 384-thread
+    #                 fused geometry at 768 items satisfies it and the
+    #                 1024-thread reference does not (768 != 3*896), nor does
+    #                 any hidden size that is not
+    #                 `3 * (block_size - 128) * src_width`. The split was
+    #                 only ever measured at the fused geometry, so no other
+    #                 instantiation may opt in even by asking.
+    comptime enabled = (
+        Self.flag
+        and Self.n_copy_warps >= 1
+        and Self.n_items == Self.n_trips * Self.n_copy_threads
+    )
+
+    @always_inline
+    @staticmethod
+    def copy_role_index() -> Int:
+        """Returns this thread's linear index within the copy role."""
+        return Int(thread_idx.x)
+
+    @always_inline
+    @staticmethod
+    def is_ep_copy_role() -> Bool:
+        """Returns True if this thread carries copy/quantize work."""
+        return Self.copy_role_index() < Self.n_copy_threads
+
+    @always_inline
+    @staticmethod
+    def publisher_role_index() -> Int:
+        """Returns this warp's index within the publisher role.
+
+        Negative on a copy-role warp, so it is only meaningful behind
+        `is_ep_publisher_role()`.
+        """
+        return Int(warp_id()) - Self.n_copy_warps
+
+    @always_inline
+    @staticmethod
+    def is_ep_publisher_role() -> Bool:
+        """Returns True if this thread's warp carries publication work."""
+        return Self.publisher_role_index() >= 0
+
+
 @always_inline
-@parameter
+@__parameter
 def ep_signal_completion[
     p2p_world_size: Int,
     //,
     use_shmem: Bool,
     n_experts_per_device: Int = 0,
     skip_a2a: Bool = False,
+    has_rank_flag: Bool = False,
+    ep_ord_r: Bool = False,
 ](
     my_rank: Int32,
     dst_rank: Int32,
-    recv_count_ptrs: InlineArray[
+    recv_count_ptrs: Array[
         UnsafePointer[UInt64, MutUntrackedOrigin], p2p_world_size
     ],
     signal_offset: Int32,
     signal: UInt64,
     rank_completion_counter: UnsafePointer[Int32, MutUntrackedOrigin],
+    rank_flag_offset: Int32 = 0,
 ) -> None:
     """
     Signals the completion of the communication by writing to the receive count
@@ -230,8 +355,55 @@ def ep_signal_completion[
 
     For same-node signaling, uses normal stores and only issues a release store
     when the last expert for a destination rank is completed. This reduces the
-    number of release stores from n_experts to p2p_world_size.
+    number of release stores from n_experts to p2p_world_size, and the
+    destination checks each per-expert signal individually.
+
+    With `ep_ord_r` the routine implements rank-level completion instead, which
+    a fused consumer needs when it acquires ONCE per source rank rather than
+    per expert: the per-expert count word becomes a plain progress store issued
+    before an `ACQUIRE_RELEASE` election, and the elected last producer
+    release-stores a dedicated rank-completion flag.
+
+    That election ordering is load-bearing correctness, not an optimization.
+    Each producer's RMW releases its own payload and count stores into the
+    counter's modification order and acquires its predecessor's, so by
+    induction the elected producer happens-after every other producer; its
+    single system-scope release then carries the whole rank's state to a
+    destination that acquires only the rank flag. A relaxed election would
+    publish nothing but the elected producer's own stores.
+
+    Parameters:
+        p2p_world_size: Number of ranks reachable by direct peer access.
+        use_shmem: Whether to signal remote ranks through the SHMEM API.
+        n_experts_per_device: Local expert count, used for the election bound.
+        skip_a2a: Whether all-to-all traffic is skipped (device-scope signals).
+        has_rank_flag: Whether the caller reserved a dedicated rank-completion
+            word per source rank in the receive-count buffer tail.
+        ep_ord_r: Whether to use rank-level completion (see above).
+
+    Args:
+        my_rank: This rank.
+        dst_rank: Destination rank being signalled.
+        recv_count_ptrs: Receive-count buffers, one per peer-accessible rank.
+        signal_offset: Offset of this expert's per-expert count word.
+        signal: The value published for this expert.
+        rank_completion_counter: Per-destination-rank election counter.
+        rank_flag_offset: Offset of the dedicated rank-completion flag; read
+            only when `ep_ord_r` is set.
     """
+    # The dedicated rank flag is published only by the ORD-R branch, so a
+    # caller that reserved the word but left the protocol legacy would wait
+    # forever on something nothing writes.
+    comptime assert not has_rank_flag or ep_ord_r, (
+        "has_rank_flag reserves the rank-completion word, but only ep_ord_r"
+        " publishes it: enable ep_ord_r or drop has_rank_flag"
+    )
+    # And the converse: under ORD-R the rank flag is the only strong signal the
+    # protocol emits, so the destination would have nothing sound to acquire.
+    comptime assert not ep_ord_r or has_rank_flag, (
+        "ep_ord_r's per-expert words are plain stores; the dedicated rank flag"
+        " is the protocol's only strong signal, so has_rank_flag is mandatory"
+    )
 
     var my_p2p_world, my_p2p_rank = udivmod(Int(my_rank), p2p_world_size)
     var dst_p2p_world, dst_p2p_rank = udivmod(Int(dst_rank), p2p_world_size)
@@ -242,6 +414,46 @@ def ep_signal_completion[
     # receive count buffer.
     if my_p2p_world == dst_p2p_world:
         var dst_p2p_ptr = recv_count_ptrs[dst_p2p_rank] + signal_offset
+        comptime if ep_ord_r:
+            # Rank-level completion. The count word is issued BEFORE the
+            # election so it sits in this thread's release set when the RMW
+            # publishes it into the chain; issued after, it would fall outside
+            # the chain and be invisible to the flag's acquirer. Nothing may
+            # spin on it -- it is progress data, never eligibility.
+            comptime if is_nvidia_gpu():
+                dst_p2p_ptr[] = signal
+            else:
+                # TODO(KERN-2792): AMD needs store-release even for words
+                # nothing spins on; mirror the legacy branch until resolved.
+                Atomic[scope=scope].store[ordering=Ordering.RELEASE](
+                    dst_p2p_ptr, signal
+                )
+            var old_count = _counter_atomic.fetch_add[
+                ordering=Ordering.ACQUIRE_RELEASE
+            ](rank_completion_counter + Int(dst_p2p_rank), 1)
+            # The last expert for this destination rank is elected to publish
+            # the rank-level arrival. `rank_completion_counter` is
+            # source-local, so the election stays at device scope.
+            if old_count == Int32(n_experts_per_device - 1):
+                # A word of its own, never one of the per-expert signal words.
+                # SENTINEL discipline: the buffer is pre-set to
+                # `UInt64.MAX_FINITE`; the elected producer release-stores
+                # `n_experts_per_device`, and the DESTINATION restores the
+                # sentinel after consuming the dispatch, so a stale flag can
+                # never satisfy the next generation's wait. By the induction
+                # in the docstring this single release carries every
+                # producer's payload and count stores.
+                Atomic[scope=scope].store[ordering=Ordering.RELEASE](
+                    recv_count_ptrs[dst_p2p_rank] + rank_flag_offset,
+                    UInt64(n_experts_per_device),
+                )
+                # Reset counter for next kernel invocation, AFTER the release:
+                # while the counter still reads n no concurrent producer can
+                # win a second election, and resetting first would let a
+                # next-generation increment be lost to this store.
+                rank_completion_counter[dst_p2p_rank] = 0
+            return
+
         var old_count = _counter_atomic.fetch_add[ordering=Ordering.RELAXED](
             rank_completion_counter + Int(dst_p2p_rank), 1
         )
@@ -285,16 +497,38 @@ def ep_signal_completion[
 
 @always_inline
 def get_device_alignment() -> Int:
+    """Returns the natural SIMD alignment in bytes for the current GPU target.
+
+    Computes the alignment of a full `SIMD[.uint8, gpu_simd_width]` vector,
+    which is the minimum alignment that avoids split transactions on the target
+    device. Token format structs use this as the default `alignment` when the
+    caller does not supply an explicit value.
+
+    Returns:
+        The alignment in bytes of the native SIMD byte vector for the target GPU.
+    """
     comptime gpu_target = get_gpu_target()
     comptime gpu_simd_width = simd_width_of[DType.uint8, target=gpu_target]()
     comptime gpu_alignment = align_of[
-        SIMD[DType.uint8, gpu_simd_width], target=gpu_target
+        SIMD[.uint8, gpu_simd_width], target=gpu_target
     ]()
 
     return gpu_alignment
 
 
-trait TokenFormat(DevicePassable, ImplicitlyDeletable):
+trait TokenFormat(Deinitable, DevicePassable):
+    """Specifies the wire format for a single MoE token in EP dispatch/combine.
+
+    Implementors encode how a token's hidden-state vector is packed for
+    cross-GPU transfer (quantization, scale placement, alignment) and how the
+    received bytes are unpacked into the output tensor. The graph compiler
+    selects a concrete implementation based on the model's quantization config.
+
+    All size and alignment properties are compile-time constants so the
+    dispatch kernel can allocate receive buffers and issue vectorized copies
+    without runtime branching.
+    """
+
     comptime hid_dim: Int
     comptime top_k: Int
     comptime alignment: Int
@@ -357,7 +591,7 @@ trait TokenFormat(DevicePassable, ImplicitlyDeletable):
     def copy_token_to_send_buf[
         src_type: DType,
         block_size: Int,
-        buf_addr_space: AddressSpace = AddressSpace.GENERIC,
+        buf_addr_space: AddressSpace = .GENERIC,
     ](
         buf_p: UnsafePointer[mut=True, UInt8, _, address_space=buf_addr_space],
         src_p: UnsafePointer[mut=False, Scalar[src_type], ...],
@@ -368,7 +602,7 @@ trait TokenFormat(DevicePassable, ImplicitlyDeletable):
 
     @always_inline
     def copy_msg_to_output_tensor[
-        buf_addr_space: AddressSpace = AddressSpace.GENERIC,
+        buf_addr_space: AddressSpace = .GENERIC,
     ](
         self,
         buf_p: UnsafePointer[mut=False, UInt8, _, address_space=buf_addr_space],
@@ -439,6 +673,21 @@ struct BF16TokenFormat[
     _top_k: Int,
     _alignment: Int = 0,
 ](TokenFormat, TrivialRegisterPassable):
+    """Token format that transmits the full hidden state in BFloat16.
+
+    Packs `hid_dim` BF16 elements directly into the wire buffer without
+    quantization. Used when bandwidth headroom is sufficient or when the model
+    does not apply EP quantization.
+
+    Parameters:
+        output_layout: Layout of the output `TileTensor` that receives decoded
+            tokens.
+        _hid_dim: Hidden dimension (number of BF16 elements per token).
+        _top_k: Number of experts each token is routed to.
+        _alignment: Override for the byte alignment of the wire buffer; 0
+            selects `get_device_alignment()`.
+    """
+
     comptime hid_dim = Self._hid_dim
     comptime top_k = Self._top_k
     comptime alignment = Self._alignment or get_device_alignment()
@@ -447,7 +696,7 @@ struct BF16TokenFormat[
     comptime dispatch_smem_size = 0
 
     comptime TensorType = TileTensor[
-        DType.bfloat16, Self.output_layout, MutUntrackedOrigin
+        .bfloat16, Self.output_layout, MutUntrackedOrigin
     ]
     var output_tokens: Self.TensorType
 
@@ -480,11 +729,13 @@ struct BF16TokenFormat[
     @always_inline
     def __init__(
         out self,
-        output_tokens: TileTensor[DType.bfloat16, Self.output_layout, ...],
+        output_tokens: TileTensor[
+            .bfloat16, Self.output_layout, Engine=DefaultEngine[], ...
+        ],
     ):
         self.output_tokens = {
             UnsafePointer[BFloat16, MutUntrackedOrigin](
-                unsafe_from_address=Int(output_tokens.ptr)
+                unsafe_from_address=Int(output_tokens._storage)
             ),
             output_tokens.layout,
         }
@@ -501,7 +752,7 @@ struct BF16TokenFormat[
     def copy_token_to_send_buf[
         src_type: DType,
         block_size: Int,
-        buf_addr_space: AddressSpace = AddressSpace.GENERIC,
+        buf_addr_space: AddressSpace = .GENERIC,
     ](
         buf_p: UnsafePointer[mut=True, UInt8, _, address_space=buf_addr_space],
         src_p: UnsafePointer[mut=False, Scalar[src_type], ...],
@@ -515,7 +766,7 @@ struct BF16TokenFormat[
 
     @always_inline
     def copy_msg_to_output_tensor[
-        buf_addr_space: AddressSpace = AddressSpace.GENERIC,
+        buf_addr_space: AddressSpace = .GENERIC,
     ](
         self,
         buf_p: UnsafePointer[mut=False, UInt8, _, address_space=buf_addr_space],
@@ -531,7 +782,7 @@ struct BF16TokenFormat[
         for i in range(lane_id(), Self.hid_dim // bf16_width, WARP_SIZE):
             self.output_tokens.store(
                 (token_index, i * bf16_width),
-                bitcast[DType.bfloat16, bf16_width](
+                bitcast[.bfloat16, bf16_width](
                     buf_p.load[
                         width=byte_width,
                         invariant=True,
@@ -553,6 +804,24 @@ struct BlockwiseFP8TokenFormat[
     _top_k: Int,
     _alignment: Int = 0,
 ](TokenFormat, TrivialRegisterPassable):
+    """Token format that quantizes the hidden state to FP8 with block-wise scales.
+
+    Each token is packed as FP8 quantized values followed by per-group scale
+    factors (one scale per 128 elements). Reduces wire bandwidth by
+    approximately 2x compared to `BF16TokenFormat` with minimal accuracy loss.
+
+    Parameters:
+        fp8_dtype: FP8 data type used for quantized values (e.g.
+            `.float8_e4m3fn`).
+        scales_dtype: Data type for the block-wise scale factors.
+        output_layout: Layout of the FP8 output `TileTensor`.
+        scales_layout: Layout of the scales output `TileTensor`.
+        _hid_dim: Hidden dimension; must be divisible by the group size (128).
+        _top_k: Number of experts each token is routed to.
+        _alignment: Override for the byte alignment of the wire buffer; 0
+            selects `get_device_alignment()`.
+    """
+
     comptime hid_dim = Self._hid_dim
     comptime top_k = Self._top_k
     comptime alignment = Self._alignment or get_device_alignment()
@@ -605,18 +874,22 @@ struct BlockwiseFP8TokenFormat[
     @always_inline
     def __init__(
         out self,
-        output_tokens: TileTensor[Self.fp8_dtype, Self.output_layout, ...],
-        output_scales: TileTensor[Self.scales_dtype, Self.scales_layout, ...],
+        output_tokens: TileTensor[
+            Self.fp8_dtype, Self.output_layout, Engine=DefaultEngine[], ...
+        ],
+        output_scales: TileTensor[
+            Self.scales_dtype, Self.scales_layout, Engine=DefaultEngine[], ...
+        ],
     ):
         self.output_tokens = {
             UnsafePointer[Scalar[Self.fp8_dtype], MutUntrackedOrigin](
-                unsafe_from_address=Int(output_tokens.ptr)
+                unsafe_from_address=Int(output_tokens._storage)
             ),
             output_tokens.layout,
         }
         self.output_scales = {
             UnsafePointer[Scalar[Self.scales_dtype], MutUntrackedOrigin](
-                unsafe_from_address=Int(output_scales.ptr)
+                unsafe_from_address=Int(output_scales._storage)
             ),
             output_scales.layout,
         }
@@ -680,7 +953,7 @@ struct BlockwiseFP8TokenFormat[
     def copy_token_to_send_buf[
         src_type: DType,
         block_size: Int,
-        buf_addr_space: AddressSpace = AddressSpace.GENERIC,
+        buf_addr_space: AddressSpace = .GENERIC,
     ](
         buf_p: UnsafePointer[mut=True, UInt8, _, address_space=buf_addr_space],
         src_p: UnsafePointer[mut=False, Scalar[src_type], ...],
@@ -713,23 +986,21 @@ struct BlockwiseFP8TokenFormat[
 
             buf_p.store[alignment=byte_width](
                 i * byte_width,
-                bitcast[DType.uint8, byte_width](
-                    output_vec.cast[Self.fp8_dtype]()
-                ),
+                bitcast[.uint8, byte_width](output_vec.cast[Self.fp8_dtype]()),
             )
 
             # The first thread in each group stores the scale factor.
             comptime scale_bytes = size_of[Self.scales_dtype]()
             if umod(lane_id(), n_threads_per_group) == 0:
-                scale_idx = ufloordiv(i * src_width, Self.group_size)
+                var scale_idx = ufloordiv(i * src_width, Self.group_size)
                 buf_p.store[alignment=scale_bytes](
                     Self.scales_offset() + scale_idx * scale_bytes,
-                    bitcast[DType.uint8, scale_bytes](scale_factor),
+                    bitcast[.uint8, scale_bytes](scale_factor),
                 )
 
     @always_inline
     def copy_msg_to_output_tensor[
-        buf_addr_space: AddressSpace = AddressSpace.GENERIC,
+        buf_addr_space: AddressSpace = .GENERIC,
     ](
         self,
         buf_p: UnsafePointer[mut=False, UInt8, _, address_space=buf_addr_space],
@@ -786,21 +1057,46 @@ struct NVBlockScaledTokenFormat[
     _hid_dim: Int,
     _top_k: Int,
     _alignment: Int = 0,
+    ep_copy_role_split: Bool = False,
 ](ImplicitlyCopyable, TokenFormat):
+    """Token format for NVIDIA block-scaled FP4/FP8 quantization.
+
+    Supports NVFP4 (`quant_dtype=uint8`, `scales_dtype=float8_e4m3fn`),
+    MXFP4 (`quant_dtype=uint8`, `scales_dtype=float8_e8m0fnu`), and MXFP8
+    (`quant_dtype=float8_e4m3fn`, `scales_dtype=float8_e8m0fnu`) wire formats.
+    Uses TMA-based copies for scale preshuffle into the output tensor.
+
+    Parameters:
+        quant_dtype: Quantized element dtype (e.g. `.uint8` for FP4).
+        scales_dtype: Scale factor dtype (FP8 variant).
+        output_layout: Layout of the quantized output `TileTensor`.
+        scales_offset_layout: Layout of the per-expert scale offset tensor.
+        _hid_dim: Hidden dimension; must be divisible by the group size.
+        _top_k: Number of experts each token is routed to.
+        _alignment: Override for the byte alignment of the wire buffer; 0
+            selects `get_device_alignment()`.
+        ep_copy_role_split: Opt in to the copy/publisher role split in
+            `copy_token_to_send_buf`. Off by default, which keeps the stock
+            strided copy loop byte for byte. `EPDispatchKernel` carries a
+            parameter of the same name for the matching publisher fan-out; a
+            caller that turns one on should turn both on, or the split's
+            empty-store-history property is lost. Either combination stays
+            correct -- every copy item and every top-k destination is covered
+            exactly once on all four pairings.
+    """
+
     comptime hid_dim = Self._hid_dim
     comptime top_k = Self._top_k
     comptime alignment = Self._alignment or get_device_alignment()
     comptime is_mxfp8 = (
-        Self.scales_dtype == DType.float8_e8m0fnu
-        and Self.quant_dtype == DType.float8_e4m3fn
+        Self.scales_dtype == .float8_e8m0fnu
+        and Self.quant_dtype == .float8_e4m3fn
     )
     comptime is_mxfp4 = (
-        Self.scales_dtype == DType.float8_e8m0fnu
-        and Self.quant_dtype == DType.uint8
+        Self.scales_dtype == .float8_e8m0fnu and Self.quant_dtype == .uint8
     )
     comptime is_nvfp4 = (
-        Self.scales_dtype == DType.float8_e4m3fn
-        and Self.quant_dtype == DType.uint8
+        Self.scales_dtype == .float8_e4m3fn and Self.quant_dtype == .uint8
     )
 
     comptime dispatch_wait_tile_shape = (128, 2)
@@ -809,7 +1105,7 @@ struct NVBlockScaledTokenFormat[
         Self.quant_dtype, Self.output_layout, MutUntrackedOrigin
     ]
     comptime ScalesOffsetTensorType = TileTensor[
-        DType.uint32, Self.scales_offset_layout, MutUntrackedOrigin
+        .uint32, Self.scales_offset_layout, MutUntrackedOrigin
     ]
 
     @staticmethod
@@ -896,22 +1192,26 @@ struct NVBlockScaledTokenFormat[
     @always_inline
     def __init__(
         out self,
-        output_tokens: TileTensor[Self.quant_dtype, Self.output_layout, ...],
-        output_scales: TileTensor[Self.scales_dtype, ...],
+        output_tokens: TileTensor[
+            Self.quant_dtype, Self.output_layout, Engine=DefaultEngine[], ...
+        ],
+        output_scales: TileTensor[
+            Self.scales_dtype, Engine=DefaultEngine[], ...
+        ],
         output_scales_offset: TileTensor[
-            DType.uint32, Self.scales_offset_layout, ...
+            .uint32, Self.scales_offset_layout, Engine=DefaultEngine[], ...
         ],
         ctx: DeviceContext,
     ):
         self.output_tokens = {
             UnsafePointer[Scalar[Self.quant_dtype], MutUntrackedOrigin](
-                unsafe_from_address=Int(output_tokens.ptr)
+                unsafe_from_address=Int(output_tokens._storage)
             ),
             output_tokens.layout,
         }
         self.output_scales_offset = {
-            UnsafePointer[Scalar[DType.uint32], MutUntrackedOrigin](
-                unsafe_from_address=Int(output_scales_offset.ptr)
+            UnsafePointer[UInt32, MutUntrackedOrigin](
+                unsafe_from_address=Int(output_scales_offset._storage)
             ),
             output_scales_offset.layout,
         }
@@ -920,7 +1220,7 @@ struct NVBlockScaledTokenFormat[
         # dimension. This is required by the TMA instructions that the leading
         # dimensions must be multiples of 16-byte strides
         var scales_tensor_view = TileTensor(
-            output_scales.ptr,
+            output_scales._storage,
             row_major(
                 (
                     Int(output_scales.dim(0)),
@@ -1031,77 +1331,138 @@ struct NVBlockScaledTokenFormat[
     def copy_token_to_send_buf[
         src_type: DType,
         block_size: Int,
-        buf_addr_space: AddressSpace = AddressSpace.GENERIC,
+        buf_addr_space: AddressSpace = .GENERIC,
     ](
         buf_p: UnsafePointer[mut=True, UInt8, _, address_space=buf_addr_space],
         src_p: UnsafePointer[mut=False, Scalar[src_type], ...],
         input_scale: Float32,
     ) -> None:
-        comptime src_width = 8
-        comptime byte_width = src_width // 2
+        comptime src_width = EP_COPY_SRC_WIDTH
+        comptime n_items = Self.hid_dim // src_width
         comptime NUM_THREADS_PER_SF = Self.group_size // src_width
+        comptime Roles = EPRoleSplit[
+            block_size, n_items, Self.ep_copy_role_split
+        ]
 
-        for i in range(thread_idx.x, Self.hid_dim // src_width, block_size):
-            var loaded_vec = src_p.load[
-                width=src_width, alignment=Self.alignment, invariant=True
-            ](i * src_width)
-
-            # each thread finds maximum value in its local 8 elements
-            var thread_max = abs(loaded_vec).reduce_max().cast[DType.float32]()
-            # find the maximum value among all 16 elements
-            var group_max = warp.lane_group_max[num_lanes=NUM_THREADS_PER_SF](
-                thread_max
+        comptime if Roles.enabled:
+            # Role split: the copy role alone carries every item, `n_trips` per
+            # thread at `lane`, `lane + n_copy_threads`, `lane + 2 *
+            # n_copy_threads`. Both the trip stride and the copy-role width are
+            # multiples of NUM_THREADS_PER_SF, so every thread keeps its
+            # `i % NUM_THREADS_PER_SF` scale phase and each `lane_group_max`
+            # still reduces over exactly the element set the strided loop
+            # reduced over. Emitted bytes, scale owner, scale address and
+            # payload addresses are all unchanged.
+            comptime assert Roles.n_copy_threads % NUM_THREADS_PER_SF == 0, (
+                "the copy-role width must preserve each thread's scale-group"
+                " phase"
             )
 
-            var scale_factor: Float32
-            comptime if Self.is_mxfp8:
-                scale_factor = group_max * recip(Float32(448.0))
-            elif Self.is_nvfp4:
-                scale_factor = input_scale * (group_max * recip(Float32(6.0)))
-            else:
-                scale_factor = group_max * recip(Float32(6.0))
-
-            # NOTE: NVFP4 uses FP8-UE4M3 format for the scale factor but we know that scale_factor is always positive, so we can use E4M3 instead of UE4M3.
-            var fp8_scale_factor = scale_factor.cast[Self.scales_dtype]()
-
-            var output_scale = Float32(0.0)
-            if group_max != 0:
-                comptime if Self.is_nvfp4:
-                    output_scale = recip(
-                        fp8_scale_factor.cast[DType.float32]()
-                        * recip(input_scale)
+            if Roles.is_ep_copy_role():
+                var lane = Roles.copy_role_index()
+                comptime for t in range(Roles.n_trips):
+                    Self._copy_one_item[src_type, buf_addr_space](
+                        buf_p,
+                        src_p,
+                        input_scale,
+                        lane + t * Roles.n_copy_threads,
                     )
-                else:
-                    output_scale = recip(fp8_scale_factor.cast[DType.float32]())
-
-            # write back the scale factor
-            comptime scale_bytes = size_of[Self.scales_dtype]()
-            if i % NUM_THREADS_PER_SF == 0:
-                buf_p.store[alignment=scale_bytes](
-                    Self.scales_offset()
-                    + ufloordiv(i, NUM_THREADS_PER_SF) * scale_bytes,
-                    bitcast[DType.uint8, scale_bytes](fp8_scale_factor),
-                )
-
-            var input_f32 = loaded_vec.cast[DType.float32]() * output_scale
-            comptime if Self.is_mxfp8:
-                var output_vector = input_f32.cast[Self.quant_dtype]()
-                buf_p.store[alignment=src_width](
-                    i * src_width,
-                    bitcast[DType.uint8, src_width](output_vector),
-                )
-            else:
-                var output_vector = bitcast[Self.quant_dtype, byte_width](
-                    cast_fp32_to_fp4e2m1(input_f32)
-                )
-                buf_p.store[alignment=byte_width](
-                    i * byte_width,
-                    bitcast[DType.uint8, byte_width](output_vector),
+        else:
+            for i in range(thread_idx.x, n_items, block_size):
+                Self._copy_one_item[src_type, buf_addr_space](
+                    buf_p, src_p, input_scale, Int(i)
                 )
 
     @always_inline
-    def copy_msg_to_output_tensor[
+    @staticmethod
+    def _copy_one_item[
+        src_type: DType,
         buf_addr_space: AddressSpace = AddressSpace.GENERIC,
+    ](
+        buf_p: UnsafePointer[mut=True, UInt8, _, address_space=buf_addr_space],
+        src_p: UnsafePointer[mut=False, Scalar[src_type], ...],
+        input_scale: Float32,
+        i: Int,
+    ) -> None:
+        """Quantizes one `src_width`-element item of a token into the send
+        buffer.
+
+        Factored out so the role-split and stock iteration orders share one
+        body and cannot drift; both hand it the same item indices.
+
+        Parameters:
+            src_type: Element type of the source token.
+            buf_addr_space: Address space of the send buffer.
+
+        Args:
+            buf_p: Send-buffer pointer for this token's message.
+            src_p: Source token pointer.
+            input_scale: Global input scale for NVFP4.
+            i: Item index within the token.
+        """
+        comptime src_width = EP_COPY_SRC_WIDTH
+        comptime byte_width = src_width // 2
+        comptime NUM_THREADS_PER_SF = Self.group_size // src_width
+
+        var loaded_vec = src_p.load[
+            width=src_width, alignment=Self.alignment, invariant=True
+        ](i * src_width)
+
+        # each thread finds maximum value in its local 8 elements
+        var thread_max = abs(loaded_vec).reduce_max().cast[DType.float32]()
+        # find the maximum value among all 16 elements
+        var group_max = warp.lane_group_max[num_lanes=NUM_THREADS_PER_SF](
+            thread_max
+        )
+
+        var scale_factor: Float32
+        comptime if Self.is_mxfp8:
+            scale_factor = group_max * recip(Float32(448.0))
+        elif Self.is_nvfp4:
+            scale_factor = input_scale * (group_max * recip(Float32(6.0)))
+        else:
+            scale_factor = group_max * recip(Float32(6.0))
+
+        # NOTE: NVFP4 uses FP8-UE4M3 format for the scale factor but we know that scale_factor is always positive, so we can use E4M3 instead of UE4M3.
+        var fp8_scale_factor = scale_factor.cast[Self.scales_dtype]()
+
+        var output_scale = Float32(0.0)
+        if group_max != 0:
+            comptime if Self.is_nvfp4:
+                output_scale = recip(
+                    fp8_scale_factor.cast[DType.float32]() * recip(input_scale)
+                )
+            else:
+                output_scale = recip(fp8_scale_factor.cast[DType.float32]())
+
+        # write back the scale factor
+        comptime scale_bytes = size_of[Self.scales_dtype]()
+        if i % NUM_THREADS_PER_SF == 0:
+            buf_p.store[alignment=scale_bytes](
+                Self.scales_offset()
+                + ufloordiv(i, NUM_THREADS_PER_SF) * scale_bytes,
+                bitcast[DType.uint8, scale_bytes](fp8_scale_factor),
+            )
+
+        var input_f32 = loaded_vec.cast[DType.float32]() * output_scale
+        comptime if Self.is_mxfp8:
+            var output_vector = input_f32.cast[Self.quant_dtype]()
+            buf_p.store[alignment=src_width](
+                i * src_width,
+                bitcast[DType.uint8, src_width](output_vector),
+            )
+        else:
+            var output_vector = bitcast[Self.quant_dtype, byte_width](
+                cast_fp32_to_fp4e2m1(input_f32)
+            )
+            buf_p.store[alignment=byte_width](
+                i * byte_width,
+                bitcast[DType.uint8, byte_width](output_vector),
+            )
+
+    @always_inline
+    def copy_msg_to_output_tensor[
+        buf_addr_space: AddressSpace = .GENERIC,
     ](
         self,
         buf_p: UnsafePointer[mut=False, UInt8, _, address_space=buf_addr_space],
@@ -1118,7 +1479,7 @@ struct NVBlockScaledTokenFormat[
             self.scales_tma_op.prefetch_descriptor()
 
         var smem_base = external_memory[
-            UInt8, address_space=AddressSpace.SHARED, alignment=128
+            UInt8, address_space=.SHARED, alignment=128
         ]()
         var mbar_base = (smem_base + Self._mbar_smem_offset).bitcast[
             SharedMemBarrier
@@ -1157,7 +1518,7 @@ struct NVBlockScaledTokenFormat[
         )
         var smem_ptr = external_memory[
             Scalar[Self.scales_dtype],
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
             alignment=128,
         ]()
         var scales_tile = TileTensor(
@@ -1248,7 +1609,7 @@ struct NVBlockScaledTokenFormat[
         var mbar_base = (smem_base + Self._mbar_smem_offset).bitcast[
             SharedMemBarrier
         ]()
-        var output_tokens_base = self.output_tokens.ptr.bitcast[UInt8]()
+        var output_tokens_base = self.output_tokens._storage.bitcast[UInt8]()
         var phase = UInt32(0)
 
         # Process the tokens in reverse order. This reduce latency when there
@@ -1296,8 +1657,8 @@ struct NVBlockScaledTokenFormat[
             cp_async_bulk_wait_group[0]()
 
 
-struct MXFP4TokenFormat[
-    fp4_dtype: DType,
+struct MXTokenFormat[
+    quant_dtype: DType,
     scales_dtype: DType,
     output_layout: TensorLayout,
     scales_layout: TensorLayout,
@@ -1307,17 +1668,48 @@ struct MXFP4TokenFormat[
     _alignment: Int = 0,
     *,
     fuse_a_scale_preshuffle: Bool = False,
+    mx_format: MXFormat = MXFormat.from_dtype[quant_dtype](),
 ](TokenFormat, TrivialRegisterPassable):
+    """Token format for MX (microscaling) FP4 quantization.
+
+    Packs each token as FP4 values with block-wise MX scale factors (one
+    `float8_e8m0fnu` scale per `MXFP4_SF_VECTOR_SIZE` elements). Achieves the
+    highest compression ratio of all built-in token formats. Setting
+    `fuse_a_scale_preshuffle=True` folds the grouped-matmul scale preshuffle
+    into the dispatch-wait copy path (KS224 up-projection fusion).
+
+    Parameters:
+        quant_dtype: FP4 element dtype (e.g. `.uint8` with nibble packing).
+        scales_dtype: MX scale dtype (`.float8_e8m0fnu`).
+        output_layout: Layout of the FP4 output `TileTensor`.
+        scales_layout: Layout of the scale output `TileTensor`.
+        _hid_dim: Hidden dimension; must be divisible by the group size
+            (`MXFP4_SF_VECTOR_SIZE`).
+        _top_k: Number of experts each token is routed to.
+        _alignment: Override for the byte alignment of the wire buffer; 0
+            selects `get_device_alignment()`.
+        fuse_a_scale_preshuffle: When `True`, fuses the per-expert scale
+            preshuffle into the tile copy for reduced memory traffic.
+        mx_format: Which MX element encoding the wire payload holds, defaulting
+            to whatever `quant_dtype` denotes. Pass a six-bit `quant_dtype`
+            (`float6_e2m3fn`/`float6_e3m2fn`) and the format follows; the legacy
+            `uint8` spelling is ambiguous -- MXFP4 and MXFP6 both travel as
+            packed `uint8` with `float8_e8m0fnu` scales -- so it resolves to FP4
+            and an MXFP6 caller stuck on `uint8` must name the format here.
+    """
+
     comptime hid_dim = Self._hid_dim
     comptime top_k = Self._top_k
     comptime alignment = Self._alignment or get_device_alignment()
     comptime group_size = MXFP4_SF_VECTOR_SIZE
+    comptime bits_per_element = Self.mx_format.bits_per_element()
+    comptime is_fp6 = Self.bits_per_element == 6
 
     comptime dispatch_wait_tile_shape = (128, 1)
     comptime dispatch_smem_size = 0
 
     comptime TensorType = TileTensor[
-        Self.fp4_dtype, Self.output_layout, MutUntrackedOrigin
+        Self.quant_dtype, Self.output_layout, MutUntrackedOrigin
     ]
     comptime ScalesTensorType = TileTensor[
         Self.scales_dtype, Self.scales_layout, MutUntrackedOrigin
@@ -1345,8 +1737,8 @@ struct MXFP4TokenFormat[
     @staticmethod
     def get_type_name() -> String:
         return String(
-            "MXFP4TokenFormat[fp4_dtype = ",
-            String(Self.fp4_dtype),
+            "MXTokenFormat[quant_dtype = ",
+            String(Self.quant_dtype),
             ", scales_dtype = ",
             String(Self.scales_dtype),
             ", hid_dim = ",
@@ -1363,19 +1755,23 @@ struct MXFP4TokenFormat[
     @always_inline
     def __init__(
         out self,
-        output_tokens: TileTensor[Self.fp4_dtype, Self.output_layout, ...],
-        output_scales: TileTensor[Self.scales_dtype, Self.scales_layout, ...],
+        output_tokens: TileTensor[
+            Self.quant_dtype, Self.output_layout, Engine=DefaultEngine[], ...
+        ],
+        output_scales: TileTensor[
+            Self.scales_dtype, Self.scales_layout, Engine=DefaultEngine[], ...
+        ],
         max_padded_M: Int = 0,
     ):
         self.output_tokens = {
-            UnsafePointer[Scalar[Self.fp4_dtype], MutUntrackedOrigin](
-                unsafe_from_address=Int(output_tokens.ptr)
+            UnsafePointer[Scalar[Self.quant_dtype], MutUntrackedOrigin](
+                unsafe_from_address=Int(output_tokens._storage)
             ),
             output_tokens.layout,
         }
         self.output_scales = {
             UnsafePointer[Scalar[Self.scales_dtype], MutUntrackedOrigin](
-                unsafe_from_address=Int(output_scales.ptr)
+                unsafe_from_address=Int(output_scales._storage)
             ),
             output_scales.layout,
         }
@@ -1383,8 +1779,10 @@ struct MXFP4TokenFormat[
 
     @always_inline
     @staticmethod
-    def fp4_quant_size() -> Int:
-        return align_up(Self.hid_dim // 2, Self.alignment)
+    def quant_size() -> Int:
+        return align_up(
+            (Self.hid_dim * Self.bits_per_element) // 8, Self.alignment
+        )
 
     @always_inline
     @staticmethod
@@ -1400,69 +1798,164 @@ struct MXFP4TokenFormat[
     @always_inline
     @staticmethod
     def token_size() -> Int:
-        return Self.fp4_quant_size() + Self.scales_size()
+        return Self.quant_size() + Self.scales_size()
 
     @always_inline
     @staticmethod
     def scales_offset() -> Int:
-        return Self.fp4_quant_size()
+        return Self.quant_size()
+
+    comptime fp6_fmt = (
+        Self.mx_format.fp6_format() if Self.mx_format.is_fp6() else FP6Format.E2M3
+    )
+
+    @always_inline
+    @staticmethod
+    def _copy_token_to_send_buf_fp6[
+        src_type: DType,
+        block_size: Int,
+        buf_addr_space: AddressSpace = .GENERIC,
+    ](
+        buf_p: UnsafePointer[mut=True, UInt8, _, address_space=buf_addr_space],
+        src_p: UnsafePointer[mut=False, Scalar[src_type], ...],
+    ) -> None:
+        """Quantizes one token to packed MXFP6, one MX block per thread.
+
+        The 32 elements of a block share one E8M0 scale and occupy exactly 24
+        bytes (eight whole 4-element / 3-byte groups, so no group straddles a
+        thread), which keeps the reduction in registers and the store to three
+        aligned 8-byte writes.
+        """
+        comptime blk = MXFP6_SF_VECTOR_SIZE
+        comptime bytes_per_blk = (blk * 6) // 8
+        comptime scale_bytes = size_of[Self.scales_dtype]()
+        comptime assert (
+            Self.hid_dim % blk == 0
+        ), "hid_dim must be divisible by the MXFP6 block size"
+
+        for b in range(thread_idx.x, Self.hid_dim // blk, block_size):
+            var data = src_p.load[
+                width=blk, alignment=Self.alignment, invariant=True
+            ](b * blk).cast[.float32]()
+
+            var group_max = abs(data).reduce_max()
+            var e8m0_scale = compute_mxfp6_even_scale[Self.fp6_fmt](group_max)
+
+            #
+            var out_scale = Float32(0.0)
+            if group_max != Float32(0.0) and isfinite(group_max):
+                out_scale = recip(e8m0_scale.cast[.float32]())
+            if not isfinite(group_max) or not isfinite(out_scale):
+                out_scale = Float32(0.0)
+                e8m0_scale = bitcast[.float8_e8m0fnu](UInt8(0))
+                data = type_of(data)(0.0)
+
+            var codes = encode_f32_to_fp6[Self.fp6_fmt](data * out_scale)
+
+            var packed = SIMD[.uint8, 32](0)
+            comptime for g in range(blk // 4):
+                var word = pack_fp6_x4(codes.slice[4, offset=g * 4]())
+                comptime for i in range(3):
+                    packed[g * 3 + i] = UInt8(
+                        (word >> UInt32(8 * i)) & UInt32(0xFF)
+                    )
+
+            comptime for chunk in range(bytes_per_blk // 8):
+                buf_p.store[alignment=8](
+                    b * bytes_per_blk + chunk * 8,
+                    packed.slice[8, offset=chunk * 8](),
+                )
+
+            buf_p.store[alignment=scale_bytes](
+                Self.scales_offset() + b * scale_bytes,
+                bitcast[.uint8, scale_bytes](
+                    rebind[Scalar[Self.scales_dtype]](e8m0_scale)
+                ),
+            )
 
     @always_inline
     @staticmethod
     def copy_token_to_send_buf[
         src_type: DType,
         block_size: Int,
-        buf_addr_space: AddressSpace = AddressSpace.GENERIC,
+        buf_addr_space: AddressSpace = .GENERIC,
     ](
         buf_p: UnsafePointer[mut=True, UInt8, _, address_space=buf_addr_space],
         src_p: UnsafePointer[mut=False, Scalar[src_type], ...],
         input_scale: Float32,
     ) -> None:
-        comptime src_width = 8
-        comptime byte_width = src_width // 2
-        comptime NUM_THREADS_PER_SF = MXFP4_SF_VECTOR_SIZE // src_width
+        comptime if Self.is_fp6:
+            Self._copy_token_to_send_buf_fp6[src_type, block_size](buf_p, src_p)
+        else:
+            comptime src_width = 8
+            comptime byte_width = (src_width * Self.bits_per_element) // 8
+            comptime NUM_THREADS_PER_SF = MXFP4_SF_VECTOR_SIZE // src_width
 
-        for i in range(thread_idx.x, Self.hid_dim // src_width, block_size):
-            var loaded_vec = src_p.load[
-                width=src_width, alignment=Self.alignment, invariant=True
-            ](i * src_width).cast[DType.float32]()
+            for i in range(thread_idx.x, Self.hid_dim // src_width, block_size):
+                var loaded_vec = src_p.load[
+                    width=src_width, alignment=Self.alignment, invariant=True
+                ](i * src_width).cast[.float32]()
 
-            # each thread finds maximum value in its local 8 elements
-            var thread_max = abs(loaded_vec).reduce_max().cast[DType.float32]()
-            # find the maximum value among all 32 elements
-            var group_max = warp.lane_group_max[num_lanes=NUM_THREADS_PER_SF](
-                thread_max
-            )
+                # each thread finds maximum value in its local 8 elements
+                var thread_max = abs(loaded_vec).reduce_max().cast[.float32]()
+                # find the maximum value among all 32 elements
+                var group_max = warp.lane_group_max[
+                    num_lanes=NUM_THREADS_PER_SF
+                ](thread_max)
 
-            # Use MXFP4 even-mode rounding for the E8M0 scale.
-            var fp8_scale_factor = compute_mxfp4_even_scale(group_max).cast[
-                Self.scales_dtype
-            ]()
-            var scale_f32 = fp8_scale_factor.cast[DType.float32]()
+                var fp8_scale_factor: Scalar[Self.scales_dtype]
+                var scale_f32: Float32
+                var block_is_dead = False
+                comptime if Self.bits_per_element == 8:
+                    # MXFP8 multiplies the data by the scale's RECIPROCAL, unlike
+                    # the FP4 path below, which hands the scale itself to the
+                    # packing helper.
+                    fp8_scale_factor, scale_f32, block_is_dead = (
+                        compute_mxfp8_block_scale[Self.scales_dtype](group_max)
+                    )
+                else:
+                    # Use MXFP4 even-mode rounding for the E8M0 scale.
+                    fp8_scale_factor = compute_mxfp4_even_scale(group_max).cast[
+                        Self.scales_dtype
+                    ]()
+                    scale_f32 = fp8_scale_factor.cast[.float32]()
 
-            # write back the scale factor
-            comptime scale_bytes = size_of[Self.scales_dtype]()
-            if i % NUM_THREADS_PER_SF == 0:
-                buf_p.store[alignment=scale_bytes](
-                    Self.scales_offset()
-                    + i // NUM_THREADS_PER_SF * scale_bytes,
-                    bitcast[DType.uint8, scale_bytes](fp8_scale_factor),
-                )
+                # write back the scale factor
+                comptime scale_bytes = size_of[Self.scales_dtype]()
+                if i % NUM_THREADS_PER_SF == 0:
+                    buf_p.store[alignment=scale_bytes](
+                        Self.scales_offset()
+                        + i // NUM_THREADS_PER_SF * scale_bytes,
+                        bitcast[.uint8, scale_bytes](fp8_scale_factor),
+                    )
 
-            var output_vector = bitcast[Self.fp4_dtype, byte_width](
-                cast_float_to_fp4e2m1_amd(
-                    loaded_vec,
-                    scale_f32,
-                )
-            )
-            buf_p.store[alignment=byte_width](
-                i * byte_width,
-                bitcast[DType.uint8, byte_width](output_vector),
-            )
+                comptime if Self.bits_per_element == 8:
+                    # A dead block has no E4M3 representation, so its data must be
+                    # zeroed too -- a non-finite lane would otherwise store
+                    # `inf * 0.0 = NaN`.
+                    var data = type_of(loaded_vec)(
+                        0.0
+                    ) if block_is_dead else loaded_vec
+                    var fp8_vec = (data * scale_f32).cast[Self.quant_dtype]()
+                    buf_p.store[alignment=byte_width](
+                        i * byte_width,
+                        bitcast[.uint8, byte_width](fp8_vec),
+                    )
+                else:
+                    var output_vector = bitcast[Self.quant_dtype, byte_width](
+                        cast_float_to_fp4e2m1_amd(
+                            loaded_vec,
+                            scale_f32,
+                        )
+                    )
+                    buf_p.store[alignment=byte_width](
+                        i * byte_width,
+                        bitcast[.uint8, byte_width](output_vector),
+                    )
 
     @always_inline
     def copy_msg_to_output_tensor[
-        buf_addr_space: AddressSpace = AddressSpace.GENERIC,
+        buf_addr_space: AddressSpace = .GENERIC,
     ](
         self,
         buf_p: UnsafePointer[mut=False, UInt8, _, address_space=buf_addr_space],
@@ -1474,8 +1967,8 @@ struct MXFP4TokenFormat[
             Self.TensorType.flat_rank >= 2
         ), "output_tokens expects rank >= 2"
         # First we copy the FP4 quants.
-        comptime fp4_width = simd_width_of[Self.fp4_dtype]()
-        comptime quant_bytes = Self.hid_dim // 2
+        comptime fp4_width = simd_width_of[Self.quant_dtype]()
+        comptime quant_bytes = (Self.hid_dim * Self.bits_per_element) // 8
         comptime assert (
             quant_bytes % fp4_width == 0
         ), "quant_bytes must be divisible by fp4_width"
@@ -1483,7 +1976,7 @@ struct MXFP4TokenFormat[
         for i in range(lane_id(), quant_bytes // fp4_width, WARP_SIZE):
             self.output_tokens.store(
                 (token_index, i * fp4_width),
-                bitcast[Self.fp4_dtype, fp4_width](
+                bitcast[Self.quant_dtype, fp4_width](
                     buf_p.load[
                         width=fp4_width,
                         invariant=True,
@@ -1550,9 +2043,9 @@ struct MXFP4TokenFormat[
                 var dst_off = Shuffler[1].scale_4d_slot_byte_off[
                     K_SCALES=K_SCALES
                 ](expert_slot, local_row, i, self.max_padded_M)
-                self.output_scales.ptr[dst_off] = bitcast[Self.scales_dtype, 1](
-                    byte
-                )
+                self.output_scales._storage[dst_off] = bitcast[
+                    Self.scales_dtype, 1
+                ](byte)
         else:
             for i in range(
                 lane_id(), Self.hid_dim // Self.group_size, WARP_SIZE
@@ -1605,10 +2098,10 @@ struct EPLocalSyncCounters[n_experts: Int](
     def __init__(out self, ptr: UnsafePointer[mut=True, Int32, ...]):
         self.ptr = ptr.unsafe_origin_cast[
             MutUntrackedOrigin
-        ]().address_space_cast[AddressSpace.GENERIC]()
+        ]().address_space_cast[.GENERIC]()
 
     @always_inline
-    def __init__(out self, mut buffer: DeviceBuffer[DType.int32]):
+    def __init__(out self, mut buffer: DeviceBuffer[.int32]):
         self.ptr = buffer.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
 
     def _to_device_type(
@@ -1736,6 +2229,10 @@ struct EPDispatchKernel[
     use_shmem: Bool = True,
     fused_shared_expert: Bool = False,
     skip_a2a: Bool = False,
+    has_rank_flag: Bool = False,
+    ep_ord_r: Bool = False,
+    ep_copy_role_split: Bool = False,
+    ep_send_join_named: Bool = False,
 ]:
     """Implements dispatch_async and dispatch_wait kernel logic for Expert Parallelism.
 
@@ -1768,6 +2265,20 @@ struct EPDispatchKernel[
             routed experts' inputs.
         skip_a2a: Whether to skip the A2A communication. If true, we will only
             send tokens within the current device.
+        has_rank_flag: Whether to reserve a dedicated rank-completion word per
+            source rank in the receive-count buffer tail. Required by, and only
+            meaningful with, `ep_ord_r`.
+        ep_ord_r: Whether completion is published at rank level (one elected
+            system-scope release per source rank) instead of the legacy
+            per-expert scheme. A fused consumer that acquires once per source
+            rank needs this; see `ep_signal_completion`.
+        ep_copy_role_split: Opt in to the split's publisher fan-out (the token
+            format carries the matching parameter for the copy body). Off by
+            default, which keeps the stock warp-strided fan-out.
+        ep_send_join_named: Join the per-token send on
+            the dedicated `NB_SEND` hardware barrier id instead of the generic
+            id-0 `barrier()`. Off by default. NVIDIA only; AMD keeps
+            `barrier()` either way.
     """
 
     comptime n_local_experts = Self.n_experts // Self.n_ranks
@@ -1775,6 +2286,22 @@ struct EPDispatchKernel[
     comptime top_k = Self.token_fmt_type.top_k
     comptime hid_dim = Self.token_fmt_type.hid_dim
     comptime msg_bytes = Self.token_fmt_type.msg_size()
+
+    # Hardware barrier ids. Id 0 is what the generic `barrier()` uses, so the
+    # send join takes an id of its own and can never be joined by an unrelated
+    # CTA-wide rendezvous.
+    comptime NB_SEND = 3
+
+    # The publisher fan-out follows whatever the copy body did, so it is
+    # derived from the same predicate on the same (CTA width, item count)
+    # pair. When the token format does not tile `hid_dim // EP_COPY_SRC_WIDTH`
+    # -- BF16, whose body is a `block_memcpy` -- `enabled` is False for both,
+    # which is the stock path anyway.
+    comptime role_split = EPRoleSplit[
+        Self.num_threads,
+        Self.hid_dim // EP_COPY_SRC_WIDTH,
+        Self.ep_copy_role_split,
+    ]
 
     # Aux SMs for dispatch_async kernel: one SM handles n_warps experts for
     # monitoring.
@@ -1793,6 +2320,40 @@ struct EPDispatchKernel[
     # These two offsets are only used when fused_shared_expert is True.
     comptime send_buf_ready_offset = 4 * Self.n_experts + 2
     comptime shared_expert_started_offset = 4 * Self.n_experts + 3
+
+    # Rank-completion flags (`ep_ord_r` only) live in a dedicated tail region
+    # of the receive-count buffer, one word per SOURCE rank, immediately after
+    # the per-expert count grid. Keeping them out of that grid is what lets a
+    # consumer distinguish "this expert's count landed" from "this whole rank
+    # is complete" -- the distinction rank-level activation eligibility rests
+    # on. The region exists only when `has_rank_flag` is set, so the legacy
+    # buffer size is unchanged.
+    comptime rank_flag_base = Self.n_local_experts * Self.n_ranks
+
+    @staticmethod
+    @always_inline
+    def rank_flag_offset(src_rank: Int) -> Int32:
+        """Offset of `src_rank`'s dedicated rank-completion flag.
+
+        Args:
+            src_rank: The SOURCE rank whose completion the flag publishes.
+
+        Returns:
+            Element offset into the destination's receive-count buffer.
+        """
+        comptime assert Self.has_rank_flag, (
+            "rank_flag_offset addresses the ORD-R rank-flag tail; it exists"
+            " only when has_rank_flag is set"
+        )
+        return Int32(Self.rank_flag_base + src_rank)
+
+    @staticmethod
+    @always_inline
+    def recv_count_size() -> Int:
+        """Receive-count buffer element count, including the ORD-R tail."""
+        comptime if Self.has_rank_flag:
+            return Self.rank_flag_base + Self.n_ranks
+        return Self.rank_flag_base
 
     comptime _recv_layout = row_major[
         Self.n_local_experts,
@@ -1815,26 +2376,24 @@ struct EPDispatchKernel[
         ),
     ](coord: Coord, out offset: Scalar[out_dtype]):
         comptime if Self.skip_a2a:
-            _coord = Coord((coord[0], Idx[0], coord[2], coord[3]))
+            var _coord = Coord((coord[0], Idx[0], coord[2], coord[3]))
             offset = Self._recv_layout[linear_idx_type=out_dtype](_coord)
         else:
             offset = Self._recv_layout[linear_idx_type=out_dtype](coord)
 
     @staticmethod
     @always_inline
-    def recv_count_layout(coord: Coord, out offset: Scalar[DType.int32]):
+    def recv_count_layout(coord: Coord, out offset: Int32):
         comptime if Self.skip_a2a:
-            _coord = Coord((coord[0], Idx[0]))
-            offset = Self._recv_count_layout[linear_idx_type=DType.int32](
-                _coord
-            )
+            var _coord = Coord((coord[0], Idx[0]))
+            offset = Self._recv_count_layout[linear_idx_type=.int32](_coord)
         else:
-            offset = Self._recv_count_layout[linear_idx_type=DType.int32](coord)
+            offset = Self._recv_count_layout[linear_idx_type=.int32](coord)
 
     @staticmethod
     @always_inline
-    def send_buf_layout(coord: Coord, out offset: Scalar[DType.int32]):
-        offset = Self._send_layout[linear_idx_type=DType.int32](coord)
+    def send_buf_layout(coord: Coord, out offset: Int32):
+        offset = Self._send_layout[linear_idx_type=.int32](coord)
 
     # ===-------------------------------------------------------------------===#
     # Dispatch Kernel Methods
@@ -1843,8 +2402,8 @@ struct EPDispatchKernel[
     @staticmethod
     @always_inline
     def monitor_and_signal_completion(
-        topk_ids: TileTensor[mut=False, DType.int32, ...],
-        recv_count_ptrs: InlineArray[
+        topk_ids: TileTensor[mut=False, .int32, Engine=DefaultEngine[], ...],
+        recv_count_ptrs: Array[
             UnsafePointer[UInt64, MutUntrackedOrigin], Self.p2p_world_size
         ],
         expert_reserved_counter: UnsafePointer[Int32, MutUntrackedOrigin],
@@ -1895,18 +2454,38 @@ struct EPDispatchKernel[
                 )
 
                 # Wait until all the tokens for the expert have been sent.
-                while (
-                    _counter_atomic.load[ordering=Ordering.ACQUIRE](
-                        expert_finished_counter + counter_offset
-                    )
-                    != expert_count
-                ):
-                    pass
+                comptime if is_amd_gpu():
+                    # TODO(KERN-3184): Investigate why AMD GPUs are slow if the below
+                    # ACQUIRE atomic load is used instead of this volatile load.
+                    while (
+                        expert_finished_counter.load[volatile=True](
+                            counter_offset
+                        )
+                        != expert_count
+                    ):
+                        pass
+                    # Acquire the flag's release; the volatile poll is unordered.
+                    fence[ordering=Ordering.ACQUIRE, scope=DEVICE_SCOPE]()
+                else:
+                    while (
+                        _counter_atomic.load[ordering=Ordering.ACQUIRE](
+                            expert_finished_counter + counter_offset
+                        )
+                        != expert_count
+                    ):
+                        pass
 
+                # The rank flag published here is keyed by the SOURCE rank, so
+                # a destination acquiring it learns that THIS rank is complete.
+                var rank_flag_off = Int32(0)
+                comptime if Self.ep_ord_r:
+                    rank_flag_off = Self.rank_flag_offset(Int(my_rank))
                 ep_signal_completion[
                     Self.use_shmem,
                     n_experts_per_device=Self.n_local_experts,
                     skip_a2a=Self.skip_a2a,
+                    has_rank_flag=Self.has_rank_flag,
+                    ep_ord_r=Self.ep_ord_r,
                 ](
                     my_rank,
                     Int32(dst_rank),
@@ -1914,6 +2493,7 @@ struct EPDispatchKernel[
                     signal_offset,
                     UInt64(expert_count),
                     rank_completion_counter,
+                    rank_flag_off,
                 )
 
                 expert_reserved_counter[counter_offset] = 0
@@ -1926,10 +2506,12 @@ struct EPDispatchKernel[
         //,
         input_scales_wrapper: Optional[input_scales_wrapper_type] = None,
     ](
-        input_tokens: TileTensor[mut=False, input_type, ...],
-        topk_ids: TileTensor[mut=False, DType.int32, ...],
+        input_tokens: TileTensor[
+            mut=False, input_type, Engine=DefaultEngine[], ...
+        ],
+        topk_ids: TileTensor[mut=False, .int32, Engine=DefaultEngine[], ...],
         send_buf_p: UnsafePointer[UInt8, MutUntrackedOrigin],
-        recv_buf_ptrs: InlineArray[
+        recv_buf_ptrs: Array[
             UnsafePointer[UInt8, MutUntrackedOrigin], Self.p2p_world_size
         ],
         expert_reserved_counter: UnsafePointer[Int32, MutUntrackedOrigin],
@@ -1955,6 +2537,12 @@ struct EPDispatchKernel[
             input_tokens.flat_rank == 2
         ), "input_tokens expects rank == 2"
         comptime assert topk_ids.flat_rank == 2, "topk_ids expects rank == 2"
+        comptime Roles = Self.role_split
+        # `named_barrier` counts THREADS and requires a multiple of the warp
+        # size; the send join passes the whole CTA width.
+        comptime assert (
+            Self.num_threads % WARP_SIZE == 0
+        ), "num_threads must be a whole number of warps"
         var tid = thread_idx.x
         var num_tokens = input_tokens.dim(0)
         var my_p2p_world, my_p2p_rank = divmod(
@@ -1965,7 +2553,7 @@ struct EPDispatchKernel[
 
         comptime if input_scales_wrapper is not None:
             comptime input_scale_fn = input_scales_wrapper.value()
-            input_scale = input_scale_fn[DType.float32](0)
+            input_scale = input_scale_fn[.float32](0)
 
         # Use runtime grid_dim so reduced-grid launches don't skip tokens.
         # When grid_dim == n_sms this is identical to the comptime stride.
@@ -1999,7 +2587,7 @@ struct EPDispatchKernel[
                 ](
                     Self.token_fmt_type.topk_info_offset()
                     + tid * size_of[UInt16](),
-                    bitcast[DType.uint8, size_of[UInt16]()](UInt16(top_k_idx)),
+                    bitcast[.uint8, size_of[UInt16]()](UInt16(top_k_idx)),
                 )
 
                 # Store the source token index in current token's message.
@@ -2009,16 +2597,38 @@ struct EPDispatchKernel[
                         alignment=align_of[DType.int32](),
                     ](
                         Self.token_fmt_type.src_info_offset(),
-                        bitcast[DType.uint8, size_of[Int32]()](
-                            Int32(token_idx)
-                        ),
+                        bitcast[.uint8, size_of[Int32]()](Int32(token_idx)),
                     )
 
-            barrier()
+            # Named send join (opt-in): a barrier over exactly this CTA's
+            # threads. The participant set is identical to the generic
+            # `barrier()` it replaces in every specialization, but on a
+            # dedicated id it cannot be conflated with any other id-0
+            # rendezvous in the kernel. `named_barrier` is NVIDIA-only, so AMD
+            # keeps the generic join; so does every caller that leaves the
+            # flag off.
+            comptime if Self.ep_send_join_named and is_nvidia_gpu():
+                named_barrier[Int32(Self.num_threads)](Int32(Self.NB_SEND))
+            else:
+                barrier()
 
             # Try to copy the message to the target expert's recv_buf if the
             # target device is on the same node.
-            for topk_idx in range(warp_id(), Self.top_k, Self.n_warps):
+            # When the role split is active the fan-out is
+            # publisher-role-relative, so copy-role warps get an empty range
+            # and keep their store history out of the send; otherwise it is
+            # the stock warp-strided fan-out. Either way every top-k
+            # destination is visited by exactly one warp.
+            comptime pub_stride = (
+                Roles.n_publisher_warps if Roles.enabled else Self.n_warps
+            )
+            var pub_start = Int(warp_id())
+            comptime if Roles.enabled:
+                pub_start = (
+                    Roles.publisher_role_index() if Roles.is_ep_publisher_role() else Self.top_k
+                )
+
+            for topk_idx in range(pub_start, Self.top_k, pub_stride):
                 var target_expert = rebind[Int32](topk_ids[token_idx, topk_idx])
                 var dst_rank, dst_expert_local_idx = divmod(
                     target_expert, Int32(Self.n_local_experts)
@@ -2128,8 +2738,8 @@ struct EPDispatchKernel[
     @always_inline
     def wait_for_arrivals_and_compute_offsets(
         format_handler: Self.token_fmt_type,
-        row_offsets: TileTensor[mut=True, DType.uint32, ...],
-        expert_ids: TileTensor[mut=True, DType.int32, ...],
+        row_offsets: TileTensor[mut=True, .uint32, Engine=DefaultEngine[], ...],
+        expert_ids: TileTensor[mut=True, .int32, Engine=DefaultEngine[], ...],
         recv_count_p: UnsafePointer[UInt64, MutUntrackedOrigin],
         atomic_counter: UnsafePointer[Int32, MutUntrackedOrigin],
         my_rank: Int32,
@@ -2160,8 +2770,8 @@ struct EPDispatchKernel[
         comptime shared_expert_offset = 1 if Self.fused_shared_expert else 0
         var tid = thread_idx.x
 
-        var prefix_sum_arr = stack_allocation[
-            Self.n_experts, DType.uint32, address_space=AddressSpace.SHARED
+        var prefix_sum_arr = unsafe_stack_allocation[
+            Self.n_experts, DType.uint32, address_space=.SHARED
         ]()
 
         if tid < Self.n_local_experts + shared_expert_offset:
@@ -2202,7 +2812,7 @@ struct EPDispatchKernel[
         # Some token format handlers may require padding the expert offsets to
         # satisfy the grouped matmul alignment requirement.
         comptime n_groups = Self.n_local_experts + shared_expert_offset
-        format_handler.pad_expert_offsets[n_groups](row_offsets.ptr)
+        format_handler.pad_expert_offsets[n_groups](row_offsets._storage)
 
         # Write out data needed for other SMs to copy the tokens to the output
         # tensor.
@@ -2290,8 +2900,8 @@ struct EPDispatchKernel[
     @always_inline
     def copy_received_tokens_to_output(
         format_handler: Self.token_fmt_type,
-        row_offsets: TileTensor[mut=True, DType.uint32, ...],
-        src_info: TileTensor[mut=True, DType.int32, ...],
+        row_offsets: TileTensor[mut=True, .uint32, Engine=DefaultEngine[], ...],
+        src_info: TileTensor[mut=True, .int32, Engine=DefaultEngine[], ...],
         recv_buf_p: UnsafePointer[UInt8, MutUntrackedOrigin],
         atomic_counter: UnsafePointer[Int32, MutUntrackedOrigin],
         my_rank: Int32,
@@ -2331,18 +2941,18 @@ struct EPDispatchKernel[
 
         # Shared memory: rank prefix sums, per-tile token-to-rank map,
         # expert start, and chunk_start broadcast slot.
-        var rank_prefix = stack_allocation[
-            Self.n_ranks, DType.int32, address_space=AddressSpace.SHARED
+        var rank_prefix = unsafe_stack_allocation[
+            Self.n_ranks, Int32, address_space=.SHARED
         ]()
-        var tok_rank_map = stack_allocation[
-            tile_size, DType.int32, address_space=AddressSpace.SHARED
+        var tok_rank_map = unsafe_stack_allocation[
+            tile_size, Int32, address_space=.SHARED
         ]()
-        var smem_vals = stack_allocation[
-            2, DType.int32, address_space=AddressSpace.SHARED
+        var smem_vals = unsafe_stack_allocation[
+            2, Int32, address_space=.SHARED
         ]()
 
         @always_inline
-        def fetch_tile_id() {read} -> Int32:
+        def fetch_tile_id() {imm} -> Int32:
             """Fetch the start of the next tile for the current expert. Should
             be called by a single thread.
             """
@@ -2410,12 +3020,17 @@ struct EPDispatchKernel[
                 break
 
             var tile_end = min(tile_start + tile_size, total_tokens)
-            last_tile = tile_end == total_tokens
+            # One token tile needs `sms_per_tile` claims (one per K tile);
+            # stop only after the last of those, or the remaining half is dropped.
+            last_tile = (
+                tile_end == total_tokens
+                and umod(tile_id, sms_per_tile) == sms_per_tile - 1
+            )
 
             @always_inline
             def _recv_buf_ptr_for(
                 tok_local: Int,
-            ) {read} -> UnsafePointer[UInt8, MutUntrackedOrigin]:
+            ) {imm} -> UnsafePointer[UInt8, MutUntrackedOrigin]:
                 """Return the pointer to the token in the receive buffer."""
                 var wep = tile_start + tok_local
                 var src_rank = Int(tok_rank_map[tok_local])
@@ -2435,12 +3050,12 @@ struct EPDispatchKernel[
             def extract_topk_info(
                 token_ptr: UnsafePointer[UInt8, MutUntrackedOrigin],
                 output_pos: Int,
-            ) {read} -> None:
+            ) {imm} -> None:
                 """Extract the top-k info from the token ans save it to the
                 src_info tensor. Should be called by whole warp.
                 """
                 if lane_id() < Self.top_k:
-                    var src_topk_idx = bitcast[DType.uint16, 1](
+                    var src_topk_idx = bitcast[.uint16, 1](
                         token_ptr.load[
                             width=size_of[UInt16](),
                             alignment=size_of[UInt16](),
@@ -2449,7 +3064,7 @@ struct EPDispatchKernel[
                             + lane_id() * size_of[UInt16](),
                         )
                     )
-                    var src_idx = bitcast[DType.int32, 1](
+                    var src_idx = bitcast[.int32, 1](
                         token_ptr.load[
                             width=size_of[Int32](),
                             alignment=size_of[Int32](),
@@ -2554,7 +3169,7 @@ struct EPDispatchKernel[
             @always_inline
             def _send_buf_ptr_for(
                 tok_local: Int,
-            ) {read} -> UnsafePointer[UInt8, MutUntrackedOrigin]:
+            ) {imm} -> UnsafePointer[UInt8, MutUntrackedOrigin]:
                 return send_buf_p + Self.send_buf_layout(
                     (tile_start + tok_local, Idx[0])
                 )
@@ -2563,7 +3178,7 @@ struct EPDispatchKernel[
             def extract_topk_info(
                 token_ptr: UnsafePointer[UInt8, MutUntrackedOrigin],
                 output_pos: Int,
-            ) {read} -> None:
+            ) {imm} -> None:
                 pass
 
             format_handler.copy_msg_tile_to_output_tensor[
@@ -2599,14 +3214,14 @@ def dispatch_async_kernel[
     use_shmem: Bool = True,
 ](
     input_tokens: TileTensor[
-        input_type, input_tokens_layout, ImmutUntrackedOrigin
+        input_type, input_tokens_layout, ImmUntrackedOrigin
     ],
-    topk_ids: TileTensor[DType.int32, topk_ids_layout, ImmutUntrackedOrigin],
+    topk_ids: TileTensor[.int32, topk_ids_layout, ImmUntrackedOrigin],
     send_buf_p: UnsafePointer[UInt8, MutUntrackedOrigin],
-    recv_buf_ptrs: InlineArray[
+    recv_buf_ptrs: Array[
         UnsafePointer[UInt8, MutUntrackedOrigin], p2p_world_size
     ],
-    recv_count_ptrs: InlineArray[
+    recv_count_ptrs: Array[
         UnsafePointer[UInt64, MutUntrackedOrigin], p2p_world_size
     ],
     ep_counters: EPLocalSyncCounters[n_experts],
@@ -2720,11 +3335,9 @@ def dispatch_wait_kernel[
     input_scales_wrapper: Optional[input_scales_wrapper_type] = None,
 ](
     format_handler: token_fmt_type,
-    row_offsets: TileTensor[
-        DType.uint32, row_offsets_layout, MutUntrackedOrigin
-    ],
-    expert_ids: TileTensor[DType.int32, expert_ids_layout, MutUntrackedOrigin],
-    src_info: TileTensor[DType.int32, src_info_layout, MutUntrackedOrigin],
+    row_offsets: TileTensor[.uint32, row_offsets_layout, MutUntrackedOrigin],
+    expert_ids: TileTensor[.int32, expert_ids_layout, MutUntrackedOrigin],
+    src_info: TileTensor[.int32, src_info_layout, MutUntrackedOrigin],
     recv_buf_p: UnsafePointer[UInt8, MutUntrackedOrigin],
     recv_count_p: UnsafePointer[UInt64, MutUntrackedOrigin],
     ep_counters: EPLocalSyncCounters[n_experts],
@@ -2888,17 +3501,38 @@ struct EPCombineKernel[
 
     @staticmethod
     @always_inline
-    def recv_buf_layout(coord: Coord) -> Scalar[DType.int32]:
-        return Self._recv_layout[linear_idx_type=DType.int32](coord)
+    def recv_buf_layout(coord: Coord) -> Int32:
+        return Self._recv_layout[linear_idx_type=.int32](coord)
 
     @staticmethod
     @always_inline
-    def recv_count_layout(coord: Coord) -> Scalar[DType.int32]:
+    def _recv_offset_in_bounds(src_idx: Int32, src_topk_idx: Int32) -> Bool:
+        """Whether a src_info row is a valid receive-buffer write offset.
+
+        `src_idx`/`src_topk_idx` come straight from `src_info`, which
+        `dispatch_wait` only writes for rows whose message header matched the
+        local expert. A stale or garbled row keeps out-of-range values; using
+        them as a `recv_buf_layout` offset is a wild P2P write that stomped
+        model weights in SERVOPT-1458. Validate against the receive-buffer
+        shape `(max_tokens_per_rank, top_k, msg_bytes)` first.
+        """
+        var si = Int(src_idx)
+        var sti = Int(src_topk_idx)
+        return (
+            si >= 0
+            and si < Self.max_tokens_per_rank
+            and sti >= 0
+            and sti < Self.top_k
+        )
+
+    @staticmethod
+    @always_inline
+    def recv_count_layout(coord: Coord) -> Int32:
         comptime if Self.skip_a2a:
             var _coord = Coord((coord[0], Idx[0]))
-            return Self._recv_count_layout[linear_idx_type=DType.int32](_coord)
+            return Self._recv_count_layout[linear_idx_type=.int32](_coord)
         else:
-            return Self._recv_count_layout[linear_idx_type=DType.int32](coord)
+            return Self._recv_count_layout[linear_idx_type=.int32](coord)
 
     # ===-------------------------------------------------------------------===#
     # Combine Kernel Methods
@@ -2910,8 +3544,10 @@ struct EPCombineKernel[
         input_type: DType,
         //,
     ](
-        input_tokens: TileTensor[input_type, ...],
-        output_tokens: TileTensor[mut=True, input_type, ...],
+        input_tokens: TileTensor[input_type, Engine=DefaultEngine[], ...],
+        output_tokens: TileTensor[
+            mut=True, input_type, Engine=DefaultEngine[], ...
+        ],
     ) -> None:
         """Copies shared expert outputs to the output tensor.
 
@@ -2936,8 +3572,8 @@ struct EPCombineKernel[
         for token_idx in range(
             sm_id, Int(shared_expert_token_count), Self.n_sms
         ):
-            var output_tokens_p = output_tokens.ptr + token_idx * hid_dim
-            var input_tokens_p = input_tokens.ptr + token_idx * hid_dim
+            var output_tokens_p = output_tokens._storage + token_idx * hid_dim
+            var input_tokens_p = input_tokens._storage + token_idx * hid_dim
             block_memcpy[hid_dim * size_of[input_type](), Self.num_threads](
                 output_tokens_p.bitcast[UInt8](),
                 input_tokens_p.bitcast[UInt8](),
@@ -2950,13 +3586,13 @@ struct EPCombineKernel[
         input_type: DType,
         //,
     ](
-        input_tokens: TileTensor[input_type, ...],
-        src_info: TileTensor[DType.int32, ...],
+        input_tokens: TileTensor[input_type, Engine=DefaultEngine[], ...],
+        src_info: TileTensor[.int32, Engine=DefaultEngine[], ...],
         send_buf_p: UnsafePointer[UInt8, MutUntrackedOrigin],
-        recv_buf_ptrs: InlineArray[
+        recv_buf_ptrs: Array[
             UnsafePointer[UInt8, MutUntrackedOrigin], Self.p2p_world_size
         ],
-        recv_count_ptrs: InlineArray[
+        recv_count_ptrs: Array[
             UnsafePointer[UInt64, MutUntrackedOrigin], Self.p2p_world_size
         ],
         atomic_counter: UnsafePointer[Int32, MutUntrackedOrigin],
@@ -3020,7 +3656,7 @@ struct EPCombineKernel[
             comptime DATA_READY_FLAG = 1024
             var token_end_count = atomic_counter.load[
                 width=2,
-                alignment=align_of[SIMD[DType.int32, 2]](),
+                alignment=align_of[SIMD[.int32, 2]](),
                 invariant=True,
             ](2 * expert_rank_offset)
             var token_end = token_end_count[0] - DATA_READY_FLAG
@@ -3035,6 +3671,9 @@ struct EPCombineKernel[
                     )
                     var src_idx = src_token_info[0]
                     var src_topk_idx = src_token_info[1]
+
+                    if not Self._recv_offset_in_bounds(src_idx, src_topk_idx):
+                        continue
 
                     var dst_recv_buf_ptr = recv_buf_ptrs[
                         dst_p2p_rank
@@ -3105,26 +3744,31 @@ struct EPCombineKernel[
                                 var src_idx = src_token_info[0]
                                 var src_topk_idx = src_token_info[1]
 
-                                var curr_send_buf_ptr = (
-                                    send_buf_p
-                                    + Self.send_buf_layout((token_idx, Idx[0]))
-                                )
-                                var dst_recv_buf_ptr = recv_buf_ptrs[
-                                    my_p2p_rank
-                                ] + Self.recv_buf_layout(
-                                    (
-                                        Int(src_idx),
-                                        Int(src_topk_idx),
-                                        Idx[0],
+                                if Self._recv_offset_in_bounds(
+                                    src_idx, src_topk_idx
+                                ):
+                                    var curr_send_buf_ptr = (
+                                        send_buf_p
+                                        + Self.send_buf_layout(
+                                            (token_idx, Idx[0])
+                                        )
                                     )
-                                )
+                                    var dst_recv_buf_ptr = recv_buf_ptrs[
+                                        my_p2p_rank
+                                    ] + Self.recv_buf_layout(
+                                        (
+                                            Int(src_idx),
+                                            Int(src_topk_idx),
+                                            Idx[0],
+                                        )
+                                    )
 
-                                shmem_put_nbi[kind=SHMEMScope.default](
-                                    dst_recv_buf_ptr,
-                                    curr_send_buf_ptr,
-                                    c_size_t(Self.msg_bytes),
-                                    Int32(target_rank),
-                                )
+                                    shmem_put_nbi[kind=SHMEMScope.default](
+                                        dst_recv_buf_ptr,
+                                        curr_send_buf_ptr,
+                                        c_size_t(Self.msg_bytes),
+                                        Int32(target_rank),
+                                    )
 
             barrier()
 
@@ -3152,7 +3796,7 @@ struct EPCombineKernel[
                     )
 
                     atomic_counter.store[
-                        width=2, alignment=align_of[SIMD[DType.int32, 2]]()
+                        width=2, alignment=align_of[SIMD[.int32, 2]]()
                     ](expert_rank_offset * 2, 0)
 
     # ===-------------------------------------------------------------------===#
@@ -3204,11 +3848,13 @@ struct EPCombineKernel[
         router_weights_wrapper: Optional[router_weights_wrapper_type] = None,
         elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
     ](
-        output_tokens: TileTensor[mut=True, output_type, ...],
+        output_tokens: TileTensor[
+            mut=True, output_type, Engine=DefaultEngine[], ...
+        ],
         recv_buf_p: UnsafePointer[UInt8, MutUntrackedOrigin],
         atomic_counter: UnsafePointer[Int32, MutUntrackedOrigin],
         my_rank: Int32,
-        topk_ids_p: Optional[UnsafePointer[Int32, ImmutUntrackedOrigin]] = None,
+        topk_ids_p: Optional[UnsafePointer[Int32, ImmUntrackedOrigin]] = None,
     ) -> None:
         """Communication SM logic for combine_wait_kernel.
 
@@ -3230,7 +3876,7 @@ struct EPCombineKernel[
 
         comptime last_dim = 1 if router_weights_wrapper else 2
         comptime hid_dim = output_tokens.static_shape[last_dim]
-        comptime _align = align_of[SIMD[DType.uint8, byte_simd_width]]()
+        comptime _align = align_of[SIMD[.uint8, byte_simd_width]]()
 
         comptime assert (
             Self.msg_bytes == hid_dim * size_of[Scalar[output_type]]()
@@ -3251,6 +3897,8 @@ struct EPCombineKernel[
                     atomic_counter.load[volatile=True](sm_id) != DATA_READY_FLAG
                 ):
                     pass
+                # Acquire the flag's release; the volatile poll is unordered.
+                fence[ordering=Ordering.ACQUIRE, scope=DEVICE_SCOPE]()
             else:
                 while (
                     _counter_atomic.load[ordering=Ordering.ACQUIRE](
@@ -3290,7 +3938,7 @@ struct EPCombineKernel[
                 chunk_idx, n_chunks_per_tok
             )
 
-            var accum = SIMD[DType.float32, dst_simd_width](0)
+            var accum = SIMD[.float32, dst_simd_width](0)
 
             comptime for topk_idx in range(Self.top_k):
                 comptime if Self.skip_a2a:
@@ -3311,10 +3959,10 @@ struct EPCombineKernel[
                         chunk_idx_in_token * n_chunk_bytes,
                     )
                 )
+                # recv_buf is fresh peer data each round: not invariant.
                 var recv_chunk = bitcast[output_type, dst_simd_width](
                     recv_buf_ptr.load[
                         width=byte_simd_width,
-                        invariant=True,
                         alignment=_align,
                     ](
                         lane_id() * byte_simd_width,
@@ -3325,7 +3973,7 @@ struct EPCombineKernel[
                     comptime router_weights_fn = router_weights_wrapper.value()
 
                     var weight = router_weights_fn[1](token_idx, topk_idx)
-                    accum += weight * recv_chunk.cast[DType.float32]()
+                    accum += weight * recv_chunk.cast[.float32]()
 
                 else:
                     # The output tensor is of shape
@@ -3394,14 +4042,14 @@ def combine_async_kernel[
     use_shmem: Bool = True,
 ](
     input_tokens: TileTensor[
-        input_type, input_tokens_layout, ImmutUntrackedOrigin
+        input_type, input_tokens_layout, ImmUntrackedOrigin
     ],
-    src_info: TileTensor[DType.int32, src_info_layout, ImmutUntrackedOrigin],
+    src_info: TileTensor[.int32, src_info_layout, ImmUntrackedOrigin],
     send_buf_p: UnsafePointer[UInt8, MutUntrackedOrigin],
-    recv_buf_ptrs: InlineArray[
+    recv_buf_ptrs: Array[
         UnsafePointer[UInt8, MutUntrackedOrigin], p2p_world_size
     ],
-    recv_count_ptrs: InlineArray[
+    recv_count_ptrs: Array[
         UnsafePointer[UInt64, MutUntrackedOrigin], p2p_world_size
     ],
     ep_counters: EPLocalSyncCounters[n_experts],
@@ -3602,20 +4250,18 @@ def dispatch_kernel[
     allreduce_world_size: Int = 1,
 ](
     input_tokens: TileTensor[
-        input_type, input_tokens_layout, ImmutUntrackedOrigin
+        input_type, input_tokens_layout, ImmUntrackedOrigin
     ],
-    topk_ids: TileTensor[DType.int32, topk_ids_layout, ImmutUntrackedOrigin],
+    topk_ids: TileTensor[.int32, topk_ids_layout, ImmUntrackedOrigin],
     format_handler: token_fmt_type,
-    row_offsets: TileTensor[
-        DType.uint32, row_offsets_layout, MutUntrackedOrigin
-    ],
-    expert_ids: TileTensor[DType.int32, expert_ids_layout, MutUntrackedOrigin],
-    src_info: TileTensor[DType.int32, src_info_layout, MutUntrackedOrigin],
+    row_offsets: TileTensor[.uint32, row_offsets_layout, MutUntrackedOrigin],
+    expert_ids: TileTensor[.int32, expert_ids_layout, MutUntrackedOrigin],
+    src_info: TileTensor[.int32, src_info_layout, MutUntrackedOrigin],
     send_buf_p: UnsafePointer[UInt8, MutUntrackedOrigin],
-    recv_buf_ptrs: InlineArray[
+    recv_buf_ptrs: Array[
         UnsafePointer[UInt8, MutUntrackedOrigin], p2p_world_size
     ],
-    recv_count_ptrs: InlineArray[
+    recv_count_ptrs: Array[
         UnsafePointer[UInt64, MutUntrackedOrigin], p2p_world_size
     ],
     ep_counters: EPLocalSyncCounters[n_experts],
@@ -3815,21 +4461,21 @@ def combine_kernel[
     allreduce_world_size: Int = 1,
 ](
     input_tokens: TileTensor[
-        input_type, input_tokens_layout, ImmutUntrackedOrigin
+        input_type, input_tokens_layout, ImmUntrackedOrigin
     ],
-    src_info: TileTensor[DType.int32, src_info_layout, ImmutUntrackedOrigin],
+    src_info: TileTensor[.int32, src_info_layout, ImmUntrackedOrigin],
     output_tokens: TileTensor[
         input_type, output_tokens_layout, MutUntrackedOrigin
     ],
     send_buf_p: UnsafePointer[UInt8, MutUntrackedOrigin],
-    recv_buf_ptrs: InlineArray[
+    recv_buf_ptrs: Array[
         UnsafePointer[UInt8, MutUntrackedOrigin], p2p_world_size
     ],
-    recv_count_ptrs: InlineArray[
+    recv_count_ptrs: Array[
         UnsafePointer[UInt64, MutUntrackedOrigin], p2p_world_size
     ],
     ep_counters: EPLocalSyncCounters[n_experts],
-    topk_ids_p: Optional[UnsafePointer[Int32, ImmutUntrackedOrigin]],
+    topk_ids_p: Optional[UnsafePointer[Int32, ImmUntrackedOrigin]],
     my_rank: Int32,
 ):
     """
@@ -3949,9 +4595,9 @@ def combine_kernel[
                 comptime hid_dim = input_tokens.static_shape[1]
 
                 @always_inline
-                @parameter
+                @__parameter
                 def add_shared_expert_output[
-                    dtype: DType, width: SIMDSize, *, alignment: Int = 1
+                    dtype: DType, width: SIMDLength, *, alignment: Int = 1
                 ](
                     idx: IndexList[2], combined_val: SIMD[dtype, width]
                 ) capturing:
@@ -4041,10 +4687,8 @@ def fused_silu_kernel[
     num_sms: Int,
 ](
     output_tensor: TileTensor[output_dtype, output_layout, MutUntrackedOrigin],
-    input_tensor: TileTensor[input_dtype, input_layout, ImmutUntrackedOrigin],
-    row_offsets: TileTensor[
-        DType.uint32, row_offsets_layout, ImmutUntrackedOrigin
-    ],
+    input_tensor: TileTensor[input_dtype, input_layout, ImmUntrackedOrigin],
+    row_offsets: TileTensor[.uint32, row_offsets_layout, ImmUntrackedOrigin],
 ):
     """
     This kernel performs the SILU operation for all the MLPs in the EP MoE
@@ -4052,6 +4696,19 @@ def fused_silu_kernel[
     EP dispatch phase, the actual number of received tokens is not known to the
     host. This kernel will read the row offsets to determine the actual number of
     received tokens in the input tensor.
+
+    Parameters:
+        output_dtype: Element type of the `output_tensor` (e.g.
+            `.bfloat16`).
+        input_dtype: Element type of the `input_tensor`; its accumulation type
+            must be floating-point.
+        output_layout: Layout of the `output_tensor` `TileTensor`.
+        input_layout: Layout of the `input_tensor` `TileTensor`.
+        row_offsets_layout: Layout of the 1D `row_offsets` `TileTensor`.
+        num_threads: Number of threads per block; sets the
+            `MAX_THREADS_PER_BLOCK` launch metadata.
+        num_sms: Number of streaming multiprocessors (SMs) used to scatter
+            processing across thread blocks.
 
     Arguments:
         output_tensor: The output tensor to store the result.
@@ -4128,8 +4785,8 @@ def fused_silu_fp8_kernel[
 ](
     output_tensor: TileTensor[fp8_dtype, output_layout, MutUntrackedOrigin],
     scales_tensor: TileTensor[scales_dtype, scales_layout, MutUntrackedOrigin],
-    input_tensor: TileTensor[input_dtype, input_layout, ImmutUntrackedOrigin],
-    row_offsets: TileTensor[DType.uint32, offsets_layout, ImmutUntrackedOrigin],
+    input_tensor: TileTensor[input_dtype, input_layout, ImmUntrackedOrigin],
+    row_offsets: TileTensor[.uint32, offsets_layout, ImmUntrackedOrigin],
 ):
     """
     This kernel performs the SILU operation for all the MLPs in the EP MoE
@@ -4140,6 +4797,25 @@ def fused_silu_fp8_kernel[
 
     Once the SILU operation is performed, the output tensor will be quantized to
     the FP8 format. The scales tensor will be stored in a transposed way.
+
+    Parameters:
+        fp8_dtype: FP8 element type of the quantized `output_tensor` (e.g.
+            `.float8_e4m3fn`).
+        scales_dtype: Element type of the block-wise scale factors stored in
+            `scales_tensor`.
+        input_dtype: Element type of the `input_tensor`; its accumulation type
+            must be floating-point.
+        output_layout: Layout of the FP8 `output_tensor` `TileTensor`.
+        scales_layout: Layout of the `scales_tensor` `TileTensor`; scales are
+            stored transposed (group index in dim 0, token index in dim 1).
+        input_layout: Layout of the `input_tensor` `TileTensor`.
+        offsets_layout: Layout of the 1D `row_offsets` `TileTensor`.
+        num_threads: Number of threads per block; sets the
+            `MAX_THREADS_PER_BLOCK` launch metadata.
+        num_sms: Number of streaming multiprocessors (SMs) used to scatter
+            processing across thread blocks.
+        group_size: Number of elements per quantization group; the output
+            dimension must be divisible by this (defaults to 128).
 
     Arguments:
         output_tensor: The output tensor to store the result.
@@ -4242,14 +4918,12 @@ def fused_silu_nvfp4_kernel[
 ](
     output_tensor: TileTensor[fp4_dtype, output_layout, MutUntrackedOrigin],
     scales_tensor: TileTensor[scales_dtype, scales_layout, MutUntrackedOrigin],
-    input_tensor: TileTensor[input_dtype, input_layout, ImmutUntrackedOrigin],
-    row_offsets: TileTensor[DType.uint32, offsets_layout, ImmutUntrackedOrigin],
+    input_tensor: TileTensor[input_dtype, input_layout, ImmUntrackedOrigin],
+    row_offsets: TileTensor[.uint32, offsets_layout, ImmUntrackedOrigin],
     scales_offsets: TileTensor[
-        DType.uint32, scales_offsets_layout, ImmutUntrackedOrigin
+        .uint32, scales_offsets_layout, ImmUntrackedOrigin
     ],
-    input_scales: TileTensor[
-        DType.float32, input_scales_layout, ImmutUntrackedOrigin
-    ],
+    input_scales: TileTensor[.float32, input_scales_layout, ImmUntrackedOrigin],
 ):
     """
     This kernel performs the SILU operation for all the MLPs in the EP MoE
@@ -4357,7 +5031,7 @@ def fused_silu_nvfp4_kernel[
             var output_val = gate_proj * up_proj
 
             # Quantization logic (NVFP4).
-            var thread_max = abs(output_val).reduce_max().cast[DType.float32]()
+            var thread_max = abs(output_val).reduce_max().cast[.float32]()
             var group_max = warp.lane_group_max[num_lanes=NUM_THREADS_PER_SF](
                 thread_max
             )
@@ -4369,10 +5043,10 @@ def fused_silu_nvfp4_kernel[
             var output_scale = Float32(0.0)
             if group_max != 0:
                 output_scale = recip(
-                    fp8_scale_factor.cast[DType.float32]() * recip(tensor_sf)
+                    fp8_scale_factor.cast[.float32]() * recip(tensor_sf)
                 )
 
-            var input_f32 = output_val.cast[DType.float32]() * output_scale
+            var input_f32 = output_val.cast[.float32]() * output_scale
             var output_vector = bitcast[fp4_dtype, byte_width](
                 cast_fp32_to_fp4e2m1(input_f32)
             )
@@ -4425,14 +5099,12 @@ def fused_silu_nvfp4_interleaved_kernel[
 ](
     output_tensor: TileTensor[fp4_dtype, output_layout, MutUntrackedOrigin],
     scales_tensor: TileTensor[scales_dtype, scales_layout, MutUntrackedOrigin],
-    input_tensor: TileTensor[input_dtype, input_layout, ImmutUntrackedOrigin],
-    row_offsets: TileTensor[DType.uint32, offsets_layout, ImmutUntrackedOrigin],
+    input_tensor: TileTensor[input_dtype, input_layout, ImmUntrackedOrigin],
+    row_offsets: TileTensor[.uint32, offsets_layout, ImmUntrackedOrigin],
     scales_offsets: TileTensor[
-        DType.uint32, scales_offsets_layout, ImmutUntrackedOrigin
+        .uint32, scales_offsets_layout, ImmUntrackedOrigin
     ],
-    input_scales: TileTensor[
-        DType.float32, input_scales_layout, ImmutUntrackedOrigin
-    ],
+    input_scales: TileTensor[.float32, input_scales_layout, ImmUntrackedOrigin],
 ):
     """SwiGLU + NVFP4 quantization for interleaved gate/up layout.
 
@@ -4558,7 +5230,7 @@ def fused_silu_nvfp4_interleaved_kernel[
             gate_proj = gate_proj / (1.0 + exp(-gate_proj))
             var output_val = gate_proj * up_proj
 
-            var thread_max = abs(output_val).reduce_max().cast[DType.float32]()
+            var thread_max = abs(output_val).reduce_max().cast[.float32]()
             var group_max = warp.lane_group_max[num_lanes=NUM_THREADS_PER_SF](
                 thread_max
             )
@@ -4567,10 +5239,10 @@ def fused_silu_nvfp4_interleaved_kernel[
             var output_scale = Float32(0.0)
             if group_max != 0:
                 output_scale = recip(
-                    fp8_scale_factor.cast[DType.float32]() * recip(tensor_sf)
+                    fp8_scale_factor.cast[.float32]() * recip(tensor_sf)
                 )
 
-            var input_f32 = output_val.cast[DType.float32]() * output_scale
+            var input_f32 = output_val.cast[.float32]() * output_scale
             var output_vector = bitcast[fp4_dtype, byte_width](
                 cast_fp32_to_fp4e2m1(input_f32)
             )
@@ -4606,7 +5278,7 @@ def fused_silu_nvfp4_interleaved_kernel[
 @always_inline
 def _sigmoid[
     dtype: DType,
-    width: SIMDSize,
+    width: SIMDLength,
     accum: DType = get_accum_type[dtype](),
 ](x: SIMD[dtype, width]) -> SIMD[dtype, width]:
     # Local copy: shmem can't import nn (nn -> shmem import cycle).
@@ -4621,10 +5293,10 @@ def _sigmoid[
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(num_threads))
 )
 @__name(
-    t"fused_silu_mxfp4_{input_dtype}_{fp4_dtype}_fuse_a_scale_preshuffle_{fuse_a_scale_preshuffle}_clamp_{clamp_activation}"
+    t"fused_silu_mx_{input_dtype}_{quant_dtype}_fuse_a_scale_preshuffle_{fuse_a_scale_preshuffle}_clamp_{clamp_activation}"
 )
-def fused_silu_mxfp4_kernel[
-    fp4_dtype: DType,
+def fused_silu_mx_kernel[
+    quant_dtype: DType,
     scales_dtype: DType,
     input_dtype: DType,
     output_layout: TensorLayout,
@@ -4639,12 +5311,11 @@ def fused_silu_mxfp4_kernel[
     #   g'=min(g,L); u'=clamp(u,-L,L); z=(u'+1)*g'*sigmoid(g'*alpha)
     clamp_activation: Bool = False,
 ](
-    output_tensor: TileTensor[fp4_dtype, output_layout, MutUntrackedOrigin],
+    output_tensor: TileTensor[quant_dtype, output_layout, MutUntrackedOrigin],
     scales_tensor: TileTensor[scales_dtype, scales_layout, MutUntrackedOrigin],
-    input_tensor: TileTensor[input_dtype, input_layout, ImmutUntrackedOrigin],
-    row_offsets: TileTensor[DType.uint32, offsets_layout, ImmutUntrackedOrigin],
-    max_padded_M: Int = 0,
-    # Clamped-variant alpha/L; unused when clamp_activation=False.
+    input_tensor: TileTensor[input_dtype, input_layout, ImmUntrackedOrigin],
+    row_offsets: TileTensor[.uint32, offsets_layout, ImmUntrackedOrigin],
+    max_padded_M: Int32 = 0,  # Clamped-variant alpha/L; unused when clamp_activation=False.
     alpha: Float32 = 0.0,
     limit: Float32 = 0.0,
 ):
@@ -4666,6 +5337,11 @@ def fused_silu_mxfp4_kernel[
         scales_offsets: The offsets to determine the position of the scales tiles.
         input_scales: Per-expert input scale factors.
     """
+    # `quant_dtype` selects the MX format: MXFP4 packs two nibbles per byte,
+    # MXFP8 stores one E4M3 byte per element. The E8M0 scale path is shared —
+    # both formats scale groups of 32 elements.
+    comptime elems_per_byte = 2 if quant_dtype == DType.uint8 else 1
+    var _max_padded_M = Int(max_padded_M)
     comptime accum_dtype = DType.float32
     comptime assert (
         output_tensor.flat_rank >= 2
@@ -4677,14 +5353,14 @@ def fused_silu_mxfp4_kernel[
     comptime assert row_offsets.flat_rank == 1, "row_offsets must be 1D"
     comptime input_dim = input_tensor.static_shape[1]
     comptime output_dim = output_tensor.static_shape[1]
-    comptime hidden_size = output_dim * 2
+    comptime hidden_size = output_dim * elems_per_byte
     comptime src_width = 8
-    comptime byte_width = src_width // 2
+    comptime byte_width = src_width // elems_per_byte
     comptime NUM_THREADS_PER_SF = MXFP4_SF_VECTOR_SIZE // src_width
 
     comptime assert (
         input_dim == hidden_size * 2
-    ), "Input dimension must be four times the packed output dimension."
+    ), "Input dimension must be twice the hidden size (gate || up)."
     comptime assert (
         hidden_size % MXFP4_SF_VECTOR_SIZE == 0
     ), "Hidden size must be divisible by MXFP4_SF_VECTOR_SIZE."
@@ -4696,7 +5372,7 @@ def fused_silu_mxfp4_kernel[
 
     with PDL():
         var num_tokens = row_offsets[row_offsets.static_shape[0] - 1]
-        var num_elem = num_tokens * UInt32(output_dim) * 2
+        var num_elem = num_tokens * UInt32(hidden_size)
 
         # Persistent expert-slot tracker for the fused (fuse_a_scale_preshuffle)
         # scale store. `m` is monotonic non-decreasing in `i` (m = i*src_width
@@ -4711,8 +5387,8 @@ def fused_silu_mxfp4_kernel[
             Int(num_elem // UInt32(src_width)),
             num_threads * num_sms,
         ):
-            var m = (i * src_width) // (output_dim * 2)
-            var k = (i * src_width) % (output_dim * 2)
+            var m = (i * src_width) // hidden_size
+            var k = (i * src_width) % hidden_size
 
             var gate_proj = input_tensor.load[width=src_width]((m, k)).cast[
                 accum_dtype
@@ -4725,22 +5401,34 @@ def fused_silu_mxfp4_kernel[
             comptime if clamp_activation:
                 var g_c = min(gate_proj, limit)
                 var u_c = up_proj.clamp(-limit, limit)
-                output_val = (u_c + 1.0) * g_c * _sigmoid(g_c * alpha)
+                output_val = (g_c * _sigmoid(g_c * alpha)) * (u_c + 1.0)
             else:
                 gate_proj = gate_proj / (1.0 + exp(-gate_proj))
                 output_val = gate_proj * up_proj
 
-            # Quantization logic (MXFP4).
-            var thread_max = abs(output_val).reduce_max().cast[DType.float32]()
+            var thread_max = abs(output_val).reduce_max().cast[.float32]()
             var group_max = warp.lane_group_max[num_lanes=NUM_THREADS_PER_SF](
                 thread_max
             )
 
-            # Use MXFP4 even-mode rounding for the E8M0 scale.
-            var fp8_scale_factor = compute_mxfp4_even_scale(group_max).cast[
-                scales_dtype
-            ]()
-            var scale_f32 = fp8_scale_factor.cast[DType.float32]()
+            # `scale_f32` is what the data path applies: MXFP4 hands the scale
+            # itself to `cast_float_to_fp4e2m1_amd`, MXFP8 multiplies by its
+            # reciprocal. 448 = E4M3 maxabs; the E8M0 cast rounds to a power of
+            # two, so the reciprocal is exact.
+            var fp8_scale_factor: Scalar[scales_dtype]
+            var scale_f32: Float32
+            comptime if elems_per_byte == 1:
+                var block_is_dead: Bool
+                fp8_scale_factor, scale_f32, block_is_dead = (
+                    compute_mxfp8_block_scale[scales_dtype](group_max)
+                )
+                if block_is_dead:
+                    output_val = type_of(output_val)(0.0)
+            else:
+                fp8_scale_factor = compute_mxfp4_even_scale(group_max).cast[
+                    scales_dtype
+                ]()
+                scale_f32 = fp8_scale_factor.cast[.float32]()
 
             # The first thread in each group stores the scale factor.
             if i % NUM_THREADS_PER_SF == 0:
@@ -4776,27 +5464,34 @@ def fused_silu_mxfp4_kernel[
                     var token_start = Int(row_offsets[Coord(expert_slot)])
                     var local_row = Int(m) - token_start
                     debug_assert(
-                        max_padded_M > 0,
-                        "KS64 fused scale store requires max_padded_M > 0",
+                        _max_padded_M > 0,
+                        "KS64 fused scale store requires _max_padded_M > 0",
                     )
                     debug_assert(
-                        local_row < max_padded_M,
+                        local_row < _max_padded_M,
                         (
                             "KS64 fused scale store: local_row exceeds the"
-                            " per-expert slot capacity (max_padded_M)"
+                            " per-expert slot capacity (_max_padded_M)"
                         ),
                     )
                     var dst_off = Shuffler[1].scale_4d_slot_byte_off[
                         K_SCALES=K_SCALES
-                    ](expert_slot, local_row, k_scale, max_padded_M)
-                    scales_tensor.ptr[dst_off] = fp8_scale_factor
+                    ](expert_slot, local_row, k_scale, _max_padded_M)
+                    scales_tensor._storage[dst_off] = fp8_scale_factor
                 else:
                     scales_tensor.store((m, k_scale), fp8_scale_factor)
 
-            var output_vector = bitcast[fp4_dtype, byte_width](
-                cast_float_to_fp4e2m1_amd(output_val, scale_f32)
-            )
-            output_tensor.store((m, k // 2), output_vector)
+            comptime if elems_per_byte == 1:
+                output_tensor.store(
+                    (m, k), (output_val * scale_f32).cast[quant_dtype]()
+                )
+            else:
+                output_tensor.store(
+                    (m, k // 2),
+                    bitcast[quant_dtype, byte_width](
+                        cast_float_to_fp4e2m1_amd(output_val, scale_f32)
+                    ),
+                )
 
 
 @__llvm_metadata(
@@ -4822,10 +5517,10 @@ def fused_silu_mxfp8_interleaved_kernel[
 ](
     output_tensor: TileTensor[fp8_dtype, output_layout, MutUntrackedOrigin],
     scales_tensor: TileTensor[scales_dtype, scales_layout, MutUntrackedOrigin],
-    input_tensor: TileTensor[input_dtype, input_layout, ImmutUntrackedOrigin],
-    row_offsets: TileTensor[DType.uint32, offsets_layout, ImmutUntrackedOrigin],
+    input_tensor: TileTensor[input_dtype, input_layout, ImmUntrackedOrigin],
+    row_offsets: TileTensor[.uint32, offsets_layout, ImmUntrackedOrigin],
     scales_offsets: TileTensor[
-        DType.uint32, scales_offsets_layout, ImmutUntrackedOrigin
+        .uint32, scales_offsets_layout, ImmUntrackedOrigin
     ],
     # Runtime alpha and L for the clamped activation; ignored when
     # `clamp_activation=False`.
@@ -4961,7 +5656,7 @@ def fused_silu_mxfp8_interleaved_kernel[
             var output_val: SIMD[accum_dtype, src_width]
             comptime if clamp_activation:
                 var g_c = min(gate_proj, limit)
-                var u_c = max(min(up_proj, limit), -limit)
+                var u_c = up_proj.clamp(-limit, limit)
                 var sigmoid = 1.0 / (1.0 + exp(-(g_c * alpha)))
                 output_val = (u_c + 1.0) * g_c * sigmoid
             else:
@@ -4969,7 +5664,7 @@ def fused_silu_mxfp8_interleaved_kernel[
                 output_val = gate_proj * up_proj
 
             # Per-block (32-element) amax across 4 cooperating threads.
-            var thread_max = abs(output_val).reduce_max().cast[DType.float32]()
+            var thread_max = abs(output_val).reduce_max().cast[.float32]()
             var group_max = warp.lane_group_max[num_lanes=NUM_THREADS_PER_SF](
                 thread_max
             )
@@ -4980,9 +5675,9 @@ def fused_silu_mxfp8_interleaved_kernel[
             var fp8_scale_factor = scale_factor.cast[scales_dtype]()
             var output_scale = Float32(0.0)
             if group_max != 0:
-                output_scale = recip(fp8_scale_factor.cast[DType.float32]())
+                output_scale = recip(fp8_scale_factor.cast[.float32]())
 
-            var input_f32 = output_val.cast[DType.float32]() * output_scale
+            var input_f32 = output_val.cast[.float32]() * output_scale
             var output_vector = input_f32.cast[fp8_dtype]()
             output_tensor.store((m, k), output_vector)
 
@@ -5011,4 +5706,176 @@ def fused_silu_mxfp8_interleaved_kernel[
                     token_idx + expert_m,
                     scale_simd_idx * SF_ATOM_K,
                     SIMD[scales_dtype, SF_ATOM_K](0.0),
+                )
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(num_threads))
+)
+@__name(t"ep_fused_silu_mxfp6_{input_dtype}")
+def fused_silu_mxfp6_kernel[
+    scales_dtype: DType,
+    input_dtype: DType,
+    output_layout: TensorLayout,
+    scales_layout: TensorLayout,
+    input_layout: TensorLayout,
+    offsets_layout: TensorLayout,
+    num_threads: Int,
+    num_sms: Int,
+    *,
+    fp6_format: FP6Format,
+    fuse_a_scale_preshuffle: Bool = False,
+    # Clamped SwiGLU-OAI variant; False (default) = plain SiLU(g) * u:
+    #   g'=min(g,L); u'=clamp(u,-L,L); z=(u'+1)*g'*sigmoid(g'*alpha)
+    clamp_activation: Bool = False,
+](
+    output_tensor: TileTensor[.uint8, output_layout, MutUntrackedOrigin],
+    scales_tensor: TileTensor[scales_dtype, scales_layout, MutUntrackedOrigin],
+    input_tensor: TileTensor[input_dtype, input_layout, ImmUntrackedOrigin],
+    row_offsets: TileTensor[.uint32, offsets_layout, ImmUntrackedOrigin],
+    max_padded_M: Int32 = 0,
+    alpha: Float32 = 0.0,
+    limit: Float32 = 0.0,
+):
+    """SwiGLU + MXFP6 quantization for the EP MoE down-projection input.
+
+    MXFP6 counterpart of `fused_silu_mx_kernel`, which serves MXFP4 and MXFP8
+    from one body by switching on elements-per-byte. FP6 cannot join it: four
+    codes per three bytes is a ratio of 4/3, which that integer truncates to 1
+    and so cannot distinguish from FP8.
+
+    The structural departure is that a thread owns a whole 32-element MX block
+    rather than 8 elements. At FP4 and FP8 a block is split across 2 or 4
+    cooperating threads, each holding a whole number of bytes; at FP6 an
+    8-element slice is 6 bytes, which is neither a legal SIMD width nor a legal
+    alignment, and a 4-element code group would straddle two threads' bytes. A
+    whole block is exactly 24 bytes and one scale, so the amax reduction stays
+    in registers -- no `lane_group_max` -- and the store is three aligned
+    8-byte writes.
+    """
+    comptime accum_dtype = DType.float32
+    comptime assert (
+        output_tensor.flat_rank >= 2
+    ), "output_tensor must be at least 2D"
+    comptime assert scales_tensor.flat_rank == 2, "scales_tensor must be 2D"
+    comptime assert (
+        input_tensor.flat_rank >= 2
+    ), "input_tensor must be at least 2D"
+    comptime assert row_offsets.flat_rank == 1, "row_offsets must be 1D"
+    var _max_padded_M = Int(max_padded_M)
+
+    comptime input_dim = input_tensor.static_shape[1]
+    comptime output_dim = output_tensor.static_shape[1]
+    comptime hidden_size = (output_dim * 4) // 3
+    comptime blk = MXFP6_SF_VECTOR_SIZE
+    comptime bytes_per_blk = (blk * 6) // 8
+
+    comptime assert (
+        output_dim * 4 == hidden_size * 3
+    ), "output_dim must be exactly three quarters of the hidden size"
+    comptime assert (
+        input_dim == hidden_size * 2
+    ), "Input dimension must be twice the hidden size (gate || up)."
+    comptime assert (
+        hidden_size % blk == 0
+    ), "Hidden size must be divisible by MXFP6_SF_VECTOR_SIZE."
+
+    # Scatter processing of a single token across different thread blocks
+    # to improve the memory access performance.
+    var global_warp_id = block_idx.x + warp_id() * num_sms
+    var gid = lane_id() + global_warp_id * WARP_SIZE
+
+    with PDL():
+        var num_tokens = row_offsets[row_offsets.static_shape[0] - 1]
+        var num_elem = num_tokens * UInt32(hidden_size)
+
+        var expert_slot = 0
+
+        for i in range(
+            gid,
+            Int(num_elem // UInt32(blk)),
+            num_threads * num_sms,
+        ):
+            var m = (i * blk) // hidden_size
+            var k = (i * blk) % hidden_size
+
+            var gate_proj = input_tensor.load[width=blk]((m, k)).cast[
+                accum_dtype
+            ]()
+            var up_proj = input_tensor.load[width=blk](
+                (m, k + hidden_size)
+            ).cast[accum_dtype]()
+
+            var output_val: SIMD[accum_dtype, blk]
+            comptime if clamp_activation:
+                var g_c = min(gate_proj, limit)
+                var u_c = up_proj.clamp(-limit, limit)
+                output_val = (g_c * _sigmoid(g_c * alpha)) * (u_c + 1.0)
+            else:
+                gate_proj = gate_proj / (1.0 + exp(-gate_proj))
+                output_val = gate_proj * up_proj
+
+            var group_max = abs(output_val).reduce_max()
+            var e8m0_scale = compute_mxfp6_even_scale[fp6_format](group_max)
+
+            #
+            var out_scale = Float32(0.0)
+            if group_max != Float32(0.0) and isfinite(group_max):
+                out_scale = recip(e8m0_scale.cast[.float32]())
+            if not isfinite(group_max) or not isfinite(out_scale):
+                out_scale = Float32(0.0)
+                e8m0_scale = bitcast[.float8_e8m0fnu](UInt8(0))
+                output_val = type_of(output_val)(0.0)
+
+            var codes = encode_f32_to_fp6[fp6_format](output_val * out_scale)
+
+            var packed = SIMD[.uint8, 32](0)
+            comptime for g in range(blk // 4):
+                var word = pack_fp6_x4(codes.slice[4, offset=g * 4]())
+                comptime for b in range(3):
+                    packed[g * 3 + b] = UInt8(
+                        (word >> UInt32(8 * b)) & UInt32(0xFF)
+                    )
+
+            var byte_col = (k * 6) // 8
+            comptime for chunk in range(bytes_per_blk // 8):
+                output_tensor.store(
+                    (m, byte_col + chunk * 8),
+                    packed.slice[8, offset=chunk * 8](),
+                )
+
+            comptime if fuse_a_scale_preshuffle:
+                comptime assert size_of[scales_dtype]() == 1, (
+                    "fused scale_4d store assumes a 1-byte E8M0 scale: the"
+                    " byte offset is used directly as a scales_dtype element"
+                    " index"
+                )
+                comptime K_SCALES = hidden_size // blk
+                comptime n_active = row_offsets.static_shape[0] - 1
+                while expert_slot < n_active - 1 and Int(
+                    row_offsets[Coord(expert_slot + 1)]
+                ) <= Int(m):
+                    expert_slot += 1
+                var local_row = Int(m) - Int(row_offsets[Coord(expert_slot)])
+                debug_assert(
+                    _max_padded_M > 0,
+                    "MXFP6 fused scale store requires _max_padded_M > 0",
+                )
+                debug_assert(
+                    local_row < _max_padded_M,
+                    (
+                        "MXFP6 fused scale store: local_row exceeds the"
+                        " per-expert slot capacity (_max_padded_M)"
+                    ),
+                )
+                var dst_off = Shuffler[1].scale_4d_slot_byte_off[
+                    K_SCALES=K_SCALES
+                ](expert_slot, local_row, k // blk, _max_padded_M)
+                scales_tensor._storage[dst_off] = rebind[Scalar[scales_dtype]](
+                    e8m0_scale
+                )
+            else:
+                scales_tensor.store(
+                    (m, k // blk),
+                    rebind[Scalar[scales_dtype]](e8m0_scale),
                 )

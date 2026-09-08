@@ -36,9 +36,10 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.math import ceildiv
-from std.memory import UnsafePointer, alloc
+from std.memory import alloc, dealloc
 from std.sys import get_defined_bool, get_defined_int, size_of
 
+from max.benchmark import bencher_iter_custom
 from std.benchmark import (
     Bench,
     Bencher,
@@ -46,8 +47,8 @@ from std.benchmark import (
     BenchMetric,
     ThroughputMeasure,
 )
-from std.gpu.host import DeviceBuffer, DeviceContext
-from std.gpu.primitives.grid_controls import PDLLevel, pdl_launch_attributes
+from max.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu.primitives.grid_controls import PDLLevel, pdl_launch_attributes
 from layout import Coord, Idx, TileTensor, row_major
 
 from internal_utils import arg_parse
@@ -324,13 +325,26 @@ def main() raises:
         ctx.enqueue_memset(s_buf, Scalar[scales_dtype](0))
 
         # Per-expert offsets / IDs (small, host-built once).
-        var a_offsets_host = alloc[Scalar[DType.uint32]](num_active_experts + 1)
-        var a_scale_offsets_host = alloc[Scalar[DType.uint32]](
-            num_active_experts
-        )
-        var expert_ids_host = alloc[Scalar[DType.int32]](num_active_experts)
-        var expert_scales_host = alloc[Scalar[DType.float32]](num_experts)
-        var input_scales_host = alloc[Scalar[DType.float32]](num_active_experts)
+        var a_offsets_host_alloc = alloc[UInt32](
+            {count = num_active_experts + 1}
+        ).into_managed()
+        var a_offsets_host = a_offsets_host_alloc.unsafe_ptr()
+        var a_scale_offsets_host_alloc = alloc[UInt32](
+            {count = num_active_experts}
+        ).into_managed()
+        var a_scale_offsets_host = a_scale_offsets_host_alloc.unsafe_ptr()
+        var expert_ids_host_alloc = alloc[Int32](
+            {count = num_active_experts}
+        ).into_managed()
+        var expert_ids_host = expert_ids_host_alloc.unsafe_ptr()
+        var expert_scales_host_alloc = alloc[Float32](
+            {count = num_experts}
+        ).into_managed()
+        var expert_scales_host = expert_scales_host_alloc.unsafe_ptr()
+        var input_scales_host_alloc = alloc[Float32](
+            {count = num_active_experts}
+        ).into_managed()
+        var input_scales_host = input_scales_host_alloc.unsafe_ptr()
 
         a_offsets_host[0] = 0
         var sf_acc = 0
@@ -347,19 +361,17 @@ def main() raises:
         for i in range(num_active_experts):
             input_scales_host[i] = 1.0 + Float32(i + 1) * 0.01
 
-        var a_offsets_dev = ctx.enqueue_create_buffer[DType.uint32](
+        var a_offsets_dev = ctx.enqueue_create_buffer[.uint32](
             num_active_experts + 1
         )
-        var a_scale_offsets_dev = ctx.enqueue_create_buffer[DType.uint32](
+        var a_scale_offsets_dev = ctx.enqueue_create_buffer[.uint32](
             num_active_experts
         )
-        var expert_ids_dev = ctx.enqueue_create_buffer[DType.int32](
+        var expert_ids_dev = ctx.enqueue_create_buffer[.int32](
             num_active_experts
         )
-        var expert_scales_dev = ctx.enqueue_create_buffer[DType.float32](
-            num_experts
-        )
-        var input_scales_dev = ctx.enqueue_create_buffer[DType.float32](
+        var expert_scales_dev = ctx.enqueue_create_buffer[.float32](num_experts)
+        var input_scales_dev = ctx.enqueue_create_buffer[.float32](
             num_active_experts
         )
 
@@ -376,9 +388,7 @@ def main() raises:
         var trace_buf_size = trace_num_blocks * Int(
             GROUPED_SWIGLU_TRACE_EVENTS_PER_BLOCK
         )
-        var trace_buf_dev = ctx.enqueue_create_buffer[DType.uint64](
-            trace_buf_size
-        )
+        var trace_buf_dev = ctx.enqueue_create_buffer[.uint64](trace_buf_size)
         ctx.enqueue_memset(trace_buf_dev, UInt64(0))
 
         ctx.synchronize()
@@ -443,11 +453,11 @@ def main() raises:
         # Pre-build the SwiGLU output carrier for the fused dispatch.
         # Bypassing `grouped_matmul_swiglu_nvfp4_dispatch` keeps the per-iter
         # dummy-buffer alloc + SF memset out of the timed region.
-        var c_packed_ptr = rebind[UnsafePointer[UInt8, MutAnyOrigin]](o_tt.ptr)
+        var c_packed_ptr = rebind[MutPointer[UInt8, MutAnyOrigin]](o_tt.ptr)
         var c_swiglu_scales_ptr = rebind[
-            UnsafePointer[Scalar[NVFP4_SF_DTYPE], MutAnyOrigin]
+            MutPointer[Scalar[NVFP4_SF_DTYPE], MutAnyOrigin]
         ](s_tt.ptr)
-        var c_input_scales_ptr = rebind[UnsafePointer[Float32, ImmutAnyOrigin]](
+        var c_input_scales_ptr = rebind[ImmPointer[Float32, ImmutAnyOrigin]](
             input_scales_tt.ptr
         )
         var swiglu_out = RealSwiGLUOutput[
@@ -467,33 +477,19 @@ def main() raises:
             trace_buf_dev.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
         )
 
-        @parameter
         @always_inline
-        @__copy_capture(
-            cb_a,
-            cb_b,
-            cb_a_scales,
-            cb_b_scales,
-            a_offsets_tt,
-            a_scale_offsets_tt,
-            expert_ids_tt,
-            expert_scales_tt,
-            input_scales_tt,
-            c_bf16_tt,
-            o_tt,
-            s_tt,
-            swiglu_out,
-            trace_buf_gmem,
-            a_scale_dim0,
-            M,
-            num_active_experts,
-            fused,
-            match_bf16,
-            matmul_only,
-            disable_pdl,
-            trace,
-        )
-        def kernel_launch(ctx: DeviceContext, iteration: Int) raises:
+        def kernel_launch(
+            ctx: DeviceContext, iteration: Int
+        ) raises {
+            mut cb_a,
+            mut cb_b,
+            mut cb_a_scales,
+            mut cb_b_scales,
+            mut c_bf16_tt,
+            mut o_tt,
+            mut s_tt,
+            imm,
+        }:
             var a_tt = TileTensor(
                 cb_a.offset_ptr(iteration),
                 row_major(Coord(_ri(M), Idx[packed_K])),
@@ -678,13 +674,13 @@ def main() raises:
                             attributes=pdl_launch_attributes(PDLLevel.ON),
                         )
 
-        @parameter
         @always_inline
-        def bench_func(mut b: Bencher) raises:
-            b.iter_custom[kernel_launch](ctx)
+        def bench_func(mut b: Bencher) raises {imm}:
+            bencher_iter_custom(b, kernel_launch, ctx)
 
         var m = Bench()
-        m.bench_function[bench_func](
+        m.bench_function(
+            bench_func,
             BenchId(run_name),
             [
                 ThroughputMeasure(BenchMetric.flops, Int(total_flops)),
@@ -692,11 +688,11 @@ def main() raises:
             ],
         )
 
-        a_offsets_host.free()
-        a_scale_offsets_host.free()
-        expert_ids_host.free()
-        expert_scales_host.free()
-        input_scales_host.free()
+        dealloc(a_offsets_host_alloc^)
+        dealloc(a_scale_offsets_host_alloc^)
+        dealloc(expert_ids_host_alloc^)
+        dealloc(expert_scales_host_alloc^)
+        dealloc(input_scales_host_alloc^)
 
         # Dump per-CTA per-tile pipeline trace. Schema (see
         # grouped_1d1d_matmul_kernel.mojo): for each output tile i in
@@ -731,7 +727,10 @@ def main() raises:
         # Issue latency = X_S − X_D. Real-work span = X_E − X_S.
         # Slot 0 (= L0_D) is the kernel-never-ran sentinel.
         if trace and fused:
-            var trace_host = alloc[Scalar[DType.uint64]](trace_buf_size)
+            var trace_host_alloc = alloc[UInt64](
+                {count = trace_buf_size}
+            ).into_managed()
+            var trace_host = trace_host_alloc.unsafe_ptr()
             ctx.enqueue_copy(trace_host, trace_buf_dev)
             ctx.synchronize()
             comptime max_tiles = 8  # mirrors SWIGLU_MAX_TRACED_TILES
@@ -764,6 +763,6 @@ def main() raises:
                     row += String(t",{Int(trace_host[base + 120 + i])}")
                 print(row)
             print("TRACE_CSV_END")
-            trace_host.free()
+            dealloc(trace_host_alloc^)
 
         m.dump_report()

@@ -36,7 +36,7 @@ from max.experimental.sharding import (
     Replicated,
     Sharded,
 )
-from max.experimental.sharding.per_shard_dim import global_dim, is_static
+from max.experimental.sharding.per_shard_dim import global_dim
 from max.experimental.tensor import Tensor
 from max.graph import BufferValue, DeviceRef, Shape, TensorValue, ops
 from max.graph.dim import Dim, StaticDim, SymbolicDim
@@ -125,9 +125,13 @@ def _make_split_symbolic_dim(
     tensor_axis: int,
     fallback_prefix: str,
 ) -> SymbolicDim:
-    """Makes a per-shard symbolic dim for a split axis."""
-    # When the axis is already sharded on another mesh axis, dim is a
-    # PerShardDim; key the symbol off its global dim's name when symbolic.
+    """Mints a per-device symbolic dim for a split axis, severing it from ``dim``.
+
+    The chunks of a dynamic axis are ordinarily algebraic functions of their
+    parent, so their extents stay related to it. This instead gives each
+    device an independent symbol, for the axis whose per-device extents
+    nothing global relates.
+    """
     dim = global_dim(dim)
     if isinstance(dim, SymbolicDim):
         return SymbolicDim(f"{dim.name}_{axis_name}_{coord}")
@@ -286,8 +290,6 @@ def reduce_scatter(
     t: Tensor,
     scatter_axis: int = 0,
     mesh_axis: int = 0,
-    *,
-    even: bool = True,
 ) -> Tensor:
     """Reduces a tensor across a mesh axis and scatters the result.
 
@@ -303,8 +305,6 @@ def reduce_scatter(
             sharded.
         mesh_axis: The mesh axis whose placement changes from Partial to
             Sharded.
-        even: Require an even shard split along ``scatter_axis``. Defaults
-            to ``True``.
 
     Returns:
         A tensor with the reduced and re-sharded result.
@@ -312,7 +312,7 @@ def reduce_scatter(
     return _apply_per_group(
         t,
         mesh_axis,
-        Sharded(scatter_axis, even=even),
+        Sharded(scatter_axis),
         hw_op=lambda inputs, sigs: ops.reducescatter.sum(
             inputs, sigs, axis=scatter_axis
         ),
@@ -323,12 +323,9 @@ def reduce_scatter(
 def _local_split(t: Tensor, mesh_axis: int, target: Sharded) -> Tensor:
     """``Replicated -> Sharded``: each device slices its local copy with no communication."""
     tensor_axis = target.axis
-    global_shape = t.shape
     mesh = t.mesh
     n = mesh.mesh_shape[mesh_axis]
-    axis_name = mesh.axis_names[mesh_axis]
     groups = _mesh_axis_groups(mesh, mesh_axis)
-    parent_dim = global_shape[tensor_axis]
 
     new_p = list(t.placements)
     new_p[mesh_axis] = target
@@ -344,22 +341,7 @@ def _local_split(t: Tensor, mesh_axis: int, target: Sharded) -> Tensor:
                 split_chunks = _even_split_along_axis(
                     shards[idx], tensor_axis, n
                 )
-                chunk = split_chunks[rank_in_group]
-                # is_static folds an already-sharded axis (a PerShardDim) to
-                # its global, judging it by the global size.
-                if (not target.even) and not is_static(parent_dim):
-                    chunk = _rebind_axis(
-                        chunk,
-                        tensor_axis,
-                        _make_split_symbolic_dim(
-                            parent_dim,
-                            axis_name,
-                            rank_in_group,
-                            tensor_axis,
-                            "split",
-                        ),
-                    )
-                result[idx] = chunk
+                result[idx] = split_chunks[rank_in_group]
         return Tensor.from_shard_values(
             result,
             PlacementMapping(mesh, new_placements),
@@ -392,42 +374,15 @@ def _scatter(t: Tensor, target: DeviceMapping) -> Tensor:
     with ensure_context():
         tv = t.__tensorvalue__()
 
-        if mesh.num_devices > 1 and all(
-            isinstance(p, Replicated) for p in placements
-        ):
-            shard_tvs = _broadcast_replicated(tv, mesh)
-            return Tensor.from_shard_values(
-                shard_tvs,
-                PlacementMapping(mesh, placements),
-            )
-
-        global_shape = t.shape
         shard_tvs = [tv]
         for mesh_axis in range(mesh.ndim):
             p = placements[mesh_axis]
             n = mesh.mesh_shape[mesh_axis]
-            axis_name = mesh.axis_names[mesh_axis]
             tensor_axis = p.localized_axis()
             if tensor_axis is not None:
-                parent_dim = global_shape[tensor_axis]
-                even = isinstance(p, Sharded) and p.even
                 new_tvs: list[TensorValue] = []
                 for sv in shard_tvs:
-                    chunks = list(_even_split_along_axis(sv, tensor_axis, n))
-                    if (not even) and not isinstance(parent_dim, StaticDim):
-                        for coord, chunk in enumerate(chunks):
-                            chunks[coord] = _rebind_axis(
-                                chunk,
-                                tensor_axis,
-                                _make_split_symbolic_dim(
-                                    parent_dim,
-                                    axis_name,
-                                    coord,
-                                    tensor_axis,
-                                    "scatter",
-                                ),
-                            )
-                    new_tvs.extend(chunks)
+                    new_tvs.extend(_even_split_along_axis(sv, tensor_axis, n))
                 shard_tvs = new_tvs
             elif isinstance(p, Replicated):
                 shard_tvs = [sv for sv in shard_tvs for _ in range(n)]
@@ -447,19 +402,29 @@ def _scatter(t: Tensor, target: DeviceMapping) -> Tensor:
         )
 
 
-def _broadcast_replicated(
-    tv: TensorValue, mesh: DeviceMesh
-) -> list[TensorValue]:
-    """Broadcasts values to every device using one collective op."""
-    signal_bufs = _signal_buffers(mesh)
-    if signal_bufs is None:
-        return [
-            ops.transfer_to(tv, DeviceRef.from_device(d)) for d in mesh.devices
-        ]
-    mesh_device_refs = [DeviceRef.from_device(d) for d in mesh.devices]
-    if tv.device not in mesh_device_refs:
-        tv = ops.transfer_to(tv, mesh_device_refs[0])
-    return ops.distributed_broadcast(tv, signal_bufs)
+def distributed_broadcast(t: Tensor, mesh: DeviceMesh) -> Tensor:
+    """Replicates a non-distributed tensor onto every device with one collective.
+
+    Args:
+        t: A non-distributed source tensor.
+        mesh: The device mesh to replicate onto.
+
+    Returns:
+        A distributed tensor with :class:`Replicated` placement on every axis.
+    """
+    with ensure_context():
+        signal_buffers = _signal_buffers(mesh)
+        if signal_buffers is None:
+            raise RuntimeError("No signal buffers available for broadcast.")
+        if t.mesh.num_devices > 1:
+            raise RuntimeError(
+                "`F.distributed_broadcast` requires the source tensor to be non-distributed."
+            )
+        shards = ops.distributed_broadcast(TensorValue(t), signal_buffers)
+        return Tensor.from_shard_values(
+            shards,
+            PlacementMapping(mesh, (Replicated(),) * mesh.ndim),
+        )
 
 
 def transfer_to(
@@ -597,7 +562,6 @@ def _axis_transition(
                 t,
                 mesh_axis=mesh_axis,
                 scatter_axis=target.axis,
-                even=target.even,
             )
         if isinstance(target, Partial):
             raise NotImplementedError(

@@ -22,8 +22,9 @@ Example:
 
 .. code-block:: python
 
+    from max.driver import CPU
     from max.dtype import DType
-    from max.experimental.tensor import Tensor
+    from max.experimental.tensor import Tensor, default_device
     from max.experimental.nn import Module, module_dataclass
     from max.graph import TensorType
 
@@ -35,12 +36,13 @@ Example:
         def forward(self, x: Tensor) -> Tensor:
             return x @ self.weight.T + self.bias
 
-    model = MyLayer(weight=Tensor.zeros([10, 5]), bias=Tensor.zeros([10]))
-    y = model(Tensor.ones([3, 5]))                # eager forward
+    with default_device(CPU()):
+        model = MyLayer(weight=Tensor.zeros([10, 5]), bias=Tensor.zeros([10]))
+        y = model(Tensor.ones([3, 5]))
 
-    input_type = TensorType(DType.float32, ["batch", 5], device=model.device)
-    compiled = model.compile(input_type)          # AOT-compiled model
-    result = compiled(Tensor.ones([3, 5]))        # run the compiled model
+        input_type = TensorType(DType.float32, ["batch", 5], device=model.device)
+        compiled = model.compile(input_type)
+        result = compiled(Tensor.ones([3, 5]))
 
 .. invisible-code-block: python
 
@@ -52,6 +54,7 @@ Example:
     assert np.allclose(result.to_numpy(), np.zeros((3, 10)))
 """
 
+from .common_layers.lora_wrapper import LoRA, lora_layers, lora_parameters
 from .conv import Conv2d
 from .embedding import Embedding
 from .linear import Linear
@@ -65,6 +68,7 @@ from .module import (
 from .norm import GemmaRMSNorm, GroupNorm, LayerNorm, RMSNorm
 from .rope import RotaryEmbedding, TransposedRotaryEmbedding
 from .sequential import ModuleList, Sequential
+from .transparent_module import TransparentModule
 
 __all__ = [
     "CompiledModel",
@@ -74,13 +78,17 @@ __all__ = [
     "GroupNorm",
     "LayerNorm",
     "Linear",
+    "LoRA",
     "Module",
     "ModuleList",
     "PinnedDeviceTensor",
     "RMSNorm",
     "RotaryEmbedding",
     "Sequential",
+    "TransparentModule",
     "TransposedRotaryEmbedding",
+    "lora_layers",
+    "lora_parameters",
     "module_dataclass",
     "subgraphable",
 ]

@@ -10,9 +10,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
+"""Generates tensors filled with values drawn from a uniform distribution for CPU and GPU."""
 
-from std.algorithm.functional import elementwise
-from std.gpu.host import DeviceContext
+from max.algorithm.functional import elementwise
+from max.gpu.host import DeviceContext
 from std.random import Random
 from extensibility import _dot_prod
 
@@ -27,14 +28,14 @@ def random_uniform[
     target: StaticString,
     OutputFn: ImplicitlyCopyable
     & RegisterPassable
-    & def[width: SIMDSize, _rank: Int](
+    & def[width: SIMDLength, _rank: Int](
         idx: IndexList[_rank], val: SIMD[dtype, width]
     ),
 ](
     shape: IndexList[rank],
     lower_bound: Scalar[dtype],
     upper_bound: Scalar[dtype],
-    seed_ptr: UnsafePointer[Scalar[DType.uint64], ImmutAnyOrigin],
+    seed_ptr: UnsafePointer[UInt64, ImmutAnyOrigin],
     ctx: DeviceContext,
     output_fn: OutputFn,
 ) raises:
@@ -76,7 +77,7 @@ def random_uniform[
 
         var generator = Random(seed=seed_value, offset=UInt64(offset))
 
-        var values: SIMD[DType.float32, 4] = generator.step_uniform()
+        var values: SIMD[.float32, 4] = generator.step_uniform()
         values = values * delta + Float32(lower_bound)
 
         output_fn[width=width](

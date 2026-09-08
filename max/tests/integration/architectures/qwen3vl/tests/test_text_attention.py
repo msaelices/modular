@@ -277,6 +277,8 @@ def generate_qwen3_max_outputs(
         max_seq_len=MAX_SEQ_LEN,
         available_cache_memory=30 * 1024 * 1024,
         session=session,
+        is_di_enabled=False,
+        model_name="FAKE",
     )
     assert isinstance(kv_manager, PagedKVCacheManager)
 
@@ -319,8 +321,8 @@ def generate_qwen3_max_outputs(
         for seq_len in seq_lens
     ]
     for context in batch:
-        kv_manager.claim(context.request_id, replica_idx=0)
-        kv_manager.alloc(context, replica_idx=0)
+        kv_manager.claim(context)
+        kv_manager.alloc(context)
 
     kv_cache_runtime = kv_manager.runtime_inputs_for_leaf([batch]).inputs[0]
     assert kv_cache_runtime.attention_dispatch_metadata is not None

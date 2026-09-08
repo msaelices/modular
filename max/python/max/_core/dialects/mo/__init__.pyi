@@ -23,7 +23,7 @@ import max._core.dialects.kgen
 import max._core.dialects.m
 import max._core.dialects.mosh
 import max._core.dtype
-from max.mlir import Context, Location
+from max.mlir import Location
 
 from . import passes as passes
 
@@ -38,7 +38,7 @@ class BufferType(max._core.Type):
     In conjunction with the operations mo.mutable.load and mo.mutable.store
     this type can be used to model in-place operations in the MO dialect.
 
-    The `shapeAttr` is less permisive than the equivalent for `!mo.tensor`
+    The `shape` is less permissive than the equivalent for `!mo.tensor`
     values and must be a `MOSH::ShapeAttr` (i.e. statically ranked).
 
     The element type is an M::DType, with `invalid` denoting an unknown type.
@@ -47,7 +47,6 @@ class BufferType(max._core.Type):
     ```mlir
     !mo.buffer<[4, 16], f32>    // static shape
     !mo.buffer<[N, N, 6], i32>  // parameterized shape
-    !mo.tensor<Sh, invalid>     // shape parameter reference
     ```
     """
 
@@ -56,7 +55,7 @@ class BufferType(max._core.Type):
     @overload
     def __init__(
         self,
-        shape_attr: max._core.dialects.builtin.TypedAttr,
+        shape: max._core.dialects.mosh.ShapeAttr,
         dtype: max._core.dtype.DType,
         device_ref: max._core.dialects.m.DeviceRefAttr = ...,
         metadata: max._core.dialects.builtin.DictionaryAttr = ...,
@@ -64,7 +63,7 @@ class BufferType(max._core.Type):
     @overload
     def __init__(
         self,
-        shape_attr: max._core.dialects.builtin.TypedAttr,
+        shape: max._core.dialects.mosh.ShapeAttr,
         element_type: max._core.Type,
         device_ref: max._core.dialects.m.DeviceRefAttr = ...,
         metadata: max._core.dialects.builtin.DictionaryAttr = ...,
@@ -80,13 +79,13 @@ class BufferType(max._core.Type):
     @overload
     def __init__(
         self,
-        shape: max._core.dialects.builtin.TypedAttr,
+        shape: max._core.dialects.mosh.ShapeAttr,
         dtype: max._core.dtype.DType,
         device_ref: max._core.dialects.m.DeviceRefAttr,
         metadata: max._core.dialects.builtin.DictionaryAttr,
     ) -> None: ...
     @property
-    def shape_attr(self) -> max._core.dialects.builtin.TypedAttr: ...
+    def shape(self) -> max._core.dialects.mosh.ShapeAttr: ...
     @property
     def dtype(self) -> max._core.dtype.DType: ...
     @property
@@ -142,16 +141,6 @@ class ChainType(max._core.Type):
 
     def __init__(self) -> None: ...
 
-class ListType(max._core.Type):
-    """
-    This type represents an immutable list of elements (currently restricted to
-    `!mo.tensor`).
-    """
-
-    def __init__(self, element_type: max._core.Type) -> None: ...
-    @property
-    def element_type(self) -> max._core.Type | None: ...
-
 class OpaqueType(max._core.Type):
     """
     This is a custom user-defined type.
@@ -195,7 +184,7 @@ class TensorType(max._core.Type):
     This type represents the shape and element type of a tensor, an optional
     device ref, and an optional dictionary of metadata (e.g., layout, etc.).
 
-    The `shapeAttr` is always a `MOSH::ShapeAttr` (e.g., `[D0, 42, N]`). Rank
+    The `shape` is always a `MOSH::ShapeAttr` (e.g., `[D0, 42, N]`). Rank
     is statically known; individual dimensions may be concrete integers or
     parametric.
 
@@ -216,7 +205,7 @@ class TensorType(max._core.Type):
     @overload
     def __init__(
         self,
-        shape_attr: max._core.dialects.builtin.TypedAttr,
+        shape: max._core.dialects.mosh.ShapeAttr,
         dtype: max._core.dtype.DType,
         device_ref: max._core.dialects.m.DeviceRefAttr = ...,
         metadata: max._core.dialects.builtin.DictionaryAttr = ...,
@@ -224,7 +213,7 @@ class TensorType(max._core.Type):
     @overload
     def __init__(
         self,
-        shape_attr: max._core.dialects.builtin.TypedAttr,
+        shape: max._core.dialects.mosh.ShapeAttr,
         element_type: max._core.Type,
         device_ref: max._core.dialects.m.DeviceRefAttr = ...,
         metadata: max._core.dialects.builtin.DictionaryAttr = ...,
@@ -248,7 +237,7 @@ class TensorType(max._core.Type):
     @overload
     def __init__(
         self,
-        shape: max._core.dialects.builtin.TypedAttr,
+        shape: max._core.dialects.mosh.ShapeAttr,
         dtype: max._core.dtype.DType,
         device_ref: max._core.dialects.m.DeviceRefAttr,
         metadata: max._core.dialects.builtin.DictionaryAttr,
@@ -270,32 +259,13 @@ class TensorType(max._core.Type):
         metadata: max._core.dialects.builtin.DictionaryAttr = ...,
     ) -> None: ...
     @property
-    def shape_attr(self) -> max._core.dialects.builtin.TypedAttr: ...
+    def shape(self) -> max._core.dialects.mosh.ShapeAttr: ...
     @property
     def dtype(self) -> max._core.dtype.DType: ...
     @property
     def device_ref(self) -> max._core.dialects.m.DeviceRefAttr: ...
     @property
     def metadata(self) -> max._core.dialects.builtin.DictionaryAttr: ...
-
-class ChainAttr(max._core.Attribute):
-    """
-    Represents non-error chain values. The type of this attribute is always
-    `!mo.chain`.
-
-    Example:
-
-    ```mlir
-    #mo<chain> : !mo.chain
-    ```
-    """
-
-    @overload
-    def __init__(self, type: ChainType) -> None: ...
-    @overload
-    def __init__(self, type: ChainType) -> None: ...
-    @property
-    def type(self) -> ChainType: ...
 
 class DTypeAttr(max._core.Attribute):
     """This attribute holds the data type of a tensor."""
@@ -318,16 +288,22 @@ class LayoutAttr(max._core.Attribute):
     @property
     def format(self) -> max._core.dialects.builtin.StringAttr: ...
 
-class CompositeDistributedAllreduceAddRmsNormQuantFp8Op(max._core.Operation):
+class CompositeDistributedAllgatherRmsNormOp(max._core.Operation):
     """
-    Allreduce takes in inputs each coming from a different device with
-    the same shape as the final output and performs a sum reduction
-    across the devices. This op instance executes on a specific device
-    (specified by the device attribute) and produces the output for that device.
+    AllGather concatenates the per-device row shards (`inputs`) so every device
+    holds the full replicated tensor, then RMSNorms it in the same launch (no
+    separate-norm HBM round-trip). Returns the normed tensor (`output`) and the
+    raw gathered residual (`outResidual`); a gathered row is a verbatim copy, so
+    the residual is bit-identical to a standalone all-gather (no f32 peer-sum).
+    `multiply_before_cast=true`, bf16 in/out only (no quantization).
 
-    This op also applies a residual (add), then RMSNorm and dynamic FP8 quantization to the output of AllReduce.
-    It returns both the quantized output value and the quantization scale.
-    It also returns the intermediate output of the residual (add) op.
+    `group_size` matches `mo.distributed.allgather`: the devices split into
+    contiguous groups of that many, each gathering independently, so the op
+    works under TP-within-DP topologies and every output is the group's gathered
+    tensor rather than the whole world's. It must be at least 2 and must divide
+    the device count; `group_size == num_devices` is a full-world collective.
+    The builder always sets it -- the `0` attribute default is not a usable
+    value.
     """
 
     def __init__(
@@ -335,24 +311,20 @@ class CompositeDistributedAllreduceAddRmsNormQuantFp8Op(max._core.Operation):
         builder: max._core.OpBuilder,
         location: Location,
         output: Sequence[max._core.Type],
-        out_scale: Sequence[max._core.Type],
         out_residual: Sequence[max._core.Type],
         out_chain: ChainType,
         inputs: Sequence[max._core.Value[max._core.Type]],
         signal_buffers: Sequence[max._core.Value[max._core.Type]],
-        residual: Sequence[max._core.Value[max._core.Type]],
         gamma: Sequence[max._core.Value[max._core.Type]],
         epsilon: Sequence[max._core.Value[max._core.Type]],
         weight_offset: Sequence[max._core.Value[max._core.Type]],
-        scale_ub: Sequence[max._core.Value[max._core.Type]],
         in_chain: max._core.Value[ChainType],
+        group_size: max._core.dialects.builtin.IntegerAttr,
     ) -> None: ...
     @property
     def inputs(self) -> Sequence[max._core.Value[max._core.Type]]: ...
     @property
     def signal_buffers(self) -> Sequence[max._core.Value[max._core.Type]]: ...
-    @property
-    def residual(self) -> Sequence[max._core.Value[max._core.Type]]: ...
     @property
     def gamma(self) -> Sequence[max._core.Value[max._core.Type]]: ...
     @property
@@ -360,162 +332,133 @@ class CompositeDistributedAllreduceAddRmsNormQuantFp8Op(max._core.Operation):
     @property
     def weight_offset(self) -> Sequence[max._core.Value[max._core.Type]]: ...
     @property
-    def scale_ub(self) -> Sequence[max._core.Value[max._core.Type]]: ...
-    @property
     def in_chain(self) -> max._core.Value[ChainType]: ...
+    @property
+    def group_size(self) -> int: ...
+    @group_size.setter
+    def group_size(
+        self, arg: max._core.dialects.builtin.IntegerAttr, /
+    ) -> None: ...
 
-class CompositeBundledAllreduceAddRmsNormQuantFp8Op(max._core.Operation):
+class CompositeDistributedAllgatherRmsNormQuantMxfp8Op(max._core.Operation):
     """
-    Per-device entry point for the fused `allreduce.sum` +
-    residual add + RMS norm + dynamic-scaled FP8 quantize chain, used inside
-    an `mo.parallel` region.  Takes N peer tensor inputs (from
-    `mo.bundled.expand`), N signal buffers (captured from graph scope),
-    per-device residual and gamma tensors, the epsilon / weight offset /
-    scale-upper-bound scalars, and a chain.
-
-    Returns the FP8 quantized output for this device, its scale tensor, the
-    intermediate residual (post-add) tensor, and an output chain.  This is
-    the bundled analog of
-    `mo.composite.distributed.allreduce_add_rms_norm_quant_fp8`.
+    `mo.composite.distributed.allgather_rms_norm` plus an MXFP8 copy of the
+    normed `output`: `outQuant` (float8_e4m3fn, same shape) and `outScale`
+    (float8_e8m0fnu, `[rows, cols / 32]`, plain rank-2 row-major -- what
+    `block_scaled_matmul_amd` takes as `a_scales`, NOT the SM100 SF-atom
+    interleave and NOT the preshuffled atom order `block_scaled_matmul_amd_preb`
+    requires). Quantized from the bf16 written to `output`, so byte-identical
+    to a standalone quantize. Same `group_size` contract.
     """
 
     def __init__(
         self,
         builder: max._core.OpBuilder,
         location: Location,
-        output: TensorType,
-        out_scale: TensorType,
-        out_residual: TensorType,
+        output: Sequence[max._core.Type],
+        out_quant: Sequence[max._core.Type],
+        out_scale: Sequence[max._core.Type],
+        out_residual: Sequence[max._core.Type],
         out_chain: ChainType,
         inputs: Sequence[max._core.Value[max._core.Type]],
         signal_buffers: Sequence[max._core.Value[max._core.Type]],
-        residual: max._core.Value[TensorType],
-        gamma: max._core.Value[TensorType],
-        epsilon: max._core.Value[TensorType],
-        weight_offset: max._core.Value[TensorType],
-        scale_ub: max._core.Value[TensorType],
+        gamma: Sequence[max._core.Value[max._core.Type]],
+        epsilon: Sequence[max._core.Value[max._core.Type]],
+        weight_offset: Sequence[max._core.Value[max._core.Type]],
         in_chain: max._core.Value[ChainType],
+        group_size: max._core.dialects.builtin.IntegerAttr,
     ) -> None: ...
     @property
     def inputs(self) -> Sequence[max._core.Value[max._core.Type]]: ...
     @property
     def signal_buffers(self) -> Sequence[max._core.Value[max._core.Type]]: ...
     @property
-    def residual(self) -> max._core.Value[TensorType]: ...
+    def gamma(self) -> Sequence[max._core.Value[max._core.Type]]: ...
     @property
-    def gamma(self) -> max._core.Value[TensorType]: ...
+    def epsilon(self) -> Sequence[max._core.Value[max._core.Type]]: ...
     @property
-    def epsilon(self) -> max._core.Value[TensorType]: ...
-    @property
-    def weight_offset(self) -> max._core.Value[TensorType]: ...
-    @property
-    def scale_ub(self) -> max._core.Value[TensorType]: ...
+    def weight_offset(self) -> Sequence[max._core.Value[max._core.Type]]: ...
     @property
     def in_chain(self) -> max._core.Value[ChainType]: ...
+    @property
+    def group_size(self) -> int: ...
+    @group_size.setter
+    def group_size(
+        self, arg: max._core.dialects.builtin.IntegerAttr, /
+    ) -> None: ...
 
-class CompositeDistributedMatmulReduceScatterSumOp(max._core.Operation):
+class CompositeDistributedReduceScatterRmsNormOp(max._core.Operation):
     """
-    Each device computes a matmul (A_i @ B_i^T) and the results are
-    reduce-scattered across devices along the M axis. On Blackwell GPUs
-    this maps to a fused kernel that overlaps compute with cross-GPU TMA
-    reductions; on other targets it falls back to separate matmul + reduce-scatter.
+    ReduceScatter takes in inputs each coming from a different device and
+    partitions the reduction so each device receives a disjoint row shard of the
+    sum. This op keeps that shard's sum in f32 registers and RMSNorm-normalizes
+    it in the same launch, avoiding the HBM round-trip of a separate norm kernel.
 
-    All A inputs must be rank-2 with the same shape, and all B inputs must be
-    rank-2 with the same shape. The matmul is always performed with B transposed
-    (K-major layout).
+    It returns both the normed shard (`output`, fed to the next layer) and the
+    reduce-scatter sum shard (`outResidual`, the residual stream). The norm is
+    inherently `multiply_before_cast=true`: gamma is folded in f32 and the value
+    is cast to the input dtype once, last. bf16 in/out only (no quantization).
 
-    When `has_residual` is true, the `residual` tensor is added to the matmul
-    output on the device it resides on before the reduce-scatter communication.
-    The `residual_peer` attribute identifies which input index (and thus
-    device) holds the residual; the add is applied only on that peer so the
-    reduce-scatter sum yields `sum_j(A_j @ B_j) + residual`.
-    This fuses the `add(residual, matmul) -> reduce_scatter` pattern from
-    tensor-parallel attention (e.g. DeepseekV3/KimiK2.5 with TP+EP).
-    When `has_residual` is false, `residual` and `residual_peer` are ignored.
+    When `has_residual` is true, `residuals` is added to the sum in f32 before
+    the pre-norm round, each device adding only its own row shard. It must be
+    REPLICATED -- bit-identical on every rank of a group -- which is what lets
+    a per-rank add reproduce the leader-side pre-add it replaces.
+
+    When false it is ignored and the op is a plain reduce-scatter + norm. The
+    operands stay present and group-sized (the variadic groups must all match
+    in size), filled with the inputs and never indexed -- the same convention
+    as `has_residual` on `mo.composite.distributed.matmul_reduce_scatter.sum`.
+
+    `group_size` matches `mo.distributed.reducescatter.sum`: the devices split
+    into contiguous groups of that many, each reducing independently, so the op
+    works under TP-within-DP topologies. It must be at least 2 and must divide
+    the device count; `group_size == num_devices` is a full-world collective.
+    The builder always sets it -- the `0` attribute default is not a usable
+    value.
     """
 
     def __init__(
         self,
         builder: max._core.OpBuilder,
         location: Location,
-        outputs: Sequence[max._core.Type],
+        output: Sequence[max._core.Type],
+        out_residual: Sequence[max._core.Type],
         out_chain: ChainType,
-        inputs_a: Sequence[max._core.Value[max._core.Type]],
-        inputs_b: Sequence[max._core.Value[max._core.Type]],
-        residual: max._core.Value[TensorType],
-        has_residual: max._core.dialects.builtin.BoolAttr,
-        residual_peer: max._core.dialects.builtin.IntegerAttr,
+        inputs: Sequence[max._core.Value[max._core.Type]],
         signal_buffers: Sequence[max._core.Value[max._core.Type]],
+        gamma: Sequence[max._core.Value[max._core.Type]],
+        epsilon: Sequence[max._core.Value[max._core.Type]],
+        weight_offset: Sequence[max._core.Value[max._core.Type]],
+        residuals: Sequence[max._core.Value[max._core.Type]],
         in_chain: max._core.Value[ChainType],
+        group_size: max._core.dialects.builtin.IntegerAttr,
+        has_residual: max._core.dialects.builtin.BoolAttr,
     ) -> None: ...
     @property
-    def inputs_a(self) -> Sequence[max._core.Value[max._core.Type]]: ...
+    def inputs(self) -> Sequence[max._core.Value[max._core.Type]]: ...
     @property
-    def inputs_b(self) -> Sequence[max._core.Value[max._core.Type]]: ...
+    def signal_buffers(self) -> Sequence[max._core.Value[max._core.Type]]: ...
     @property
-    def residual(self) -> max._core.Value[TensorType]: ...
+    def gamma(self) -> Sequence[max._core.Value[max._core.Type]]: ...
+    @property
+    def epsilon(self) -> Sequence[max._core.Value[max._core.Type]]: ...
+    @property
+    def weight_offset(self) -> Sequence[max._core.Value[max._core.Type]]: ...
+    @property
+    def residuals(self) -> Sequence[max._core.Value[max._core.Type]]: ...
+    @property
+    def in_chain(self) -> max._core.Value[ChainType]: ...
+    @property
+    def group_size(self) -> int: ...
+    @group_size.setter
+    def group_size(
+        self, arg: max._core.dialects.builtin.IntegerAttr, /
+    ) -> None: ...
     @property
     def has_residual(self) -> bool: ...
     @has_residual.setter
     def has_residual(
         self, arg: max._core.dialects.builtin.BoolAttr, /
-    ) -> None: ...
-    @property
-    def residual_peer(self) -> int: ...
-    @residual_peer.setter
-    def residual_peer(
-        self, arg: max._core.dialects.builtin.IntegerAttr, /
-    ) -> None: ...
-    @property
-    def signal_buffers(self) -> Sequence[max._core.Value[max._core.Type]]: ...
-    @property
-    def in_chain(self) -> max._core.Value[ChainType]: ...
-
-class CompositeConcatSliceOp(max._core.Operation):
-    """
-    This operation performs two operations at once:
-    %concat = mo.concat[axis](inputs)
-    %slice = mo.slice(%concat)
-    And returns both the concat and the slice result.
-    """
-
-    def __init__(
-        self,
-        builder: max._core.OpBuilder,
-        location: Location,
-        concat_result: TensorType,
-        slice_result: TensorType,
-        axis: max._core.dialects.builtin.IntegerAttr,
-        inputs: Sequence[max._core.Value[max._core.Type]],
-        static_starts: max._core.dialects.builtin.ArrayAttr,
-        static_steps: max._core.dialects.builtin.ArrayAttr,
-        output_param_decls: max._core.dialects.kgen.ParamDeclArrayAttr,
-    ) -> None: ...
-    @property
-    def axis(self) -> int: ...
-    @axis.setter
-    def axis(self, arg: max._core.dialects.builtin.IntegerAttr, /) -> None: ...
-    @property
-    def inputs(self) -> Sequence[max._core.Value[max._core.Type]]: ...
-    @property
-    def static_starts(self) -> max._core.dialects.builtin.ArrayAttr: ...
-    @static_starts.setter
-    def static_starts(
-        self, arg: max._core.dialects.builtin.ArrayAttr, /
-    ) -> None: ...
-    @property
-    def static_steps(self) -> max._core.dialects.builtin.ArrayAttr: ...
-    @static_steps.setter
-    def static_steps(
-        self, arg: max._core.dialects.builtin.ArrayAttr, /
-    ) -> None: ...
-    @property
-    def output_param_decls(
-        self,
-    ) -> Sequence[max._core.dialects.kgen.ParamDeclAttr]: ...
-    @output_param_decls.setter
-    def output_param_decls(
-        self, arg: max._core.dialects.kgen.ParamDeclArrayAttr, /
     ) -> None: ...
 
 class CompositeMatmulAddOp(max._core.Operation):
@@ -573,11 +516,148 @@ class CompositeMatmulAddOp(max._core.Operation):
         self, arg: max._core.dialects.builtin.BoolAttr, /
     ) -> None: ...
 
-class CompositeMaskedFlashAttentionCpuOp(max._core.Operation):
+class CompositeGroupedMatmulBlockScaledOp(max._core.Operation):
     """
-    Fused scaled-dot-product attention (`softmax(Q @ K^T * scale + mask) @ V`)
-    on CPU. `scale` is a host scalar (`f32`). Lowers 1:1 to the
-    `with_mask_flash_attention_cpu` kernel.
+    The down leg of an NVFP4 MoE FFN: a per-expert (ragged) block-scaled grouped
+    matmul of the packed-NVFP4 activations by the down weights, producing the
+    bf16 hidden-state output.
+
+    Composite form of the `mo.composite.grouped_matmul_block_scaled` kernel;
+    lowers 1:1.
+    """
+
+    def __init__(
+        self,
+        builder: max._core.OpBuilder,
+        location: Location,
+        output: TensorType,
+        hidden_states: max._core.Value[TensorType],
+        weight: max._core.Value[TensorType],
+        a_scales: max._core.Value[TensorType],
+        b_scales: max._core.Value[TensorType],
+        expert_start_indices: max._core.Value[TensorType],
+        expert_ids: max._core.Value[TensorType],
+        a_scale_offsets: max._core.Value[TensorType],
+        expert_scales: max._core.Value[TensorType],
+        estimated_total_m: max._core.Value[TensorType],
+        num_active_experts: max._core.Value[TensorType],
+    ) -> None: ...
+    @property
+    def hidden_states(self) -> max._core.Value[TensorType]: ...
+    @property
+    def weight(self) -> max._core.Value[TensorType]: ...
+    @property
+    def a_scales(self) -> max._core.Value[TensorType]: ...
+    @property
+    def b_scales(self) -> max._core.Value[TensorType]: ...
+    @property
+    def expert_start_indices(self) -> max._core.Value[TensorType]: ...
+    @property
+    def expert_ids(self) -> max._core.Value[TensorType]: ...
+    @property
+    def a_scale_offsets(self) -> max._core.Value[TensorType]: ...
+    @property
+    def expert_scales(self) -> max._core.Value[TensorType]: ...
+    @property
+    def estimated_total_m(self) -> max._core.Value[TensorType]: ...
+    @property
+    def num_active_experts(self) -> max._core.Value[TensorType]: ...
+
+class CompositeGroupedMatmulSwigluNvfp4Op(max._core.Operation):
+    """
+    The gate-up leg of an NVFP4 MoE FFN: a per-expert (ragged) grouped matmul of
+    the packed-NVFP4 activations by the gate-up weights, followed by a SwiGLU
+    activation and a bf16->nvfp4 quantization of the result. Returns the packed
+    NVFP4 activations for the down leg (`c_packed`) and their per-expert SwiGLU
+    scale tile (`c_swiglu_scales`).
+
+    `swiglu_alpha`/`swiglu_limit` are host scalars parameterizing the clamped
+    SwiGLU (swigluoai) activation, enabled by the `clamp_activation` attribute.
+
+    Composite form of the `mo.composite.grouped_matmul_swiglu_nvfp4` kernel;
+    lowers 1:1.
+    """
+
+    def __init__(
+        self,
+        builder: max._core.OpBuilder,
+        location: Location,
+        c_packed: TensorType,
+        c_swiglu_scales: TensorType,
+        hidden_states: max._core.Value[TensorType],
+        weight: max._core.Value[TensorType],
+        a_scales: max._core.Value[TensorType],
+        b_scales: max._core.Value[TensorType],
+        expert_start_indices: max._core.Value[TensorType],
+        expert_ids: max._core.Value[TensorType],
+        a_scale_offsets: max._core.Value[TensorType],
+        expert_scales: max._core.Value[TensorType],
+        c_input_scales: max._core.Value[TensorType],
+        estimated_total_m: max._core.Value[TensorType],
+        num_active_experts: max._core.Value[TensorType],
+        swiglu_alpha: max._core.Value[TensorType],
+        swiglu_limit: max._core.Value[TensorType],
+        clamp_activation: max._core.dialects.builtin.BoolAttr,
+    ) -> None: ...
+    @property
+    def hidden_states(self) -> max._core.Value[TensorType]: ...
+    @property
+    def weight(self) -> max._core.Value[TensorType]: ...
+    @property
+    def a_scales(self) -> max._core.Value[TensorType]: ...
+    @property
+    def b_scales(self) -> max._core.Value[TensorType]: ...
+    @property
+    def expert_start_indices(self) -> max._core.Value[TensorType]: ...
+    @property
+    def expert_ids(self) -> max._core.Value[TensorType]: ...
+    @property
+    def a_scale_offsets(self) -> max._core.Value[TensorType]: ...
+    @property
+    def expert_scales(self) -> max._core.Value[TensorType]: ...
+    @property
+    def c_input_scales(self) -> max._core.Value[TensorType]: ...
+    @property
+    def estimated_total_m(self) -> max._core.Value[TensorType]: ...
+    @property
+    def num_active_experts(self) -> max._core.Value[TensorType]: ...
+    @property
+    def swiglu_alpha(self) -> max._core.Value[TensorType]: ...
+    @property
+    def swiglu_limit(self) -> max._core.Value[TensorType]: ...
+    @property
+    def clamp_activation(self) -> bool: ...
+    @clamp_activation.setter
+    def clamp_activation(
+        self, arg: max._core.dialects.builtin.BoolAttr, /
+    ) -> None: ...
+
+class CompositeLayerNormRopeRaggedOp(max._core.Operation):
+    """
+    Fused operation computing LayerNorm followed by ragged RoPE applied to a
+    leading slice of the normalized output, with the remaining columns passed
+    through unrotated:
+
+      normed = layer_norm(input, gamma, beta, epsilon)
+      roped, passthrough = split(normed, axis=-1)
+      roped = rope.ragged(roped, input_row_offsets, start_pos, freqs_cis)
+      result = concat(roped, passthrough, axis=-1)
+
+    The RoPE width is taken from `freqsCis`'s last dimension.
+
+    Example:
+
+    ```mlir
+      %result = mo.composite.layer_norm_rope_ragged(%input, %gamma, %beta,
+                                                     %epsilon, %row_offsets,
+                                                     %start_pos, %freqs_cis)
+        {interleaved = false} :
+        (!mo.tensor<[8, 128], bf16, gpu:0>, !mo.tensor<[128], f32, gpu:0>,
+         !mo.tensor<[128], f32, gpu:0>, !mo.tensor<[], f32>,
+         !mo.tensor<[batch_plus_one], ui32, gpu:0>, !mo.tensor<[batch], ui32, gpu:0>,
+         !mo.tensor<[1024, 64], f32, gpu:0>)
+        -> !mo.tensor<[8, 128], bf16, gpu:0>
+    ```
     """
 
     def __init__(
@@ -585,22 +665,44 @@ class CompositeMaskedFlashAttentionCpuOp(max._core.Operation):
         builder: max._core.OpBuilder,
         location: Location,
         result: TensorType,
-        query: max._core.Value[TensorType],
-        key: max._core.Value[TensorType],
-        value: max._core.Value[TensorType],
-        mask: max._core.Value[TensorType],
-        scale: max._core.Value[TensorType],
+        input: max._core.Value[TensorType],
+        gamma: max._core.Value[TensorType],
+        beta: max._core.Value[TensorType],
+        epsilon: max._core.Value[TensorType],
+        input_row_offsets: max._core.Value[TensorType],
+        start_pos: max._core.Value[TensorType],
+        freqs_cis: max._core.Value[TensorType],
+        interleaved: max._core.dialects.builtin.BoolAttr,
+        output_param_decls: max._core.dialects.kgen.ParamDeclArrayAttr,
     ) -> None: ...
     @property
-    def query(self) -> max._core.Value[TensorType]: ...
+    def input(self) -> max._core.Value[TensorType]: ...
     @property
-    def key(self) -> max._core.Value[TensorType]: ...
+    def gamma(self) -> max._core.Value[TensorType]: ...
     @property
-    def value(self) -> max._core.Value[TensorType]: ...
+    def beta(self) -> max._core.Value[TensorType]: ...
     @property
-    def mask(self) -> max._core.Value[TensorType]: ...
+    def epsilon(self) -> max._core.Value[TensorType]: ...
     @property
-    def scale(self) -> max._core.Value[TensorType]: ...
+    def input_row_offsets(self) -> max._core.Value[TensorType]: ...
+    @property
+    def start_pos(self) -> max._core.Value[TensorType]: ...
+    @property
+    def freqs_cis(self) -> max._core.Value[TensorType]: ...
+    @property
+    def interleaved(self) -> bool: ...
+    @interleaved.setter
+    def interleaved(
+        self, arg: max._core.dialects.builtin.BoolAttr, /
+    ) -> None: ...
+    @property
+    def output_param_decls(
+        self,
+    ) -> Sequence[max._core.dialects.kgen.ParamDeclAttr]: ...
+    @output_param_decls.setter
+    def output_param_decls(
+        self, arg: max._core.dialects.kgen.ParamDeclArrayAttr, /
+    ) -> None: ...
 
 class CompositeMaskedFlashAttentionGpuOp(max._core.Operation):
     """
@@ -631,79 +733,26 @@ class CompositeMaskedFlashAttentionGpuOp(max._core.Operation):
     @property
     def scale(self) -> max._core.Value[TensorType]: ...
 
-class CompositeMatmulFusedPartialRmsNormOp(max._core.Operation):
+class CompositeRmsNormResidualAddOp(max._core.Operation):
     """
-    Fused operation computing a matmul followed by an RMS norm of the result,
-    returning both the normalized output and the un-normalized matmul output:
+    Fused operation computing:
+      intermediate = input + residual_input
+      output = rms_norm(intermediate, gamma, epsilon, weight_offset)
 
-      unnormed = input_a @ input_b   {transpose_b = true}
-      normed   = rms_norm(unnormed, gamma, epsilon, weight_offset)
-                   {multiply_before_cast = true}
+    Returns both the final normalized output and the post-add intermediate
+    tensor. This is the canonical transformer/mamba pre-norm boundary
+    `rms_norm(residual + out)`, where the pre-add value is carried forward as
+    the next block's residual. Unlike `rms_norm_fused_residual_add`, there is a
+    single RMS norm (no inner norm on `input`).
 
-    The kernel hardcodes `transpose_b = true` and `multiply_before_cast = true`.
-    Produced by the matmul + partial-RMS-norm fusion pattern (GPU only).
-    """
+    Example:
 
-    def __init__(
-        self,
-        builder: max._core.OpBuilder,
-        location: Location,
-        normed: TensorType,
-        unnormed: TensorType,
-        input_a: max._core.Value[TensorType],
-        input_b: max._core.Value[TensorType],
-        gamma: max._core.Value[TensorType],
-        epsilon: max._core.Value[TensorType],
-        weight_offset: max._core.Value[TensorType],
-    ) -> None: ...
-    @property
-    def input_a(self) -> max._core.Value[TensorType]: ...
-    @property
-    def input_b(self) -> max._core.Value[TensorType]: ...
-    @property
-    def gamma(self) -> max._core.Value[TensorType]: ...
-    @property
-    def epsilon(self) -> max._core.Value[TensorType]: ...
-    @property
-    def weight_offset(self) -> max._core.Value[TensorType]: ...
-
-class CompositeNoMaskFlashAttentionCpuOp(max._core.Operation):
-    """
-    Fused scaled-dot-product attention (`softmax(Q @ K^T * scale) @ V`) on CPU
-    with no attention mask. `scale` is a host scalar (`f32`). Lowers 1:1 to the
-    `no_mask_flash_attention_cpu` kernel.
-    """
-
-    def __init__(
-        self,
-        builder: max._core.OpBuilder,
-        location: Location,
-        result: TensorType,
-        query: max._core.Value[TensorType],
-        key: max._core.Value[TensorType],
-        value: max._core.Value[TensorType],
-        scale: max._core.Value[TensorType],
-    ) -> None: ...
-    @property
-    def query(self) -> max._core.Value[TensorType]: ...
-    @property
-    def key(self) -> max._core.Value[TensorType]: ...
-    @property
-    def value(self) -> max._core.Value[TensorType]: ...
-    @property
-    def scale(self) -> max._core.Value[TensorType]: ...
-
-class CompositeRmsNormFusedQuantizeDynamicScaledFp8Op(max._core.Operation):
-    """
-    Fused operation computing token-wise dynamic-scaled FP8 quantization of an
-    RMS-normalized input:
-
-      normed = rms_norm(input, weight, epsilon, weight_offset)
-                 {multiply_before_cast = true}
-      output, scale = quantize_dynamic_scaled_float8(normed, scale_ub)
-
-    Returns the FP8 quantized output and its per-token scale tensor. Produced by
-    the RMS-norm + quantize fusion pattern (GPU only).
+    ```mlir
+      %output, %intermediate = mo.composite.rms_norm_residual_add(
+          %input, %residual, %gamma, %eps, %offset) {
+          multiply_before_cast = false} :
+        (...) -> (!mo.tensor<[3, 2], f32>, !mo.tensor<[3, 2], f32>)
+    ```
     """
 
     def __init__(
@@ -711,23 +760,39 @@ class CompositeRmsNormFusedQuantizeDynamicScaledFp8Op(max._core.Operation):
         builder: max._core.OpBuilder,
         location: Location,
         output: TensorType,
-        scale: TensorType,
+        intermediate: TensorType,
         input: max._core.Value[TensorType],
-        weight: max._core.Value[TensorType],
+        residual_input: max._core.Value[TensorType],
+        gamma: max._core.Value[TensorType],
         epsilon: max._core.Value[TensorType],
         weight_offset: max._core.Value[TensorType],
-        scale_ub: max._core.Value[TensorType],
+        multiply_before_cast: max._core.dialects.builtin.BoolAttr,
+        output_param_decls: max._core.dialects.kgen.ParamDeclArrayAttr,
     ) -> None: ...
     @property
     def input(self) -> max._core.Value[TensorType]: ...
     @property
-    def weight(self) -> max._core.Value[TensorType]: ...
+    def residual_input(self) -> max._core.Value[TensorType]: ...
+    @property
+    def gamma(self) -> max._core.Value[TensorType]: ...
     @property
     def epsilon(self) -> max._core.Value[TensorType]: ...
     @property
     def weight_offset(self) -> max._core.Value[TensorType]: ...
     @property
-    def scale_ub(self) -> max._core.Value[TensorType]: ...
+    def multiply_before_cast(self) -> bool: ...
+    @multiply_before_cast.setter
+    def multiply_before_cast(
+        self, arg: max._core.dialects.builtin.BoolAttr, /
+    ) -> None: ...
+    @property
+    def output_param_decls(
+        self,
+    ) -> Sequence[max._core.dialects.kgen.ParamDeclAttr]: ...
+    @output_param_decls.setter
+    def output_param_decls(
+        self, arg: max._core.dialects.kgen.ParamDeclArrayAttr, /
+    ) -> None: ...
 
 class CompositeRmsNormFusedResidualAddOp(max._core.Operation):
     """
@@ -859,6 +924,74 @@ class CompositeRmsNormRopeOp(max._core.Operation):
         self, arg: max._core.dialects.kgen.ParamDeclArrayAttr, /
     ) -> None: ...
 
+class CompositeRopeRaggedOp(max._core.Operation):
+    """
+    Applies Rotary Position Embedding (RoPE) to `input`, a ragged batch of
+    tokens. Per-token absolute positions are derived from `inputRowOffsets`
+    (the ragged batch boundaries) and `startPos` (each sequence's current
+    cache length) and used to index `freqsCis`. When `freqsCis`'s last
+    dimension is smaller than `input`'s, RoPE is applied to only
+    `freqsCis`-many columns of each head and the rest pass through
+    unrotated: the trailing columns are rotated by default (the MLA
+    layout), or the leading ones when `rope_first` is set (the
+    DeepSeekV3.2/GLM Indexer layout, where Q and K are chunked as
+    `pe, nope`). `rope_first` is meaningless -- and must be false -- when
+    `freqsCis` is as wide as `input`, since then no column passes through.
+
+    Example:
+
+    ```mlir
+      %result = mo.composite.rope.ragged(%input, %row_offsets, %start_pos,
+                                          %freqs_cis)
+        {interleaved = false, rope_first = false} :
+        (!mo.tensor<[8, 1, 64], bf16, gpu:0>, !mo.tensor<[batch_plus_one], ui32, gpu:0>,
+         !mo.tensor<[batch], ui32, gpu:0>, !mo.tensor<[1024, 64], f32, gpu:0>)
+        -> !mo.tensor<[8, 1, 64], bf16, gpu:0>
+    ```
+    """
+
+    def __init__(
+        self,
+        builder: max._core.OpBuilder,
+        location: Location,
+        result: TensorType,
+        input: max._core.Value[TensorType],
+        input_row_offsets: max._core.Value[TensorType],
+        start_pos: max._core.Value[TensorType],
+        freqs_cis: max._core.Value[TensorType],
+        interleaved: max._core.dialects.builtin.BoolAttr,
+        rope_first: max._core.dialects.builtin.BoolAttr,
+        output_param_decls: max._core.dialects.kgen.ParamDeclArrayAttr,
+    ) -> None: ...
+    @property
+    def input(self) -> max._core.Value[TensorType]: ...
+    @property
+    def input_row_offsets(self) -> max._core.Value[TensorType]: ...
+    @property
+    def start_pos(self) -> max._core.Value[TensorType]: ...
+    @property
+    def freqs_cis(self) -> max._core.Value[TensorType]: ...
+    @property
+    def interleaved(self) -> bool: ...
+    @interleaved.setter
+    def interleaved(
+        self, arg: max._core.dialects.builtin.BoolAttr, /
+    ) -> None: ...
+    @property
+    def rope_first(self) -> bool: ...
+    @rope_first.setter
+    def rope_first(
+        self, arg: max._core.dialects.builtin.BoolAttr, /
+    ) -> None: ...
+    @property
+    def output_param_decls(
+        self,
+    ) -> Sequence[max._core.dialects.kgen.ParamDeclAttr]: ...
+    @output_param_decls.setter
+    def output_param_decls(
+        self, arg: max._core.dialects.kgen.ParamDeclArrayAttr, /
+    ) -> None: ...
+
 class CoordinateTransformMode(enum.Enum):
     half_pixel = 0
 
@@ -874,178 +1007,6 @@ class CoordinateTransformModeAttr(max._core.Attribute):
     def __init__(self, value: CoordinateTransformMode) -> None: ...
     @property
     def value(self) -> CoordinateTransformMode: ...
-
-class IOKind(enum.Enum):
-    _unknown = 32
-
-    _output = 0
-
-    _input = 1
-
-    _fused_input = 2
-
-    _fused_output = 3
-
-    _fused_compute_output = 31
-
-class IOKindAttr(max._core.Attribute):
-    def __init__(self, arg0: Context, arg1: IOKind, /) -> None: ...
-    @property
-    def value(self) -> IOKind: ...
-
-class MOBundledCollectiveInterface(Protocol):
-    """
-    Marks an op that is a per-launch entry point for a bundled collective and
-    is only valid inside an `mo.parallel` body.
-    """
-
-class MOConditionallyInPlaceInterface(Protocol):
-    """
-    Interface that ops that can conditionally represent an in-place computation
-    (e.g. a custom op that directly operates on a mo.buffer value or a
-     mogg.kernel after it has been load and store fused).
-
-    Should be used in conjunction with MOMutableOpInterface.
-    """
-
-    @property
-    def in_place(self) -> bool: ...
-
-class ConstantLike(Protocol):
-    """Interface for modeling constant operations."""
-
-    @property
-    def type(self) -> TensorType: ...
-    @property
-    def result(self) -> max._core.Value[TensorType]: ...
-
-class MOControlOpInterface(Protocol):
-    """Interface marking ops that are control flow"""
-
-class ElementWiseBinary(Protocol):
-    """Interface for modeling binary element-wise operations."""
-
-    @property
-    def lhs_input(self) -> max._core.Value[TensorType]: ...
-    @lhs_input.setter
-    def lhs_input(self, arg: max._core.Value, /) -> None: ...
-    @property
-    def rhs_input(self) -> max._core.Value[TensorType]: ...
-    @rhs_input.setter
-    def rhs_input(self, arg: max._core.Value, /) -> None: ...
-    @property
-    def result(self) -> max._core.Value[TensorType]: ...
-
-class ElementWiseLike(Protocol):
-    """Represents an generic element-wise op."""
-
-class ElementWiseUnary(Protocol):
-    """Interface for modeling unary element-wise operations."""
-
-    @property
-    def input(self) -> max._core.Value[TensorType]: ...
-    @input.setter
-    def input(self, arg: max._core.Value, /) -> None: ...
-    @property
-    def result(self) -> max._core.Value[TensorType]: ...
-
-class MOHasDeviceInterface(Protocol):
-    """
-    Interface for ops with an optional `#M.device_ref` attribute describing the
-    intended execution device. The reference must resolve to an `#M.device_spec`
-    in the op's containing `mo.graph` 'device_specs' attribute.
-    """
-
-    @property
-    def execution_devices(self) -> list[max._core.dialects.m.DeviceRefAttr]: ...
-    @property
-    def execution_device(self) -> max._core.dialects.m.DeviceRefAttr: ...
-
-class MatmulLike(Protocol):
-    """
-    Interface for modeling operations that implement matmul-like behavior,
-    including vanilla matmul and batchmatmul.
-
-    Dynamically ranked/shaped inputs and results are permitted, but if the shape
-    is known, the last 2 dimensions of each input are assumed to be the matrix
-    dimension. This interface refers to the left and right matrices as A and B,
-    respectively.
-    """
-
-    @property
-    def tensor_a(self) -> max._core.Value[TensorType]: ...
-    @property
-    def tensor_b(self) -> max._core.Value[TensorType]: ...
-    @property
-    def tensor_result(self) -> max._core.Value[TensorType]: ...
-
-class MOMutableOpInterface(Protocol):
-    """
-    Interface that all mutable ops under rmo/mo implement and any ops that
-    could represent in-place compute should implement as well.
-
-    In the case where an op can be conditionally in-place (e.g. mo.custom) it
-    should also implement the MOConditionallyInPlaceInterface as well.
-    """
-
-    @property
-    def in_chains(self) -> list[max._core.Value[ChainType]]: ...
-    @property
-    def out_chains(self) -> list[max._core.Value[ChainType]]: ...
-    @property
-    def in_chains_mutable(self) -> list[max._core.OpOperand]: ...
-
-class PadLike(Protocol):
-    """Interface for modeling pad operations."""
-
-    @property
-    def implicitly_parametric(self) -> bool: ...
-    @property
-    def output_param_decls(
-        self,
-    ) -> Sequence[max._core.dialects.kgen.ParamDeclAttr]: ...
-    @output_param_decls.setter
-    def output_param_decls(
-        self, arg: Sequence[max._core.dialects.kgen.ParamDeclAttr], /
-    ) -> None: ...
-    @property
-    def input(self) -> max._core.Value[TensorType]: ...
-    @property
-    def paddings(self) -> max._core.Value[TensorType]: ...
-    @property
-    def type(self) -> TensorType: ...
-    def get_effects(
-        self, arg: Sequence[max._core._MemoryEffect], /
-    ) -> None: ...
-    def walk_declarations(
-        self, arg: Callable[[max._core.dialects.kgen.ParamDeclAttr], None], /
-    ) -> None: ...
-    def walk_definitions(
-        self,
-        arg: Callable[
-            [
-                max._core.dialects.kgen.ParamDeclAttr,
-                max._core.dialects.kgen.ParamDefValue,
-            ],
-            None,
-        ],
-        /,
-    ) -> None: ...
-    def rename_declarations(
-        self, arg: Sequence[max._core.dialects.kgen.ParamDeclAttr], /
-    ) -> None: ...
-    def collect_parameter_uses(
-        self,
-        arg0: Callable[[max._core.Attribute], None],
-        arg1: Callable[[max._core.Type], None],
-        /,
-    ) -> None: ...
-    def collect_parameter_uses_below(
-        self,
-        arg0: Callable[[max._core.Attribute], None],
-        arg1: Callable[[max._core.Type], None],
-        /,
-    ) -> None: ...
 
 class ParamDeclarationInterface(Protocol):
     """
@@ -1094,350 +1055,6 @@ class ParamDeclarationInterface(Protocol):
         arg0: Callable[[max._core.Attribute], None],
         arg1: Callable[[max._core.Type], None],
         /,
-    ) -> None: ...
-
-class PreservedDuringKernelLowering(Protocol):
-    """
-    Represents a MO operation that must have must lowered using a kernel
-    implementation.
-    """
-
-class Reduction(Protocol):
-    """Interface for modeling reduction operations."""
-
-    @property
-    def implicitly_parametric(self) -> bool: ...
-    @property
-    def output_param_decls(
-        self,
-    ) -> Sequence[max._core.dialects.kgen.ParamDeclAttr]: ...
-    @output_param_decls.setter
-    def output_param_decls(
-        self, arg: Sequence[max._core.dialects.kgen.ParamDeclAttr], /
-    ) -> None: ...
-    @property
-    def input(self) -> max._core.Value[TensorType]: ...
-    @property
-    def input_mutable(self) -> max._core.OpOperand: ...
-    @property
-    def axis_attr(self) -> max._core.dialects.builtin.IntegerAttr: ...
-    @property
-    def result(self) -> max._core.Value[TensorType]: ...
-    def get_effects(
-        self, arg: Sequence[max._core._MemoryEffect], /
-    ) -> None: ...
-    def walk_declarations(
-        self, arg: Callable[[max._core.dialects.kgen.ParamDeclAttr], None], /
-    ) -> None: ...
-    def walk_definitions(
-        self,
-        arg: Callable[
-            [
-                max._core.dialects.kgen.ParamDeclAttr,
-                max._core.dialects.kgen.ParamDefValue,
-            ],
-            None,
-        ],
-        /,
-    ) -> None: ...
-    def rename_declarations(
-        self, arg: Sequence[max._core.dialects.kgen.ParamDeclAttr], /
-    ) -> None: ...
-    def collect_parameter_uses(
-        self,
-        arg0: Callable[[max._core.Attribute], None],
-        arg1: Callable[[max._core.Type], None],
-        /,
-    ) -> None: ...
-    def collect_parameter_uses_below(
-        self,
-        arg0: Callable[[max._core.Attribute], None],
-        arg1: Callable[[max._core.Type], None],
-        /,
-    ) -> None: ...
-
-class SameVariadicOperandSizeInterface(Protocol):
-    """
-    Interface that represent MO Ops that take multiple variadics, all with the same size.
-    Wrapper around the builtin `SameVariadicOperandSize` that can't be checked in C++.
-    """
-
-class SameVariadicResultSizeInterface(Protocol):
-    """
-    Interface that represent MO Ops that have multiple variadic results, all with the same size.
-    Wrapper around the builtin `SameVariadicResultSize` that can't be checked in C++.
-    """
-
-class ScatterLike(Protocol):
-    """
-    Interface for modeling Scatter-like operations (i.e., regular Scatter
-    and Scatter with reductions).
-    """
-
-    @property
-    def implicitly_parametric(self) -> bool: ...
-    @property
-    def output_param_decls(
-        self,
-    ) -> Sequence[max._core.dialects.kgen.ParamDeclAttr]: ...
-    @output_param_decls.setter
-    def output_param_decls(
-        self, arg: Sequence[max._core.dialects.kgen.ParamDeclAttr], /
-    ) -> None: ...
-    @property
-    def input(self) -> max._core.Value[TensorType]: ...
-    @property
-    def input_mutable(self) -> max._core.OpOperand: ...
-    @property
-    def updates(self) -> max._core.Value[TensorType]: ...
-    @property
-    def updates_mutable(self) -> max._core.OpOperand: ...
-    @property
-    def indices(self) -> max._core.Value[TensorType]: ...
-    @property
-    def indices_mutable(self) -> max._core.OpOperand: ...
-    @property
-    def axis(self) -> max._core.Value[TensorType]: ...
-    @property
-    def axis_mutable(self) -> max._core.OpOperand: ...
-    @property
-    def result(self) -> max._core.Value[TensorType]: ...
-    def get_effects(
-        self, arg: Sequence[max._core._MemoryEffect], /
-    ) -> None: ...
-    def walk_declarations(
-        self, arg: Callable[[max._core.dialects.kgen.ParamDeclAttr], None], /
-    ) -> None: ...
-    def walk_definitions(
-        self,
-        arg: Callable[
-            [
-                max._core.dialects.kgen.ParamDeclAttr,
-                max._core.dialects.kgen.ParamDefValue,
-            ],
-            None,
-        ],
-        /,
-    ) -> None: ...
-    def rename_declarations(
-        self, arg: Sequence[max._core.dialects.kgen.ParamDeclAttr], /
-    ) -> None: ...
-    def collect_parameter_uses(
-        self,
-        arg0: Callable[[max._core.Attribute], None],
-        arg1: Callable[[max._core.Type], None],
-        /,
-    ) -> None: ...
-    def collect_parameter_uses_below(
-        self,
-        arg0: Callable[[max._core.Attribute], None],
-        arg1: Callable[[max._core.Type], None],
-        /,
-    ) -> None: ...
-
-class ScatterNdLike(Protocol):
-    """
-    Interface for modeling ScatterND-like operations (i.e., regular ScatterND
-    and ScatterND with reductions).
-    """
-
-    @property
-    def implicitly_parametric(self) -> bool: ...
-    @property
-    def output_param_decls(
-        self,
-    ) -> Sequence[max._core.dialects.kgen.ParamDeclAttr]: ...
-    @output_param_decls.setter
-    def output_param_decls(
-        self, arg: Sequence[max._core.dialects.kgen.ParamDeclAttr], /
-    ) -> None: ...
-    @property
-    def input(self) -> max._core.Value[TensorType]: ...
-    @property
-    def input_mutable(self) -> max._core.OpOperand: ...
-    @property
-    def updates(self) -> max._core.Value[TensorType]: ...
-    @property
-    def updates_mutable(self) -> max._core.OpOperand: ...
-    @property
-    def indices(self) -> max._core.Value[TensorType]: ...
-    @property
-    def indices_mutable(self) -> max._core.OpOperand: ...
-    @property
-    def result(self) -> max._core.Value[TensorType]: ...
-    def get_effects(
-        self, arg: Sequence[max._core._MemoryEffect], /
-    ) -> None: ...
-    def walk_declarations(
-        self, arg: Callable[[max._core.dialects.kgen.ParamDeclAttr], None], /
-    ) -> None: ...
-    def walk_definitions(
-        self,
-        arg: Callable[
-            [
-                max._core.dialects.kgen.ParamDeclAttr,
-                max._core.dialects.kgen.ParamDefValue,
-            ],
-            None,
-        ],
-        /,
-    ) -> None: ...
-    def rename_declarations(
-        self, arg: Sequence[max._core.dialects.kgen.ParamDeclAttr], /
-    ) -> None: ...
-    def collect_parameter_uses(
-        self,
-        arg0: Callable[[max._core.Attribute], None],
-        arg1: Callable[[max._core.Type], None],
-        /,
-    ) -> None: ...
-    def collect_parameter_uses_below(
-        self,
-        arg0: Callable[[max._core.Attribute], None],
-        arg1: Callable[[max._core.Type], None],
-        /,
-    ) -> None: ...
-
-class ShapeMaterialization(Protocol):
-    """
-    Interface that models ops which
-    1. declare parameters whose values depend on the op's input shape or data.
-    2. might know how to define the declared parameters in terms of new ops
-       (a best effort process that depends on the op type and its inputs).
-    """
-
-    @property
-    def implicitly_parametric(self) -> bool: ...
-    @property
-    def output_param_decls(
-        self,
-    ) -> Sequence[max._core.dialects.kgen.ParamDeclAttr]: ...
-    @output_param_decls.setter
-    def output_param_decls(
-        self, arg: Sequence[max._core.dialects.kgen.ParamDeclAttr], /
-    ) -> None: ...
-    @property
-    def data_dependent_input_indices(self) -> list[int]: ...
-    def get_effects(
-        self, arg: Sequence[max._core._MemoryEffect], /
-    ) -> None: ...
-    def walk_declarations(
-        self, arg: Callable[[max._core.dialects.kgen.ParamDeclAttr], None], /
-    ) -> None: ...
-    def walk_definitions(
-        self,
-        arg: Callable[
-            [
-                max._core.dialects.kgen.ParamDeclAttr,
-                max._core.dialects.kgen.ParamDefValue,
-            ],
-            None,
-        ],
-        /,
-    ) -> None: ...
-    def rename_declarations(
-        self, arg: Sequence[max._core.dialects.kgen.ParamDeclAttr], /
-    ) -> None: ...
-    def collect_parameter_uses(
-        self,
-        arg0: Callable[[max._core.Attribute], None],
-        arg1: Callable[[max._core.Type], None],
-        /,
-    ) -> None: ...
-    def collect_parameter_uses_below(
-        self,
-        arg0: Callable[[max._core.Attribute], None],
-        arg1: Callable[[max._core.Type], None],
-        /,
-    ) -> None: ...
-    def materialize_shape_defs(
-        self, arg: Sequence[max._core.dialects.builtin.TypedAttr], /
-    ) -> ShapeMaterializeResult: ...
-
-class SlidingWindow(Protocol):
-    """Interface for modeling operations that have sliding window semantics."""
-
-    @property
-    def strides(self) -> max._core.Value[TensorType]: ...
-    @property
-    def dilations(self) -> max._core.Value[TensorType]: ...
-    @property
-    def paddings(self) -> max._core.Value[TensorType]: ...
-
-class Staticization(Protocol):
-    """
-    Interface that models op which, if given staticized versions of its inputs,
-    might be able to get staticized as well, where "being staticized" means
-    having the op's output value represented as a parameter expression, i.e.,
-    one of:
-    - `IntegerAttr` for a integer or boolean constant, e.g., `42`.
-    - `BoolAttr` for a boolean constant, e.g., `true`.
-    - `KGEN::ParamDeclRefAttr` for a parameter reference, e.g., `D0`.
-    - `KGEN::ParamOperatorAttr` for a parameter expression, e.g., `add(D1, 2)`.
-    """
-
-    def try_staticize(
-        self,
-        arg0: Sequence[max._core.dialects.builtin.TypedAttr],
-        arg1: ParamExprBuilder,
-        /,
-    ) -> max._core.dialects.builtin.TypedAttr: ...
-
-class MOTensorOpInterface(Protocol):
-    """
-    Interface that all MO ops should implement, mainly providing typed accessors
-    to inputs, outputs, and their shapes.
-    """
-
-    def get_input_tensor(self, arg: int, /) -> max._core.Value[TensorType]: ...
-    def get_output_tensor(self, arg: int, /) -> max._core.Value[TensorType]: ...
-
-class ViewLike(Protocol):
-    """Represents a view op."""
-
-class IfOp(max._core.Operation):
-    """
-    The `mo.if` op takes an `i1` condition, a 'then' block and an 'else'
-    block. If the condition is true, the 'then' block is run and the op
-    returns the results of that block, otherwise the "else" block is
-    run and its values are returned.
-
-    The blocks have access to all outer values. The blocks must return
-    values using the `mo.yield' op, and the returned values must match the
-    types given in the `mo.if` result signature.
-
-    Example:
-
-    ```mlir
-      %res = mo.if (%cond : !mo.tensor<[], bool>) -> !mo.tensor<?, f32> {
-        %v1 = mo.add(%x, %y) : (!mo.tensor<?, f32>, !mo.tensor<?, f32>
-                                ) -> !mo.tensor<?, f32>
-        mo.yield %v1 : !mo.tensor<?, f32>
-      } else {
-        %v2 = mo.sub(%x, %y) : (!mo.tensor<?, f32>, !mo.tensor<?, f32>
-                                  ) -> !mo.tensor<?, f32>
-        mo.yield %v2 : !mo.tensor<?, f32>
-      }
-    ```
-    """
-
-    def __init__(
-        self,
-        builder: max._core.OpBuilder,
-        location: Location,
-        results: Sequence[max._core.Type],
-        cond: max._core.Value,
-        output_param_decls: max._core.dialects.kgen.ParamDeclArrayAttr,
-    ) -> None: ...
-    @property
-    def cond(self) -> max._core.Value: ...
-    @property
-    def output_param_decls(
-        self,
-    ) -> Sequence[max._core.dialects.kgen.ParamDeclAttr]: ...
-    @output_param_decls.setter
-    def output_param_decls(
-        self, arg: max._core.dialects.kgen.ParamDeclArrayAttr, /
     ) -> None: ...
 
 class ShapeFromTensorOp(max._core.Operation):
@@ -1659,6 +1276,11 @@ class DistributedAllreduceSumOp(max._core.Operation):
     Allreduce takes in inputs each coming from a different device with
     the same shape as the final output and performs a sum reduction
     across the devices.
+
+    When `group_size` is set to a nonzero value smaller than the number of
+    inputs, contiguous runs of `group_size` devices form independent
+    allreduce groups (e.g. tensor-parallel groups under data parallelism);
+    shapes must then only match within each group.
     """
 
     def __init__(
@@ -1670,6 +1292,7 @@ class DistributedAllreduceSumOp(max._core.Operation):
         inputs: Sequence[max._core.Value[max._core.Type]],
         signal_buffers: Sequence[max._core.Value[max._core.Type]],
         in_chain: max._core.Value[ChainType],
+        group_size: max._core.dialects.builtin.IntegerAttr,
     ) -> None: ...
     @property
     def inputs(self) -> Sequence[max._core.Value[max._core.Type]]: ...
@@ -1677,6 +1300,12 @@ class DistributedAllreduceSumOp(max._core.Operation):
     def signal_buffers(self) -> Sequence[max._core.Value[max._core.Type]]: ...
     @property
     def in_chain(self) -> max._core.Value[ChainType]: ...
+    @property
+    def group_size(self) -> int: ...
+    @group_size.setter
+    def group_size(
+        self, arg: max._core.dialects.builtin.IntegerAttr, /
+    ) -> None: ...
 
 class AndOp(max._core.Operation):
     """
@@ -1853,78 +1482,6 @@ class ArgNonzeroOp(max._core.Operation):
     def output_param_decls(
         self, arg: max._core.dialects.kgen.ParamDeclArrayAttr, /
     ) -> None: ...
-
-class AssertOp(max._core.Operation):
-    """
-    Asserts that a single boolean value is true.
-
-    Currently bare assert operations are *not* used in MO graphs,
-    rather they are wrapped first in a KGEN MLIR op attr, a KGEN apply
-    attr and finally materialized as an actual operation via the KGENParamDeclare op.
-
-    In order to properly materialize assert logic for a particular op and ensure
-    the execution dependencies are properly tracked you must:
-
-    1. Create each individual assert via calls to AssertOp's emitStaticCall method
-    2. Supply all the asserts (really KGENParamDeclare ops) to the materializeAllAssertLogic
-       function which will handle linking the individual assertions together via !mo.chains
-       and materialize the remaining structures needed to properly track the execution
-       dependencies from the asserts to their compute op.
-
-    Example:
-
-    ```mlir
-    // When using emitStaticCall and materializeAllAssertLogic
-    %X: mo.tensor<[D1, D2]>,
-    %Y: mo.tensor<[D3, D4]>
-
-    ...
-
-    kgen.param.declare CH0:
-      <apply(:(i1) -> !mo.chain "mo.assert"{message = "Error 1" : !kgen.string}, eq(D1, D3))>
-
-    kgen.param.declare CH1:
-      <apply(:(!mo.chain, i1) -> !mo.chain "mo.assert"{message = "Error 2" : !kgen.string}, CH0, eq(D2, D4))>
-
-    %chain1 = mosh.param.to_value = <CH0>
-    %chain2 = mosh.param.to_value = <CH1>
-
-    %guard_chain = mo.chain.create(%chain1, %chain2)
-
-    %Xp, Yp = mo.guard[%guard_chain](%X, %Y)
-
-    ...
-
-    %Z = mo.op(%Xp, %Yp)
-    ```
-    """
-
-    @overload
-    def __init__(
-        self,
-        builder: max._core.OpBuilder,
-        location: Location,
-        chain: ChainType,
-        in_chain: max._core.Value[ChainType],
-        cond: max._core.Value,
-        message: max._core.dialects.builtin.TypedAttr,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        builder: max._core.OpBuilder,
-        location: Location,
-        cond: max._core.Value,
-        message: str,
-    ) -> None: ...
-    @property
-    def in_chain(self) -> max._core.Value[ChainType]: ...
-    @property
-    def cond(self) -> max._core.Value: ...
-    @property
-    def message(self) -> max._core.dialects.builtin.TypedAttr: ...
-    @message.setter
-    def message(self, arg: max._core.dialects.builtin.TypedAttr, /) -> None: ...
 
 class AtanhOp(max._core.Operation):
     """
@@ -2385,13 +1942,23 @@ class BroadcastToOp(max._core.Operation):
 
 class BufferCreateOp(max._core.Operation):
     """
-    This operation creates an uninitialized buffer with the specified shape and data type on a given device.
-    The buffer is not initialized with any values, and the operation is intended for use cases where the buffer
-    will be filled with data later in the computation.
+    This operation creates a buffer with the specified shape and data type on a given device.
+
+    By default the buffer is uninitialized and (re)allocated on every execution,
+    for use cases where it will be filled with data later in the computation.
+
+    When the optional `initValue` scalar attribute is set, the buffer instead
+    becomes persistent state: it is allocated once and filled with `initValue`
+    a single time during the model's `init` phase, and the same buffer is reused
+    across every `execute` call. This lets a kernel keep and mutate persistent
+    scratch state that is only initialized once (e.g. a counter buffer that a
+    kernel zeroes at the end of each invocation and expects to find zeroed on the
+    first call). `initValue` must have the same element type as the buffer.
 
     Example:
     ```mlir
     %buf = mo.buffer.create : !mo.buffer<[20, 20], f32, gpu:0>
+    %zeroed = mo.buffer.create { initValue = 0.0 : f32 } : !mo.buffer<[20, 20], f32, gpu:0>
     ```
     """
 
@@ -2399,8 +1966,13 @@ class BufferCreateOp(max._core.Operation):
         self,
         builder: max._core.OpBuilder,
         location: Location,
-        result: BufferType,
+        result: max._core.Type,
+        init_value: max._core.Attribute = ...,
     ) -> None: ...
+    @property
+    def init_value(self) -> max._core.Attribute | None: ...
+    @init_value.setter
+    def init_value(self, arg: max._core.Attribute, /) -> None: ...
 
 class BufferTransferOp(max._core.Operation):
     """
@@ -3791,6 +3363,9 @@ class DistributedEpDispatchMxfp4Op(max._core.Operation):
         n_gpus_per_node: max._core.dialects.builtin.IntegerAttr,
         n_nodes: max._core.dialects.builtin.IntegerAttr,
         fused_shared_expert: max._core.dialects.builtin.BoolAttr,
+        fuse_a_scale_preshuffle: max._core.dialects.builtin.BoolAttr,
+        max_padded_m: max._core.dialects.builtin.IntegerAttr,
+        mx_format: max._core.dialects.builtin.StringAttr,
     ) -> None: ...
     @property
     def input_tokens(self) -> Sequence[max._core.Value[max._core.Type]]: ...
@@ -3845,6 +3420,24 @@ class DistributedEpDispatchMxfp4Op(max._core.Operation):
     @fused_shared_expert.setter
     def fused_shared_expert(
         self, arg: max._core.dialects.builtin.BoolAttr, /
+    ) -> None: ...
+    @property
+    def fuse_a_scale_preshuffle(self) -> bool: ...
+    @fuse_a_scale_preshuffle.setter
+    def fuse_a_scale_preshuffle(
+        self, arg: max._core.dialects.builtin.BoolAttr, /
+    ) -> None: ...
+    @property
+    def max_padded_m(self) -> int: ...
+    @max_padded_m.setter
+    def max_padded_m(
+        self, arg: max._core.dialects.builtin.IntegerAttr, /
+    ) -> None: ...
+    @property
+    def mx_format(self) -> str: ...
+    @mx_format.setter
+    def mx_format(
+        self, arg: max._core.dialects.builtin.StringAttr, /
     ) -> None: ...
 
 class DistributedEpDispatchOp(max._core.Operation):
@@ -4255,6 +3848,7 @@ class GraphOp(max._core.Operation):
         builder: max._core.OpBuilder,
         location: Location,
         sym_name: max._core.dialects.builtin.StringAttr,
+        sym_visibility: max._core.dialects.builtin.StringAttr,
         signature: max._core.dialects.builtin.TypeAttr,
         function_type: max._core.dialects.builtin.TypeAttr,
         input_parameters: max._core.dialects.kgen.ParamDeclArrayAttr,
@@ -4277,6 +3871,12 @@ class GraphOp(max._core.Operation):
     def sym_name(self) -> str: ...
     @sym_name.setter
     def sym_name(
+        self, arg: max._core.dialects.builtin.StringAttr, /
+    ) -> None: ...
+    @property
+    def sym_visibility(self) -> str | None: ...
+    @sym_visibility.setter
+    def sym_visibility(
         self, arg: max._core.dialects.builtin.StringAttr, /
     ) -> None: ...
     @property
@@ -4376,59 +3976,6 @@ class GreaterOp(max._core.Operation):
     @property
     def input_y(self) -> max._core.Value[TensorType]: ...
 
-class GuardOp(max._core.Operation):
-    """
-    Consumes a mo.chain operation and a variadic number of inputs and is
-    semantically equivalent to a copy of the variadic inputs.
-
-    This can be used in conjunction with the !mo.chain returning ops
-    (currently only mo.assert) in order to set up execution dependencies
-    between the chain producing op and any appropriate downstream operations.
-
-    Example:
-
-    ```mlir
-      %X: !mo.tensor<[D1, D2], f32>
-      %Y: !mo.tensor<[D2, D3], f32>
-
-      %chain : !mo.chain
-
-      %guarded:2 = mo.guard[%chain](%X, %Y)
-
-      %z = mo.matmul(%guarded#0, %guarded#1)
-    ```
-    """
-
-    @overload
-    def __init__(
-        self,
-        builder: max._core.OpBuilder,
-        location: Location,
-        results: Sequence[max._core.Type],
-        chain: max._core.Value[ChainType],
-        inputs: Sequence[max._core.Value[max._core.Type]],
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        builder: max._core.OpBuilder,
-        location: Location,
-        chain: max._core.Value[ChainType],
-        inputs: Sequence[max._core.Value[max._core.Type]],
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        builder: max._core.OpBuilder,
-        location: Location,
-        operands: Sequence[max._core.Value[max._core.Type]],
-        attributes: max._core.dialects.builtin.DictionaryAttr = ...,
-    ) -> None: ...
-    @property
-    def chain(self) -> max._core.Value[ChainType]: ...
-    @property
-    def inputs(self) -> Sequence[max._core.Value[max._core.Type]]: ...
-
 class IndexToTensorOp(max._core.Operation):
     """
     Example:
@@ -4448,74 +3995,6 @@ class IndexToTensorOp(max._core.Operation):
     ) -> None: ...
     @property
     def input(self) -> max._core.Value: ...
-
-class InvokeShapeFuncOp(max._core.Operation):
-    """
-    Invokes a shape function with given name and bind its return values to the
-    output parameters. Each argument must be a shape-like or integer scalar
-    tensor. The `kgenParams` will be passed along to the shape function as is.
-
-    Example:
-
-    ```mlir
-      %input : !mo.tensor<[D1, D2], f32>
-      %axis  : !mo.tensor<[], si64>
-      %input_shape = mo.shape_of(%input)
-      : (!mo.tensor<[D1, D2], f32>) -> !mo.tensor<[2], si64>
-
-      mo.invoke_shape_func["shape_func_name"]<() -> D1, D2>(%input_shape, %axis)
-      : (!mo.tensor<[2], si64>, !mo.tensor<[], si64>)
-    ```
-
-    `dataDeptTensors` Is an instruction to the lowering that the inputs at
-    these indices should be treated as data dependent tensors. These tensors
-    include things like dynamic "axis" in reductions or "steps" in slice. Any
-    tensor which needs to have its values read to compute the shape for the op
-    falls into this category.
-    """
-
-    def __init__(
-        self,
-        builder: max._core.OpBuilder,
-        location: Location,
-        inputs: Sequence[max._core.Value[max._core.Type]],
-        shape_func_name: max._core.dialects.builtin.StringAttr,
-        output_param_decls: max._core.dialects.kgen.ParamDeclArrayAttr,
-        kgen_params: max._core.dialects.builtin.DictionaryAttr,
-        data_dept_tensors: max._core.dialects.builtin.ArrayAttr,
-    ) -> None: ...
-    @property
-    def inputs(self) -> Sequence[max._core.Value[max._core.Type]]: ...
-    @property
-    def shape_func_name(self) -> str: ...
-    @shape_func_name.setter
-    def shape_func_name(
-        self, arg: max._core.dialects.builtin.StringAttr, /
-    ) -> None: ...
-    @property
-    def output_param_decls(
-        self,
-    ) -> Sequence[max._core.dialects.kgen.ParamDeclAttr]: ...
-    @output_param_decls.setter
-    def output_param_decls(
-        self, arg: max._core.dialects.kgen.ParamDeclArrayAttr, /
-    ) -> None: ...
-    @property
-    def kgen_params(
-        self,
-    ) -> max._core.dialects.builtin.DictionaryAttr | None: ...
-    @kgen_params.setter
-    def kgen_params(
-        self, arg: max._core.dialects.builtin.DictionaryAttr, /
-    ) -> None: ...
-    @property
-    def data_dept_tensors(
-        self,
-    ) -> max._core.dialects.builtin.ArrayAttr | None: ...
-    @data_dept_tensors.setter
-    def data_dept_tensors(
-        self, arg: max._core.dialects.builtin.ArrayAttr, /
-    ) -> None: ...
 
 class IsInfOp(max._core.Operation):
     """
@@ -4604,35 +4083,6 @@ class ReduceLayerNormOp(max._core.Operation):
     @output_param_decls.setter
     def output_param_decls(
         self, arg: max._core.dialects.kgen.ParamDeclArrayAttr, /
-    ) -> None: ...
-
-class LayoutTransformOp(max._core.Operation):
-    """
-    This op transforms the layout of input tensor to the layout specified in
-    the output type. The `kgenParams` will be passed along as named parameters
-    to the underlying mojo kernel.
-
-    It requires both the input and output tensor types to contain layout
-    annotations.
-    """
-
-    def __init__(
-        self,
-        builder: max._core.OpBuilder,
-        location: Location,
-        result: TensorType,
-        input: max._core.Value[TensorType],
-        kgen_params: max._core.dialects.builtin.DictionaryAttr,
-    ) -> None: ...
-    @property
-    def input(self) -> max._core.Value[TensorType]: ...
-    @property
-    def kgen_params(
-        self,
-    ) -> max._core.dialects.builtin.DictionaryAttr | None: ...
-    @kgen_params.setter
-    def kgen_params(
-        self, arg: max._core.dialects.builtin.DictionaryAttr, /
     ) -> None: ...
 
 class Log1pOp(max._core.Operation):
@@ -7997,27 +7447,6 @@ class UnsqueezeShapeOp(max._core.Operation):
         self, arg: max._core.dialects.kgen.ParamDeclArrayAttr, /
     ) -> None: ...
 
-class WhileConditionOp(max._core.Operation):
-    """
-    This op takes the continuation condition of the parent `mo.while`. The op
-    takes variable number of operands which must match the operands of the
-    parent `mo.while`.
-
-    See the mo.while operation for an example.
-    """
-
-    def __init__(
-        self,
-        builder: max._core.OpBuilder,
-        location: Location,
-        condition: max._core.Value[TensorType],
-        args: Sequence[max._core.Value[max._core.Type]],
-    ) -> None: ...
-    @property
-    def condition(self) -> max._core.Value[TensorType]: ...
-    @property
-    def args(self) -> Sequence[max._core.Value[max._core.Type]]: ...
-
 class XorOp(max._core.Operation):
     """
     Returns `x xor y`, where `x` and `y` are input boolean tensors.
@@ -8083,56 +7512,5 @@ class YieldOp(max._core.Operation):
         self, arg: max._core.dialects.kgen.ParameterExprArrayAttr, /
     ) -> None: ...
 
-class WhileOp(max._core.Operation):
-    """
-    The `mo.while` operation takes "cond" and "body" blocks. While the "cond"
-    block evaluates to the true condition, the "body" block is executed.
-
-    The "cond" and "body" blocks have access to both the values listed in the
-    `mo.while` signature and any other outer values.
-
-    - The "cond" block must return a `!mo.tensor<[], bool>` result
-    followed by values whose types match the inputs of the `mo.while` signature.
-
-    - The "body" block must return results with the same types as the `mo.while`
-    signature, again using a `mo.yield`. The signature must include an "as"
-    clause for every input so as to rename it to a fresh symbol.
-
-    The results of the `mo.while` op are the operands of the
-    `mo.while.condition` op when the condition operand evaluates to false.
-
-    Example:
-
-    ```mlir
-      %x: !mo.tensor<[2], f32>
-      %y: !mo.tensor<[], f32>
-      %res = mo.while (%x as %inner_x: !mo.tensor<[2], f32>) {
-        %zero = mo.constant {device = #M.device_ref<"cpu", 0>, value = #M.dense_array<0> : tensor<1xsi64>} : !mo.tensor<[], si64>
-        %shape = mo.constant {device = #M.device_ref<"cpu", 0>, value = #M.dense_array<> : tensor<0xsi64>} : !mo.tensor<[0], si64>
-        %mean0 = mo.mean (%inner_x, %zero) : (!mo.tensor<[2], f32>, !mo.tensor<[], si64>) -> !mo.tensor<[1], f32>
-        %mean1 = mo.reshape (%mean0, %shape) : (!mo.tensor<[1], f32>, !mo.tensor<[0], si64>) -> !mo.tensor<[], f32>
-        %cond = mo.greater (%y, %mean1) : (!mo.tensor<[], f32>, !mo.tensor<[], f32>) -> !mo.tensor<[], bool>
-        mo.while.condition(%cond) %inner_x : !mo.tensor<[2], f32>
-      } do {
-        %new_x = mo.add(%inner_x, %inner_x) : !mo.tensor<[2], f32>
-        mo.yield %new_x : !mo.tensor<[2], f32>
-      }
-      %res: !mo.tensor<[2], f32>
-    ```
-    """
-
-    def __init__(
-        self,
-        builder: max._core.OpBuilder,
-        location: Location,
-        results: Sequence[max._core.Type],
-        inputs: Sequence[max._core.Value[max._core.Type]],
-    ) -> None: ...
-    @property
-    def inputs(self) -> Sequence[max._core.Value[max._core.Type]]: ...
-
-class ParamExprBuilder:
-    pass
-
-class ShapeMaterializeResult:
-    pass
+class ParamExprBuilder: ...
+class ShapeMaterializeResult: ...

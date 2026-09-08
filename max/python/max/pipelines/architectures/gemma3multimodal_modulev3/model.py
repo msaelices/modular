@@ -34,9 +34,10 @@ from max.pipelines.lib import (
     KVCacheConfig,
     ModelInputs,
     ModelOutputs,
+    ModuleV3MultiGraphPipelineModelWithKVCache,
     PipelineConfig,
-    PipelineModelWithKVCache,
 )
+from max.pipelines.lib.memory_estimation import MemoryPlan
 from transformers import AutoConfig
 
 from .batch_processor import Gemma3MultiModalModuleV3BatchProcessor
@@ -69,7 +70,7 @@ class Gemma3MultiModalModelInputs(ModelInputs):
 
 
 class Gemma3MultiModalModelV3(
-    PipelineModelWithKVCache[TextAndVisionContext],
+    ModuleV3MultiGraphPipelineModelWithKVCache[TextAndVisionContext],
 ):
     """Gemma 3 multimodal pipeline model using the ModuleV3 API."""
 
@@ -79,7 +80,7 @@ class Gemma3MultiModalModelV3(
     ] = Gemma3MultiModalModuleV3BatchProcessor
 
     language_model: Callable[..., Any]
-    vision_model: Callable[..., Any]
+    vision_model: Callable[..., Any] | None
 
     def __init__(
         self,
@@ -88,6 +89,8 @@ class Gemma3MultiModalModelV3(
         devices: list[Device],
         kv_cache_config: KVCacheConfig,
         weights: Weights,
+        *,
+        memory_plan: MemoryPlan,
         adapter: WeightsAdapter | None = None,
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
         max_batch_size: int = 1,
@@ -99,11 +102,12 @@ class Gemma3MultiModalModelV3(
             devices,
             kv_cache_config,
             weights,
-            adapter,
-            return_logits,
+            adapter=adapter,
+            return_logits=return_logits,
+            memory_plan=memory_plan,
         )
 
-        self.vision_model, self.language_model = self._load_models()
+        self.vision_model, self.language_model = self.load_model()
 
     @classmethod
     def get_num_layers(cls, huggingface_config: AutoConfig) -> int:
@@ -111,31 +115,40 @@ class Gemma3MultiModalModelV3(
             huggingface_config
         )
 
-    def _load_models(self) -> tuple[Callable[..., Any], Callable[..., Any]]:
-        """Loads vision and language models using the ModuleV3 API."""
+    def _load_state_dict(self) -> dict[str, Any]:
         assert self._max_batch_size, "Expected max_batch_size to be set"
 
         weights_dict = dict(self.weights.items())
-        language_weights_dict = convert_safetensor_language_state_dict(
+        self._language_weights_dict = convert_safetensor_language_state_dict(
             weights_dict
         )
-        vision_weights_dict = convert_safetensor_vision_state_dict(weights_dict)
+        self._vision_weights_dict = convert_safetensor_vision_state_dict(
+            weights_dict
+        )
+        return {k: v.data() for k, v in weights_dict.items()}
 
-        raw_state_dict = {k: v.data() for k, v in weights_dict.items()}
+    def _create_model_config(
+        self, state_dict: dict[str, Any]
+    ) -> Gemma3ForConditionalGenerationConfig:
+        assert self._max_batch_size, "Expected max_batch_size to be set"
+
         model_config = Gemma3ForConditionalGenerationConfig.initialize(
-            self.pipeline_config
+            self.pipeline_config, max_seq_len=self.max_seq_len
         )
         model_config.finalize(
             huggingface_config=self.huggingface_config,
-            state_dict=raw_state_dict,
+            state_dict=state_dict,
             return_logits=self.return_logits,
         )
         self.config = model_config
+        return model_config
 
+    def _compile_vision_model(
+        self,
+        model_config: Gemma3ForConditionalGenerationConfig,
+        state_dict: dict[str, Any],
+    ) -> Callable[..., Any]:
         device_ref = DeviceRef.from_device(self.devices[0])
-        n_devices = len(self.devices)
-
-        mesh = DeviceMesh(tuple(self.devices), (n_devices,), ("tp",))
 
         # ---- Build and compile vision model ----
         with F.lazy():
@@ -153,10 +166,20 @@ class Gemma3MultiModalModelV3(
             device=device_ref,
         )
 
-        compiled_vision = vision_nn.compile(
+        return vision_nn.compile(
             pixel_values_type,
-            weights=vision_weights_dict,
+            weights=state_dict,
         )
+
+    def _compile_language_model(
+        self,
+        model_config: Gemma3ForConditionalGenerationConfig,
+        state_dict: dict[str, Any],
+    ) -> Callable[..., Any]:
+        device_ref = DeviceRef.from_device(self.devices[0])
+        n_devices = len(self.devices)
+
+        mesh = DeviceMesh(tuple(self.devices), (n_devices,), ("tp",))
 
         # ---- Build and compile language model ----
         with F.lazy():
@@ -174,12 +197,10 @@ class Gemma3MultiModalModelV3(
             )
         )
 
-        compiled_language = language_nn.compile(
+        return language_nn.compile(
             *language_input_types,
-            weights=language_weights_dict,
+            weights=state_dict,
         )
-
-        return compiled_vision, compiled_language
 
     def execute(self, model_inputs: ModelInputs) -> ModelOutputs:
         model_inputs = cast(Gemma3MultiModalModelInputs, model_inputs)
@@ -187,6 +208,7 @@ class Gemma3MultiModalModelV3(
         image_embeddings: Buffer
         image_token_indices: Buffer
         if model_inputs.has_vision_inputs:
+            assert self.vision_model is not None
             assert model_inputs.pixel_values is not None
 
             vision_output = self.vision_model(model_inputs.pixel_values)

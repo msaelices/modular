@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-from std.collections.string.string_slice import get_static_string
+from std.collections.string.string_span import get_static_string
 from std.os import abort, getenv
 from std.pathlib import Path
 from std.sys import argv, size_of
@@ -24,8 +24,8 @@ from std.ffi import (
 )
 from std.sys.info import CompilationTarget, is_nvidia_gpu
 
-from std.gpu.host import DeviceContext
-from std.gpu.host._nvidia_cuda import CUmodule, CUstream
+from max.gpu.host import DeviceContext
+from max.gpu.host._nvidia_cuda import CUmodule, CUstream
 
 from ._mpi import MPI_Comm_rank, MPI_Init, MPIComm, get_mpi_comm_world
 from .shmem_api import SHMEMScope
@@ -56,7 +56,8 @@ def _init_nvshmem_dylib() -> OwnedDLHandle:
     #   export MODULAR_SHMEM_LIB_DIR="/path/to/venv/lib"
     # will dlopen the library from:
     #   /path/to/venv/lib/libnvshmem_host.so.3
-    if dir_name := getenv("MODULAR_SHMEM_LIB_DIR"):
+    var dir_name = getenv("MODULAR_SHMEM_LIB_DIR")
+    if dir_name:
         lib = String(Path(dir_name) / lib)
     try:
         return OwnedDLHandle(path=lib)
@@ -168,7 +169,7 @@ struct NVSHMEMXInitAttr[origin: MutOrigin]:
 struct NVSHMEMXInitArgs:
     var version: c_int
     var uid_args: NVSHMEMXUniqueIDArgs
-    var content: InlineArray[Byte, 96]
+    var content: Array[Byte, 96]
 
     def __init__(out self):
         comptime assert (
@@ -176,7 +177,7 @@ struct NVSHMEMXInitArgs:
         ), "NVSHMEMXInitArgs must be 128 bytes"
         self.version = c_int((1 << 16) + size_of[NVSHMEMXInitArgs]())
         self.uid_args = NVSHMEMXUniqueIDArgs()
-        self.content = InlineArray[Byte, 96](fill=0)
+        self.content = Array[Byte, 96](fill=0)
 
 
 struct NVSHMEMXUniqueIDArgs:
@@ -198,14 +199,14 @@ struct NVSHMEMXUniqueIDArgs:
 
 struct NVSHMEMXUniqueID:
     var version: c_int
-    var internal: InlineArray[Byte, 124]
+    var internal: Array[Byte, 124]
 
     def __init__(out self):
         comptime assert (
             size_of[Self]() == 128
         ), "nvshmemx_uniqueid_t must be 128 bytes"
         self.version = c_int((1 << 16) + size_of[NVSHMEMXUniqueID]())
-        self.internal = InlineArray[Byte, 124](fill=0)
+        self.internal = Array[Byte, 124](fill=0)
 
 
 def _get_prefix[scope: SHMEMScope]() -> StaticString:
@@ -259,31 +260,31 @@ def _dtype_to_nvshmem_type[
     ptrdiff_t            ptrdiff       64
     """
 
-    comptime if dtype == DType.float16:
+    comptime if dtype == .float16:
         return get_static_string[prefix, "half", suffix, scope]()
-    elif dtype == DType.bfloat16:
+    elif dtype == .bfloat16:
         return get_static_string[prefix, "bfloat16", suffix, scope]()
-    elif dtype == DType.float32:
+    elif dtype == .float32:
         return get_static_string[prefix, "float", suffix, scope]()
-    elif dtype == DType.float64:
+    elif dtype == .float64:
         return get_static_string[prefix, "double", suffix, scope]()
-    elif dtype == DType.int8:
+    elif dtype == .int8:
         return get_static_string[prefix, "int8", suffix, scope]()
-    elif dtype == DType.uint8:
+    elif dtype == .uint8:
         return get_static_string[prefix, "uint8", suffix, scope]()
-    elif dtype == DType.int16:
+    elif dtype == .int16:
         return get_static_string[prefix, "int16", suffix, scope]()
-    elif dtype == DType.uint16:
+    elif dtype == .uint16:
         return get_static_string[prefix, "uint16", suffix, scope]()
-    elif dtype == DType.int32:
+    elif dtype == .int32:
         return get_static_string[prefix, "int32", suffix, scope]()
-    elif dtype == DType.uint32:
+    elif dtype == .uint32:
         return get_static_string[prefix, "uint32", suffix, scope]()
-    elif dtype == DType.int64:
+    elif dtype == .int64:
         return get_static_string[prefix, "int64", suffix, scope]()
-    elif dtype == DType.uint64:
+    elif dtype == .uint64:
         return get_static_string[prefix, "uint64", suffix, scope]()
-    elif dtype == DType.int:
+    elif dtype == .int:
         return get_static_string[prefix, "size", suffix, scope]()
     else:
         CompilationTarget.unsupported_target_error[

@@ -28,6 +28,7 @@ embedding before a single MHA attention block. Layout matches
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -61,6 +62,7 @@ from max.nn.transformer.distributed_transformer import (
     extract_hs,
     forward_sharded_layers,
 )
+from max.nn.transformer.transformer import fuse_captured_hidden_states
 
 
 @dataclass(kw_only=True)
@@ -107,6 +109,9 @@ class Eagle3MHADraftConfig:
     return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN
     return_hidden_states: ReturnHiddenStates = ReturnHiddenStates.NONE
 
+    sampling_logits_dtype: DType = DType.float32
+    """Dtype exposed to the sampling consumer."""
+
     fc_norm: bool = False
     """Apply a separate RMSNorm to each captured target hidden-state chunk
     before the ``fc`` fusion (EAGLE3 ``fc_norm: true``). The chunks come from
@@ -115,17 +120,119 @@ class Eagle3MHADraftConfig:
     draft."""
 
 
+def _sampling_logits_output(
+    logits: TensorValue, output_dtype: DType
+) -> TensorValue:
+    """Returns LM-head logits in the dtype their sampling consumer requires."""
+    if output_dtype in (DType.bfloat16, DType.float16):
+        assert logits.dtype == output_dtype, (
+            f"native {output_dtype} sampling logits require an LM-head output "
+            f"of the same dtype, got {logits.dtype}"
+        )
+        return logits
+    if output_dtype != DType.float32:
+        raise ValueError(
+            "Eagle3 MHA draft sampling logits must be float32, bfloat16 or "
+            f"float16, got {output_dtype}"
+        )
+    return ops.cast(logits, DType.float32)
+
+
+def project_captured_hidden_states(
+    captures_per_device: Sequence[Sequence[TensorValue]],
+    *,
+    fc_norm_shards: Sequence[Sequence[Callable[[TensorValue], TensorValue]]]
+    | None,
+    fc_shards: Sequence[Callable[[TensorValue], TensorValue]],
+) -> list[TensorValue]:
+    """Applies the per-capture ``fc_norm``, then the ``fc`` fusion."""
+    num_devices = len(captures_per_device)
+    num_captures = len(captures_per_device[0])
+    per_capture = [
+        [captures_per_device[d][j] for d in range(num_devices)]
+        for j in range(num_captures)
+    ]
+    if fc_norm_shards is not None:
+        per_capture = [
+            forward_sharded_layers(fc_norm_shards[j], per_capture[j])
+            for j in range(num_captures)
+        ]
+    fused = fuse_captured_hidden_states(
+        [
+            [per_capture[j][d] for j in range(num_captures)]
+            for d in range(num_devices)
+        ]
+    )
+    return forward_sharded_layers(fc_shards, fused)
+
+
 class Eagle3MHADraft(Module):
     """Eagle3 MHA draft over a DeepseekV3-shaped MLA target.
 
-    The ``__call__`` contract mirrors :class:`Eagle3MLADraft` so the unified
-    graph can swap drafts without changing the call site:
+    Build the draft from an :class:`Eagle3MHADraftConfig`. The pipeline
+    constructs this config from the draft checkpoint at load time:
 
     .. code-block:: python
 
+        from max.driver import Accelerator, accelerator_count
+        from max.dtype import DType
+        from max.graph import DeviceRef
+        from max.nn.kv_cache import MHAKVCacheParams
+        from max.pipelines.architectures.eagle_common.eagle_mha_draft import (
+            Eagle3MHADraft,
+            Eagle3MHADraftConfig,
+        )
+
+        # Eagle3MHADraft builds an Allreduce across its devices, so it needs
+        # at least one accelerator.
+        if accelerator_count() > 0:
+            devices = [DeviceRef.from_device(Accelerator())]
+            config = Eagle3MHADraftConfig(
+                hidden_size=512,
+                num_attention_heads=8,
+                num_key_value_heads=8,
+                head_dim=64,
+                intermediate_size=1024,
+                vocab_size=32000,
+                rms_norm_eps=1e-5,
+                rope_theta=10000.0,
+                max_position_embeddings=2048,
+                devices=devices,
+                data_parallel_degree=1,
+                dtype=DType.float32,
+                norm_dtype=DType.float32,
+                kv_params=MHAKVCacheParams(
+                    dtype=DType.float32,
+                    n_kv_heads=8,
+                    head_dim=64,
+                    num_layers=1,
+                    devices=devices,
+                    page_size=128,
+                ),
+                rope_scaling={
+                    "factor": 1.0,
+                    "original_max_position_embeddings": 2048,
+                    "beta_fast": 32.0,
+                    "beta_slow": 1.0,
+                    "mscale": 1.0,
+                    "mscale_all_dim": 1.0,
+                },
+                fc_input_multiplier=2,
+            )
+            draft = Eagle3MHADraft(config)
+
+    A forward pass is a symbolic graph build inside a
+    :class:`~max.graph.Graph`. Its ``__call__`` contract mirrors
+    :class:`Eagle3MLADraft` so the unified graph can swap drafts without
+    changing the call site, invoked with the per-device tensors the target
+    produces:
+
+    .. code-block:: text
+
         draft(
             tokens,
-            fused_target_hs,        # per-device list[TensorValue]
+            fused_target_hs,        # per-device list[TensorValue] or
+                                    # list[list[TensorValue]]
             signal_buffers,
             kv_collections,         # per-device list[PagedCacheValues]
             return_n_logits,
@@ -135,6 +242,8 @@ class Eagle3MHADraft(Module):
             batch_context_lengths,
             split_prefix=...,
         )
+
+    See :meth:`__call__` for the full argument types.
     """
 
     def __init__(
@@ -164,6 +273,11 @@ class Eagle3MHADraft(Module):
         device0 = devices[0]
         dtype = config.dtype
         norm_dtype = config.norm_dtype
+
+        assert config.fc_input_multiplier > 1, (
+            f"fc_input_multiplier must be at least 2, got "
+            f"{config.fc_input_multiplier}"
+        )
 
         self.dp_degree = config.data_parallel_degree
         assert num_devices % self.dp_degree == 0, (
@@ -404,12 +518,14 @@ class Eagle3MHADraft(Module):
 
         self.return_logits = config.return_logits
         self.return_hidden_states = config.return_hidden_states
+        self.sampling_logits_dtype = config.sampling_logits_dtype
         self.logits_scaling = 1.0
 
     def __call__(
         self,
         tokens: TensorValue,
-        fused_target_hs: list[TensorValue],
+        fused_target_hs: Sequence[TensorValue]
+        | Sequence[Sequence[TensorValue]],
         signal_buffers: list[BufferValue],
         kv_collections: list[PagedCacheValues],
         return_n_logits: TensorValue,
@@ -428,34 +544,32 @@ class Eagle3MHADraft(Module):
         devices = config.devices
         num_devices = len(devices)
 
-        fused_hs: list[TensorValue] = list(fused_target_hs)
-        if fused_hs[0].shape[-1] != config.hidden_size:
-            # Step 0 only (fused input is ``fc_input_multiplier * hidden``).
-            # Normalize each captured chunk before fusing, matching the draft's
-            # training-time ``fc_norm``.
-            if self.fc_norm is not None:
-                h = config.hidden_size
-                normed_chunks = [
-                    forward_sharded_layers(
-                        self.fc_norm_shards[j],
-                        [
-                            fused_hs[d][:, j * h : (j + 1) * h]
-                            for d in range(num_devices)
-                        ],
-                    )
-                    for j in range(config.fc_input_multiplier)
-                ]
-                fused_hs = [
-                    ops.concat(
-                        [
-                            normed_chunks[j][d]
-                            for j in range(len(normed_chunks))
-                        ],
-                        axis=-1,
-                    )
-                    for d in range(num_devices)
-                ]
-            fused_hs = forward_sharded_layers(self.fc_shards, fused_hs)
+        # Wrap a bare per-device hidden so capture count identifies the step.
+        captures_per_dev: list[list[TensorValue]] = []
+        for per_device in fused_target_hs:
+            if isinstance(per_device, TensorValue):
+                captures_per_dev.append([per_device])
+            else:
+                captures_per_dev.append(list(per_device))
+        assert len(captures_per_dev) == num_devices, (
+            f"expected {num_devices} per-device hidden states, got "
+            f"{len(captures_per_dev)}"
+        )
+        counts = {len(c) for c in captures_per_dev}
+        assert counts in ({1}, {config.fc_input_multiplier}), (
+            f"every device must carry 1 hidden state or all "
+            f"{config.fc_input_multiplier} captures, got {sorted(counts)}"
+        )
+        if counts != {1}:
+            fused_hs = project_captured_hidden_states(
+                captures_per_dev,
+                fc_norm_shards=self.fc_norm_shards
+                if self.fc_norm is not None
+                else None,
+                fc_shards=self.fc_shards,
+            )
+        else:
+            fused_hs = [c[0] for c in captures_per_dev]
 
         h_embed = self.embed_tokens(tokens, signal_buffers)
 
@@ -588,6 +702,17 @@ class Eagle3MHADraft(Module):
             ]
             fused_hs = [
                 ops.rebind(fused_hs[i], [common_dim, config.hidden_size])
+                for i in range(num_devices)
+            ]
+            # Pure TP (EP): every rank holds the same replicated sequence, so
+            # the per-device row offsets (distinct symbolic names from the
+            # caller's per-device broadcast/range) are runtime-identical. Bind
+            # them to one shared dim so the last-token gather yields a matching
+            # row count on every rank; otherwise the vocab-parallel lm_head
+            # allgather rejects the mismatched per-device symbols.
+            common_offsets_dim = f"{split_prefix}_offsets_len"
+            input_row_offsets_ = [
+                ops.rebind(input_row_offsets_[i], [common_offsets_dim])
                 for i in range(num_devices)
             ]
 
@@ -731,9 +856,9 @@ class Eagle3MHADraft(Module):
         norm_last_token = forward_sharded_layers(
             self.norm_shards, last_token_distributed
         )
-        last_logits = ops.cast(
+        last_logits = _sampling_logits_output(
             self.lm_head(norm_last_token, signal_buffers)[0],
-            DType.float32,
+            self.sampling_logits_dtype,
         )
 
         ret_val: tuple[TensorValue, ...] = (last_logits,)
@@ -780,12 +905,12 @@ class Eagle3MHADraft(Module):
                     variable_per_dev, signal_buffers
                 )
 
-            variable_logits = ops.cast(
+            variable_logits = _sampling_logits_output(
                 self.lm_head(
                     forward_sharded_layers(self.norm_shards, variable_per_dev),
                     signal_buffers,
                 )[0],
-                DType.float32,
+                self.sampling_logits_dtype,
             )
             logit_offsets = ops.range(
                 0,

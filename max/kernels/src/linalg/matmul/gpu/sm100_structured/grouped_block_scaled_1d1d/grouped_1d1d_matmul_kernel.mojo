@@ -44,7 +44,7 @@ from std.memory import Pointer, UnsafePointer, bitcast
 from std.math.uutils import ufloordiv, umod
 from std.sys import align_of, size_of
 
-from std.gpu import (
+from max.gpu import (
     WARP_SIZE,
     block_id_in_cluster,
     block_idx,
@@ -53,38 +53,39 @@ from std.gpu import (
     lane_id,
     warp_id as get_warp_id,
 )
-from std.gpu.memory import (
-    AddressSpace,
+from max.gpu.memory import (
     async_copy,
     external_memory,
     fence_mbarrier_init,
 )
-from std.gpu.primitives.grid_controls import (
+from max.gpu.primitives.grid_controls import (
     PDLLevel,
     launch_dependent_grids,
     wait_on_dependent_grids,
 )
-import std.gpu.primitives.warp as warp
-from std.gpu.primitives.cluster import (
+import max.gpu.primitives.warp as warp
+from max.gpu.primitives.cluster import (
     block_rank_in_cluster,
     cluster_sync,
     elect_one_sync,
     elect_one_sync_with_mask,
 )
-from std.gpu.sync import async_copy_arrive, syncwarp
-from std.gpu.compute.arch.tcgen05 import (
+from max.gpu.sync import async_copy_arrive, syncwarp
+from max.gpu.compute.arch.tcgen05 import (
     tcgen05_fence_before,
     tcgen05_st,
     tcgen05_store_wait,
 )
 from layout.tma_async import PipelineState
-from std.gpu.host.nvidia.tma import TensorMapSwizzle
+from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from layout import (
     Coord,
     Idx,
     Layout,
+    DefaultEngine,
     RowMajorLayout,
     TensorLayout,
+    TensorEngine,
     TileTensor,
     row_major,
 )
@@ -111,6 +112,8 @@ from linalg.fp4_utils import (
     SF_ATOM_K,
     SF_ATOM_M,
     SF_MN_GROUP_SIZE,
+    _is_packed_fp4,
+    block_scaled_operands_compatible,
     cast_fp32_to_fp4e2m1,
     set_scale_factor,
 )
@@ -121,6 +124,7 @@ from ..structured_kernels.config import (
     OutputPipelineConfig,
 )
 from structured_kernels.kernel_common import (
+    MbarPtr,
     WarpRole1D1D,
     compute_tma_tile_dims,
     compute_accum_barrier_counts,
@@ -184,21 +188,21 @@ recorded; stage 0 is representative since stages have uniform cost).
 Slot encoding for output tile i (i in [0, SWIGLU_MAX_TRACED_TILES)):
 
   Base events (offset 9*i + 0..8):
-    9*i + 0 = T_LOAD_DISPATCH (load warp, top of outer tile loop —
+    9*i + 0 = T_LOAD_DISPATCH (load warp, top of outer tile loop:
                                 BEFORE producer-pipeline acquire;
                                 marks when the warp is dispatched to
                                 attempt this tile)
-    9*i + 1 = T_LOAD_START    (AFTER producer.acquire returns —
+    9*i + 1 = T_LOAD_START    (AFTER producer.acquire returns:
                                 marks real-work begin; gap to
                                 DISPATCH = pipeline-hazard wait)
     9*i + 2 = T_LOAD_END      (after the LAST k-tile's TMA issue)
     9*i + 3 = T_MMA_DISPATCH  (MMA warp, top of outer tile loop;
                                 leader CTA only)
     9*i + 4 = T_MMA_START     (AFTER both output- and input-pipeline
-                                acquires — first mma is about to fire)
+                                acquires; first mma is about to fire)
     9*i + 5 = T_MMA_END       (after the LAST mma issue + commit)
     9*i + 6 = T_EPI_DISPATCH  (epi warp, top of outer tile loop)
-    9*i + 7 = T_EPI_START     (AFTER consumer-pipeline acquire —
+    9*i + 7 = T_EPI_START     (AFTER consumer-pipeline acquire:
                                 accumulator ready, body about to start)
     9*i + 8 = T_EPI_END       (after Self.epilogue returns)
 
@@ -235,7 +239,7 @@ Slot encoding for output tile i (i in [0, SWIGLU_MAX_TRACED_TILES)):
                                   SFB-load barrier wait.)
 
 Issue latency = T_X_START − T_X_DISPATCH for X in {LOAD, MMA, EPI}.
-This is the wait at the acquire — the warp wanted to begin tile i but
+This is the wait at the acquire: the warp wanted to begin tile i but
 had to block on a pipeline slot. A near-zero issue latency means the
 pipeline is well-fed; a large one means the warp is starved.
 
@@ -312,13 +316,26 @@ trait SwiGLUOutput(DevicePassable, TrivialRegisterPassable):
     comptime ClampActivation: Bool
 
     def store_packed_byte(self, m: Int, byte_pos: Int, val: UInt8):
-        """Store one output byte at GMEM (m, byte_pos)."""
+        """Store one output byte at GMEM (m, byte_pos).
+
+        Args:
+            m: Row index in the packed output tensor.
+            byte_pos: Byte offset within the row.
+            val: Byte value to store.
+        """
         ...
 
     def store_packed_word(self, m: Int, byte_pos: Int, val: UInt32):
         """Store one 4-byte word at GMEM (m, byte_pos). `byte_pos` and
         the row stride must both be 4-byte aligned so this emits one
-        ST.GLOBAL.B32 vs four scalar byte stores."""
+        ST.GLOBAL.B32 vs four scalar byte stores.
+
+        Args:
+            m: Row index in the packed output tensor.
+            byte_pos: Byte offset within the row; must be a multiple of
+                4.
+            val: 4-byte word value to store.
+        """
         ...
 
     def set_sf(
@@ -327,12 +344,24 @@ trait SwiGLUOutput(DevicePassable, TrivialRegisterPassable):
         post_col: Int,
         sf: Scalar[Self.SfDtype],
     ):
-        """Set the per-(m, post_col) FP8 scale factor."""
+        """Set the per-(m, post_col) FP8 scale factor.
+
+        Args:
+            m: Row index in the output (M dimension).
+            post_col: Column index in the post-SwiGLU output (N
+                dimension).
+            sf: Scale factor value to store.
+        """
         ...
 
     def input_scale(self, active_expert_idx: Int) -> Float32:
         """Read per-active-expert input scale (`tensor_sf` in ep_comm).
-        Unused for MXFP8 (gated out by the kernel)."""
+        Unused for MXFP8 (gated out by the kernel).
+
+        Args:
+            active_expert_idx: Index into the per-active-expert input
+                scales array.
+        """
         ...
 
     def clamp_alpha(self) -> Float32:
@@ -357,7 +386,17 @@ trait SwiGLUOutput(DevicePassable, TrivialRegisterPassable):
         channels, distributed over `stride` threads keyed by `tid`.
 
         Called once per expert, on the CTA that processed the last live
-        tile, so the host doesn't need to memset the SF buffer."""
+        tile, so the host doesn't need to memset the SF buffer.
+
+        Args:
+            sf_block_base: Row offset of this expert's SF block within
+                the global SF buffer.
+            tokens_e: Number of live (non-padded) token rows for this
+                expert.
+            tid: Thread id used to distribute the zero-writes across
+                threads.
+            stride: Number of threads participating in the zero-fill.
+        """
         ...
 
 
@@ -370,6 +409,18 @@ struct NullSwiGLUOutput[
 
     Parametric so the kernel's comptime trait bound matches the
     dispatch's wiring; defaults are NVFP4 + plain SwiGLU.
+
+    Parameters:
+        _sf_dtype: `DType` of the per-block scale factors; `NVFP4_SF_DTYPE`
+            for NVFP4 or `MXFP8_SF_DTYPE` for MXFP8 (defaults to
+            `NVFP4_SF_DTYPE`).
+        _sf_vector_size: Number of output elements covered by each scale
+            factor; 16 for NVFP4, 32 for MXFP8 (defaults to
+            `NVFP4_SF_VECTOR_SIZE`).
+        _clamp_activation: When `True`, enables the clamped SwiGLU
+            activation; unused on this no-op struct but kept so the
+            trait bound matches the dispatch wiring (defaults to
+            `False`).
     """
 
     comptime SfDtype = Self._sf_dtype
@@ -440,10 +491,28 @@ struct RealSwiGLUOutput[
     """Carries the three GMEM destinations (packed output, 5D SF tile,
     per-expert input scales) as raw pointers + comptime shape info.
 
-    Raw `UnsafePointer`s rather than `TileTensor`s sidestep a callsite
+    Raw `Pointer`s rather than `TileTensor`s sidestep a callsite
     type mismatch (TileTensor has many implicit parameters). `set_sf`
     inlines the 5D SF index. Layout is the same for NVFP4 and MXFP8,
     only the SF_VECTOR_SIZE divisor differs.
+
+    Parameters:
+        c_packed_row_stride: Output row stride in bytes; `H/2` for
+            NVFP4 (two nibbles per byte) and `H` for MXFP8 (one
+            element per byte).
+        sf_dim1: Second dimension of the 5D SF tile
+            `(m_groups, sf_dim1, 32, 4, 4)`, equal to the number of
+            scale-factor blocks per output row; used by `set_sf` to
+            index the linearized SF buffer.
+        _sf_dtype: `DType` of the per-block scale factors; `NVFP4_SF_DTYPE`
+            for NVFP4 or `MXFP8_SF_DTYPE` for MXFP8 (defaults to
+            `NVFP4_SF_DTYPE`).
+        _sf_vector_size: Number of output elements covered by each scale
+            factor; 16 for NVFP4, 32 for MXFP8 (defaults to
+            `NVFP4_SF_VECTOR_SIZE`).
+        _clamp_activation: When `True`, enables the clamped SwiGLU
+            activation (`swigluoai`); the runtime constants are carried
+            by `clamp_alpha` and `clamp_limit` (defaults to `False`).
     """
 
     comptime SfDtype = Self._sf_dtype
@@ -548,9 +617,7 @@ struct RealSwiGLUOutput[
         # i3) are contiguous in linear memory, so each (row, i1) pair
         # zeroes 4 bytes via a single uint32 store instead of 4
         # separate `set_sf` byte writes.
-        var pad_end_local = (
-            (tokens_e + SF_MN_GROUP_SIZE - 1) // SF_MN_GROUP_SIZE
-        ) * SF_MN_GROUP_SIZE
+        var pad_end_local = align_up(tokens_e, SF_MN_GROUP_SIZE)
         var pad_total = pad_end_local - tokens_e
         if pad_total <= 0:
             return
@@ -639,11 +706,73 @@ struct Grouped1D1DMatmulKernel[
     # cta_group=1 layout. False (default) keeps the cooperative
     # scatter path.
     swiglu_use_inplace: Bool = False,
+    c_device_engine: TensorEngine = DefaultEngine[element_width=1],
+    offsets_engine: TensorEngine = DefaultEngine[element_width=1],
+    a_scale_offsets_engine: TensorEngine = DefaultEngine[element_width=1],
+    expert_ids_engine: TensorEngine = DefaultEngine[element_width=1],
+    expert_scales_engine: TensorEngine = DefaultEngine[element_width=1],
 ]:
     """Grouped 1D-1D block-scaled matmul kernel.
 
     Uses 3-warp specialization (Load, MMA, Epilogue) with grid-constant TMAs.
-    Work distribution via GroupedWorkIterator1D1D using offset-based addressing.
+    Work distribution via GroupedWorkIterator1D1D using offset-based
+    addressing.
+
+    Parameters:
+        a_type: Element `DType` of the A (left) input tensor.
+        b_type: Element `DType` of the B (right) input tensor.
+        c_type: Element `DType` of the C output tensor.
+        sfa_dtype: `DType` of the A-side block scale factors.
+        sfb_dtype: `DType` of the B-side block scale factors.
+        c_device_layout: `TensorLayout` of the caller's C `TileTensor`,
+            used for bounds-checked GMEM stores.
+        transpose_b: When `True`, B is stored transposed; the only
+            layout this kernel supports.
+        config: `BlockScaledMatmulConfig` carrying tile shapes, pipeline
+            stage counts, swizzle modes, and cluster geometry.
+        static_N: Expert output size (the N dimension), known at compile
+            time for TMA descriptor construction.
+        cluster_shape: 3D `(x, y, z)` cluster shape passed to the
+            `nvvm.cluster_dim` metadata (defaults to `(1, 1, 1)`).
+        elementwise_compute_lambda_fn: Optional fused elementwise lambda
+            applied in the epilogue (defaults to `None`).
+        pdl_level: Programmatic dependent launch level controlling
+            cross-grid ordering fences (defaults to `PDLLevel()`).
+        fuse_swiglu: When `True`, treats adjacent matmul-N column pairs
+            `(2i, 2i+1)` as `(gate, up)` and emits packed FP4/FP8 plus a
+            5D scale tile instead of the BF16 GMEM store (defaults to
+            `False`).
+        SwiGLUOutputT: `SwiGLUOutput` trait impl carrying the fused
+            output destinations; `NullSwiGLUOutput[]` is zero-sized so
+            the kernel ABI is unchanged when fusion is off (defaults to
+            `NullSwiGLUOutput[]`).
+        swiglu_match_bf16: When `True` (default), the SMEM scatter rounds
+            through `bfloat16` to match the chained reference path
+            byte-exact; `False` preserves `float32` for slightly more
+            accuracy.
+        swiglu_disable_compute: Diagnostic flag that strips the
+            cooperative compute body while keeping the TMEM load, SMEM
+            scatter, and barrier structure; output is invalid when
+            `True` (defaults to `False`).
+        swiglu_enable_trace: When `True`, gates per-CTA trace records on
+            `comptime if`; when `False` (default) every record site
+            strips at compile time and the kernel emits byte-identical
+            PTX to an uninstrumented build.
+        TraceBufT: `TraceBuf` trait impl for diagnostic timing;
+            `NullTrace` is zero-sized so the kernel ABI is unchanged
+            when tracing is off (defaults to `NullTrace`).
+        swiglu_use_inplace: When `True`, the epilogue uses an in-place
+            register path that skips the `bfloat16` SMEM scratchpad via
+            cross-lane shuffles; `False` (default) keeps the cooperative
+            scatter path.
+        c_device_engine: Engine of the C `TileTensor`.
+        offsets_engine: Engine of the per-expert offsets
+            `TileTensor`.
+        a_scale_offsets_engine: Engine of the per-expert A-scale
+            offsets `TileTensor`.
+        expert_ids_engine: Engine of the expert-IDs `TileTensor`.
+        expert_scales_engine: Engine of the expert-scales
+            `TileTensor`.
     """
 
     # ========== Derived Constants ==========
@@ -693,7 +822,7 @@ struct Grouped1D1DMatmulKernel[
     # TMEM configuration — stride matches MMA output width for scaled kernels.
     # SFB TMEM width must be SFB_N_ALIGNED (not MMA_N) because
     # _copy_sf_to_tmem_tt writes SF_MN_GROUP_SIZE//32 = 4 columns per
-    # SF group regardless of MMA_N.  Matches the sm100/block_scaled kernel.
+    # SF group regardless of MMA_N. Matches the sm100/block_scaled kernel.
     comptime NUM_TMEM_COLS = 512
     comptime SFA_NUM_COLS = Self.config.num_sf_k_tiles * (Self.BM // 32)
     comptime SFB_NUM_COLS = Self.config.num_sf_k_tiles * (
@@ -847,12 +976,29 @@ struct Grouped1D1DMatmulKernel[
         cluster=Self.config.cluster_shape,
         cta_group=Self.cta_group,
         AB_swapped=Self.config.AB_swapped,
+        OffsetsEngine=Self.offsets_engine,
+        ExpertIdsEngine=Self.expert_ids_engine,
+        ExpertScalesEngine=Self.expert_scales_engine,
     ]
 
     # ========== TMA Load Size Constants ==========
 
-    comptime a_expected_bytes = Self.BM * Self.BK * size_of[Self.a_type]()
-    comptime b_expected_bytes = Self.BN * Self.BK * size_of[Self.b_type]()
+    # TMA transaction sizes count the bytes the copy engine READS from global
+    # memory. An unpacked-FP4 operand occupies BK shared-memory bytes but is
+    # sourced from half as many packed ones, and a barrier told to expect the
+    # shared-memory figure never completes.
+    comptime a_gmem_bytes_per_elem_recip = 2 if _is_packed_fp4[
+        Self.a_type, Self.b_type
+    ]() else 1
+    comptime b_gmem_bytes_per_elem_recip = 2 if _is_packed_fp4[
+        Self.b_type, Self.a_type
+    ]() else 1
+    comptime a_expected_bytes = Self.BM * Self.BK * size_of[
+        Self.a_type
+    ]() // Self.a_gmem_bytes_per_elem_recip
+    comptime b_expected_bytes = Self.BN * Self.BK * size_of[
+        Self.b_type
+    ]() // Self.b_gmem_bytes_per_elem_recip
     comptime sfa_expected_bytes = Self.SmemType.Core.sfa_smem_layout.size() * size_of[
         Self.sfa_dtype
     ]()
@@ -962,18 +1108,28 @@ struct Grouped1D1DMatmulKernel[
     ]
 
     # 1D data TileTensor types (offsets, expert IDs, scales)
-    comptime OffsetsTile = TileTensor[DType.uint32, GMEMLayout1D, MutAnyOrigin]
-    comptime AScaleOffsetsTile = TileTensor[
-        DType.uint32, GMEMLayout1D, MutAnyOrigin
+    comptime OffsetsTile = TileTensor[
+        .uint32, GMEMLayout1D, MutAnyOrigin, Engine=Self.offsets_engine
     ]
-    comptime ExpertIdsTile = TileTensor[DType.int32, GMEMLayout1D, MutAnyOrigin]
+    comptime AScaleOffsetsTile = TileTensor[
+        .uint32,
+        GMEMLayout1D,
+        MutAnyOrigin,
+        Engine=Self.a_scale_offsets_engine,
+    ]
+    comptime ExpertIdsTile = TileTensor[
+        .int32, GMEMLayout1D, MutAnyOrigin, Engine=Self.expert_ids_engine
+    ]
     comptime ExpertScalesTile = TileTensor[
-        DType.float32, GMEMLayout1D, MutAnyOrigin
+        .float32, GMEMLayout1D, MutAnyOrigin, Engine=Self.expert_scales_engine
     ]
 
     # C device tensor type (for bounds-checked stores)
     comptime CDeviceTile = TileTensor[
-        Self.c_type, Self.c_device_layout, MutAnyOrigin
+        Self.c_type,
+        Self.c_device_layout,
+        MutAnyOrigin,
+        Engine=Self.c_device_engine,
     ]
 
     # TMA load size constants (from desc layout dimensions)
@@ -987,9 +1143,9 @@ struct Grouped1D1DMatmulKernel[
     @staticmethod
     def validate_config():
         """Compile-time validation of kernel configuration."""
-        comptime assert (
-            Self.a_type == Self.b_type
-        ), "A and B types must match for block-scaled GEMM"
+        comptime assert block_scaled_operands_compatible[
+            Self.a_type, Self.b_type
+        ](), "A and B types must match for block-scaled GEMM, or be the W4A8 pair"
         comptime assert (
             Self.sfa_dtype == Self.sfb_dtype
         ), "SFA and SFB types must match"
@@ -1019,7 +1175,31 @@ struct Grouped1D1DMatmulKernel[
         accum_barriers: Self.SmemType.Pipelines.AccumBarriers,
         tmem_dealloc: Self.SmemType.Pipelines.TmemDealloc,
     ):
-        """Initialize barriers and prefetch TMA descriptors."""
+        """Initialize barriers and prefetch TMA descriptors.
+
+        Args:
+            elect_one_warp: When `True`, this warp is elected to run the
+                one-time setup.
+            elect_one_thread: When `True`, this thread is elected to run
+                the one-time setup; both flags must be `True` for the
+                prefetch and barrier init to execute.
+            a_tma_op: TMA operation descriptor for the A tensor, prefetched
+                to the constant cache.
+            b_tma_op: TMA operation descriptor for the B tensor, prefetched
+                to the constant cache.
+            c_tma_op: TMA operation descriptor for the C output tensor,
+                prefetched unless `fuse_swiglu` is set.
+            sfa_tma_op: TMA operation descriptor for the A-side block scale
+                factors, prefetched to the constant cache.
+            sfb_tma_op: TMA operation descriptor for the B-side block scale
+                factors, prefetched to the constant cache.
+            input_barriers: Input pipeline `mbarrier` array to initialize
+                for producer-consumer synchronization.
+            accum_barriers: Accumulator pipeline `mbarrier` array to
+                initialize for MMA-to-epilogue handoff.
+            tmem_dealloc: TMEM deallocation barrier to initialize for
+                epilogue-to-MMA TMEM recycling.
+        """
         if elect_one_warp and elect_one_thread:
             a_tma_op.prefetch_descriptor()
             b_tma_op.prefetch_descriptor()
@@ -1113,7 +1293,7 @@ struct Grouped1D1DMatmulKernel[
 
         Each consumer warp calls this independently at kernel start,
         eliminating the latency of waiting for the scheduler warp to
-        publish slot 0.  Only lane 0 runs the GMEM scan; results are
+        publish slot 0. Only lane 0 runs the GMEM scan; results are
         broadcast to all lanes via warp.broadcast (which also provides
         the implicit __syncwarp memory fence).
         """
@@ -1192,7 +1372,7 @@ struct Grouped1D1DMatmulKernel[
         if use_group_cache:
             si = sched_group_offsets[Int(grp)]
         else:
-            si = a_offsets[Int(grp)]
+            si = a_offsets[Int(grp)][0]
 
         var found = False
         var s_m: UInt32 = 0
@@ -1210,14 +1390,14 @@ struct Grouped1D1DMatmulKernel[
                 ei = sched_group_offsets[Int(grp + 1)]
                 eid = sched_expert_ids[Int(grp)]
             else:
-                ei = a_offsets[Int(grp + 1)]
-                eid = expert_ids[Int(grp)]
+                ei = a_offsets[Int(grp + 1)][0]
+                eid = expert_ids[Int(grp)][0]
             var gs = ei - si
             if eid < 0 or gs <= 0:
                 grp += 1
                 si = ei
                 continue
-            var mb = (gs + _cta_m - 1) / _cta_m
+            var mb = ceildiv(gs, _cta_m)
             var cum = cumsum + mb
             var bs = cum * _num_n_blks
             if nbi < bs:
@@ -1231,7 +1411,7 @@ struct Grouped1D1DMatmulKernel[
                 if use_group_cache:
                     s_scale = sched_expert_scales[Int(grp)]
                 else:
-                    s_scale = expert_scales[Int(eid)]
+                    s_scale = expert_scales[Int(eid)][0]
                 found = True
                 break
             grp += 1
@@ -1295,14 +1475,14 @@ struct Grouped1D1DMatmulKernel[
         # C tensor for bounds-checked stores (TileTensor)
         c_device: Self.CDeviceTile,
         # Number of active experts
-        num_active_experts: Int,
+        num_active_experts: Int32,
         # K dimension for iteration
         K: UInt32,
         # Raw SFB pointer and strides for cp.async path (MMA_N < 64 only).
         # When group_size < SF_MN_GROUP_SIZE, cp.async replaces TMA for SFB.
         sfb_global_ptr: UnsafePointer[Scalar[Self.sfb_dtype], ImmutAnyOrigin],
-        sfb_n_stride: Int,
-        sfb_k_tiles: Int,
+        sfb_n_stride: Int32,
+        sfb_k_tiles: Int32,
         # Fused-SwiGLU+quant output sink. Pass `NullSwiGLUOutput[]()` for
         # non-fused callers — zero-sized, contributes 0 bytes to the
         # kernel ABI when `SwiGLUOutputT=NullSwiGLUOutput`.
@@ -1314,14 +1494,69 @@ struct Grouped1D1DMatmulKernel[
     ):
         """Grouped 1D-1D block-scaled GEMM kernel entry point.
 
-        Uses grid-constant TMAs with offset-based addressing for 1D-1D layout.
+        Uses grid-constant TMAs with offset-based addressing for 1D-1D
+        layout.
+
+        Args:
+            a_tma_op: Grid-constant TMA operation descriptor for
+                loading A (left input) tiles from GMEM to SMEM.
+            b_tma_op: Grid-constant TMA operation descriptor for
+                loading B (right weight) tiles from GMEM to SMEM.
+            c_tma_op: Grid-constant TMA operation descriptor for
+                storing C output tiles from SMEM to GMEM; an empty
+                placeholder on the fused-SwiGLU path.
+            sfa_tma_op: Grid-constant TMA operation descriptor for
+                loading the A-side block scale factors from GMEM to
+                SMEM.
+            sfb_tma_op: Grid-constant TMA operation descriptor for
+                loading the B-side block scale factors from GMEM to
+                SMEM, used on the `MMA_N >= 64` path; the `MMA_N < 64`
+                path uses `sfb_global_ptr` with cp.async instead.
+            a_offsets: 1D `uint32` `TileTensor` of group start offsets
+                into the packed token buffer; `a_offsets[i]` is the
+                start of group `i` and `a_offsets[i+1]` is its end.
+            a_scale_offsets: 1D `uint32` `TileTensor` of per-group
+                A-side scale-factor offsets used to locate the SFA
+                tile for each expert group.
+            expert_ids: 1D `int32` `TileTensor` of expert IDs indexed
+                by group; a negative value marks an empty or terminal
+                group.
+            expert_scales: 1D `float32` `TileTensor` of per-expert
+                output scales applied to the accumulator in the
+                epilogue.
+            c_device: C output `TileTensor` on device used for
+                bounds-checked GMEM stores in the non-fused epilogue.
+            num_active_experts: Number of active expert groups in the
+                `a_offsets` and `expert_ids` arrays for this launch.
+            K: K contraction dimension shared by all experts, in
+                elements; drives the k-tile iteration count via
+                `ceildiv(K, BK)`.
+            sfb_global_ptr: Raw GMEM pointer to the SFB scale-factor
+                tensor, used by the cp.async path when `MMA_N < 64`
+                and `group_size < SF_MN_GROUP_SIZE`; unused on the TMA
+                path.
+            sfb_n_stride: Element stride between SFB N-groups in the
+                SFB GMEM tensor, used by the cp.async path to index
+                rows.
+            sfb_k_tiles: Number of valid SFB k-tiles along K; cp.async
+                loads past this count zero-fill so out-of-bounds
+                k-tiles produce clean scales.
+            swiglu_out: Fused SwiGLU plus quantization output sink;
+                pass `NullSwiGLUOutput[]()` for the non-fused path
+                (zero-sized, 0 bytes of kernel ABI).
+            trace_buf: Diagnostic trace buffer for per-tile pipeline
+                timing; `NullTrace()` is zero-sized when
+                `swiglu_enable_trace=False`.
         """
+        var _num_active_experts = Int(num_active_experts)
+        var _sfb_n_stride = Int(sfb_n_stride)
+        var _sfb_k_tiles = Int(sfb_k_tiles)
         Self.validate_config()
 
         # ===== Shared Memory Setup =====
         ref smem = external_memory[
-            Scalar[DType.uint8],
-            address_space=AddressSpace.SHARED,
+            UInt8,
+            address_space=.SHARED,
             alignment=128,
         ]().bitcast[Self.SmemType]()[]
 
@@ -1441,9 +1676,9 @@ struct Grouped1D1DMatmulKernel[
 
         # ===== TMA LOAD WARP =====
         # For cta_group=2: BOTH CTAs run the production loop to keep
-        # pipeline state in sync.  UMMA multicast arrives on both
+        # pipeline state in sync. UMMA multicast arrives on both
         # CTAs' EMPTY barriers, so both must advance through stages
-        # to match.  Inside load_input_tiles, elect_one_cta gates
+        # to match. Inside load_input_tiles, elect_one_cta gates
         # expect_bytes and the cta_group parameter on TMA ops ensures
         # only the leader CTA issues loads.
         if Self.WarpRole.is_load():
@@ -1452,7 +1687,7 @@ struct Grouped1D1DMatmulKernel[
                 var sched_phase = UInt32(0)
                 # Iter 0: compute inline (no scheduler, no mbarrier).
                 var ctx = Self._compute_iter0_ctx(
-                    num_active_experts,
+                    _num_active_experts,
                     a_offsets,
                     expert_ids,
                     expert_scales,
@@ -1637,7 +1872,7 @@ struct Grouped1D1DMatmulKernel[
             with mma_ctx:
                 # Iter 0: compute inline (no scheduler, no mbarrier).
                 var ctx = Self._compute_iter0_ctx(
-                    num_active_experts,
+                    _num_active_experts,
                     a_offsets,
                     expert_ids,
                     expert_scales,
@@ -1817,7 +2052,7 @@ struct Grouped1D1DMatmulKernel[
             with epi_ctx:
                 # Iter 0: compute inline (no scheduler, no mbarrier).
                 var ctx = Self._compute_iter0_ctx(
-                    num_active_experts,
+                    _num_active_experts,
                     a_offsets,
                     expert_ids,
                     expert_scales,
@@ -1952,7 +2187,7 @@ struct Grouped1D1DMatmulKernel[
 
                 # Iter 0: compute inline (no scheduler, no mbarrier).
                 var ctx = Self._compute_iter0_ctx(
-                    num_active_experts,
+                    _num_active_experts,
                     a_offsets,
                     expert_ids,
                     expert_scales,
@@ -1977,7 +2212,9 @@ struct Grouped1D1DMatmulKernel[
                     # Hoist loop-invariant SF coords outside k_tile loop.
                     # sfb_n_coord must be visible to ALL lanes (cp.async
                     # needs it per-lane), so compute outside elect_one_sync.
-                    var a_scale_offset = a_scale_offsets[Int(ctx.group_idx())]
+                    var a_scale_offset = a_scale_offsets[Int(ctx.group_idx())][
+                        0
+                    ]
                     var _sfa_coord: Int
                     var sfb_n_coord: Int
                     _sfa_coord, sfb_n_coord = Self._get_sf_coords(
@@ -2051,7 +2288,7 @@ struct Grouped1D1DMatmulKernel[
                                         )
 
                                         var global_offset = (
-                                            sfb_n_coord * sfb_n_stride
+                                            sfb_n_coord * _sfb_n_stride
                                             + (k_tile_base + k_atom)
                                             * K_TILE_ELEMS
                                             + Int(cp_row_in_atom) * ROW_STRIDE
@@ -2068,7 +2305,7 @@ struct Grouped1D1DMatmulKernel[
                                         var is_valid = (
                                             lane_id() < sfb_active_lanes
                                             and k_tile_base + k_atom
-                                            < sfb_k_tiles
+                                            < _sfb_k_tiles
                                         )
                                         async_copy[
                                             size=copy_size,
@@ -2076,14 +2313,11 @@ struct Grouped1D1DMatmulKernel[
                                         ](
                                             (
                                                 sfb_global_ptr + global_offset
-                                            ).address_space_cast[
-                                                AddressSpace.GLOBAL
-                                            ](),
+                                            ).address_space_cast[.GLOBAL](),
                                             (
-                                                sfb_smem_tile.ptr + smem_offset
-                                            ).address_space_cast[
-                                                AddressSpace.SHARED
-                                            ](),
+                                                sfb_smem_tile._storage
+                                                + smem_offset
+                                            ).address_space_cast[.SHARED](),
                                             src_size=Int32(
                                                 copy_size
                                             ) if is_valid else Int32(0),
@@ -2125,7 +2359,8 @@ struct Grouped1D1DMatmulKernel[
                                         )
 
                                         var atom_dst = TileTensor(
-                                            sfb_smem_tile.ptr + smem_offset,
+                                            sfb_smem_tile._storage
+                                            + smem_offset,
                                             row_major[
                                                 Self.SFB_TMA_ROWS, ROW_STRIDE
                                             ](),
@@ -2146,15 +2381,15 @@ struct Grouped1D1DMatmulKernel[
                                             Self.sf_tma_dtype,
                                             type_of(atom_dst).LayoutType,
                                             MutAnyOrigin,
-                                            address_space=AddressSpace.SHARED,
+                                            address_space=.SHARED,
                                         ](
                                             rebind[
                                                 UnsafePointer[
                                                     Scalar[Self.sf_tma_dtype],
                                                     MutAnyOrigin,
-                                                    address_space=AddressSpace.SHARED,
+                                                    address_space=.SHARED,
                                                 ]
-                                            ](atom_dst.ptr),
+                                            ](atom_dst._storage),
                                             atom_dst.layout,
                                         )
                                         sfb_tma_op.async_copy_4d[
@@ -2189,7 +2424,7 @@ struct Grouped1D1DMatmulKernel[
 
         # ===== SFB TMEM LOAD WARPS (MMA_N < 64 only) =====
         # Dedicated warps that read SFB scale factors from SMEM and
-        # write them to TMEM via tcgen05_st.  Wait on the sfb_tma_pipeline
+        # write them to TMEM via tcgen05_st. Wait on the sfb_tma_pipeline
         # for TMA loads to complete before reading SMEM.
         comptime if Self.MMA_N < 64:
             if Self.WarpRole.is_sfb_load():
@@ -2210,7 +2445,7 @@ struct Grouped1D1DMatmulKernel[
 
                 # Iter 0: compute inline (no scheduler, no mbarrier).
                 var ctx = Self._compute_iter0_ctx(
-                    num_active_experts,
+                    _num_active_experts,
                     a_offsets,
                     expert_ids,
                     expert_scales,
@@ -2244,7 +2479,7 @@ struct Grouped1D1DMatmulKernel[
         # slot = (it-1) % 2 to stay aligned with consumers reading slot = ci % 2.
         if Self.WarpRole.is_scheduler():
             var use_group_cache = (
-                num_active_experts <= Self.SmemType.SCHED_GROUP_CACHE_CAP
+                _num_active_experts <= Self.SmemType.SCHED_GROUP_CACHE_CAP
             )
             var cta_stride = UInt32(
                 ufloordiv(grid_dim.x, Self.config.cta_group)
@@ -2262,7 +2497,7 @@ struct Grouped1D1DMatmulKernel[
             if lane_id() == 0:
                 var slot0 = Self._compute_sched_slot(
                     smem,
-                    num_active_experts,
+                    _num_active_experts,
                     a_offsets,
                     expert_ids,
                     expert_scales,
@@ -2277,7 +2512,7 @@ struct Grouped1D1DMatmulKernel[
                 if slot0.expert_id >= 0:
                     var slot1 = Self._compute_sched_slot(
                         smem,
-                        num_active_experts,
+                        _num_active_experts,
                         a_offsets,
                         expert_ids,
                         expert_scales,
@@ -2300,13 +2535,13 @@ struct Grouped1D1DMatmulKernel[
                 var sched_expert_ids = smem.sched_expert_ids()
                 var sched_expert_scales = smem.sched_expert_scales()
                 var lane = Int(lane_id())
-                for i in range(lane, num_active_experts + 1, WARP_SIZE):
-                    sched_group_offsets[i] = a_offsets[i]
-                for i in range(lane, num_active_experts, WARP_SIZE):
-                    var eid = expert_ids[i]
+                for i in range(lane, _num_active_experts + 1, WARP_SIZE):
+                    sched_group_offsets[i] = a_offsets[i][0]
+                for i in range(lane, _num_active_experts, WARP_SIZE):
+                    var eid = expert_ids[i][0]
                     sched_expert_ids[i] = eid
-                    sched_expert_scales[i] = expert_scales[
-                        Int(eid)
+                    sched_expert_scales[i] = expert_scales[Int(eid)][
+                        0
                     ] if eid >= 0 else Float32(1.0)
 
             # --- Steady-state: use SMEM cache (fast) ---
@@ -2326,7 +2561,7 @@ struct Grouped1D1DMatmulKernel[
 
                         var sched_slot = Self._compute_sched_slot(
                             smem,
-                            num_active_experts,
+                            _num_active_experts,
                             a_offsets,
                             expert_ids,
                             expert_scales,
@@ -2357,8 +2592,8 @@ struct Grouped1D1DMatmulKernel[
 
         Matches the SFB load pattern from block_scaled_matmul_small_bn.mojo.
         Each of the 4 SFB load warps (128 threads) covers 32 datapaths via
-        tcgen05_st[datapaths=32].  Only lanes 0..MMA_N-1 read valid data;
-        others write zero (harmless — UMMA only reads dp 0..MMA_N-1).
+        tcgen05_st[datapaths=32]. Only lanes 0..MMA_N-1 read valid data;
+        others write zero (harmless: UMMA only reads dp 0..MMA_N-1).
         """
         comptime k_group_size = Self.config.k_group_size
 
@@ -2380,8 +2615,8 @@ struct Grouped1D1DMatmulKernel[
             # the register while the store is still in flight. Same
             # batched-stores-then-one-wait shape as
             # TmemFragments.store() + wait_store().
-            var _sfb_st_vals = InlineArray[
-                InlineArray[Scalar[DType.uint32], 1],
+            var _sfb_st_vals = Array[
+                Array[UInt32, 1],
                 Self.config.num_sf_k_tiles,
             ](uninitialized=True)
 
@@ -2420,9 +2655,7 @@ struct Grouped1D1DMatmulKernel[
                 # warp-collective store.
                 syncwarp()
 
-                _sfb_st_vals[sf_idx][0] = bitcast[DType.uint32, 1](sfb_scales)[
-                    0
-                ]
+                _sfb_st_vals[sf_idx][0] = bitcast[.uint32, 1](sfb_scales)[0]
                 tcgen05_st[
                     datapaths=32,
                     bits=32,
@@ -2454,7 +2687,7 @@ struct Grouped1D1DMatmulKernel[
         m_coord: UInt32,
         n_coord: UInt32,
         expert_id: Int32,
-        a_scale_offset: Scalar[DType.uint32],
+        a_scale_offset: UInt32,
         m_start: UInt32,
     ) -> Tuple[Int, Int]:
         """Return (sfa_m_coord, sfb_n_coord), swapped when AB_swapped."""
@@ -2486,6 +2719,9 @@ struct Grouped1D1DMatmulKernel[
     def load_input_tiles[
         tiles_origin: MutOrigin,
         //,
+        split_txn: Bool = False,
+        weight_txn_bytes: Int = 0,
+        activation_txn_bytes: Int = 0,
     ](
         a_tma_op: Self.ATmaOp,
         b_tma_op: Self.BTmaOp,
@@ -2506,6 +2742,7 @@ struct Grouped1D1DMatmulKernel[
         b_multicast_mask: UInt16,
         load_weights: Bool = True,
         load_activations: Bool = True,
+        wr_mbar: Optional[MbarPtr] = None,
     ):
         """Load A, B, SFA, SFB tiles using TMA.
 
@@ -2522,7 +2759,68 @@ struct Grouped1D1DMatmulKernel[
         function covers all three use-cases (both, weights-only,
         activations-only). Branches inside are cheap compared to the
         TMA ops and the warp-level election that gates them.
+
+        `split_txn` splits the stage's single transaction count in two:
+        the weight side (A + SFA when `AB_swapped`) completes a
+        caller-supplied weight-ready barrier carrying
+        `weight_txn_bytes`, and the stage's own FULL barrier is reduced
+        to `activation_txn_bytes`. Both counts are armed during the
+        weight phase, so an activation-only follow-up call for the same
+        stage re-arms neither. A consumer that reads A must then join
+        the weight-ready barrier as well as the stage barrier. With
+        `split_txn=False` (the default) nothing about the emitted code
+        changes.
+
+        Parameters:
+            tiles_origin: SMEM `MutOrigin` of the producer tiles (inferred
+                from `tiles`).
+            split_txn: When `True`, account the weight bytes on `wr_mbar`
+                and the activation bytes on the stage barrier instead of
+                arming the stage barrier with `input_expected_bytes`.
+            weight_txn_bytes: Weight-side expected bytes (`split_txn`).
+            activation_txn_bytes: Activation-side expected bytes
+                (`split_txn`).
+
+        Args:
+            a_tma_op: TMA operation descriptor for A tile loads.
+            b_tma_op: TMA operation descriptor for B tile loads.
+            sfa_tma_op: TMA operation descriptor for A-side block scale
+                factor loads.
+            sfb_tma_op: TMA operation descriptor for B-side block scale
+                factor loads.
+            tiles: `ProducerTiles` pipeline handle providing the barrier
+                and payload slot for the current stage.
+            peer_cta_coord: `(peer_rank_n, peer_rank_m, peer_m_rank)`
+                cluster peer ranks used to slice A/B tiles across paired
+                CTAs in 2SM mode.
+            work_ctx: `GroupedWorkContext1D1D` carrying the current tile's
+                m/n coordinates, expert id, group idx, and m bounds.
+            a_scale_offsets: Per-group A-side scale factor offsets;
+                `a_scale_offsets[group_idx]` gives the SFA row offset.
+            iter_idx: Outer k-tile iteration index; the base k coordinate
+                is `(iter_idx + j) * BK`.
+            elect_one_cta: When `True`, this CTA is the cluster leader and
+                issues `expect_bytes` for the input pipeline.
+            a_multicast_mask: TMA multicast bitmask selecting which cluster
+                CTAs receive the A tile.
+            b_multicast_mask: TMA multicast bitmask selecting which cluster
+                CTAs receive the B tile.
+            load_weights: When `True`, load the weight side (A+SFA if
+                `AB_swapped`, else B+SFB) (defaults to `True`).
+            load_activations: When `True`, load the activation side
+                (defaults to `True`).
+            wr_mbar: Weight-ready barrier the weight-side TMAs signal
+                under `split_txn`. Must be present whenever `split_txn`
+                is set; ignored otherwise.
         """
+        comptime assert (
+            not split_txn
+            or weight_txn_bytes + activation_txn_bytes
+            == Self.input_expected_bytes
+        ), (
+            "split_txn byte counts must reconstruct input_expected_bytes"
+            " exactly, or the stage's transactions never balance"
+        )
         var peer_rank_n = peer_cta_coord[0]
         var peer_rank_m = peer_cta_coord[1]
         var peer_m_rank = peer_cta_coord[2]
@@ -2582,9 +2880,30 @@ struct Grouped1D1DMatmulKernel[
             # phase so activation-only calls (post-PDL-wait) don't re-expect.
             if load_weights:
                 if elect_one_cta:
-                    tiles.expect_bytes(Self.input_expected_bytes)
+                    comptime if split_txn:
+                        # BOTH counts are armed in the weight phase, so the
+                        # `load_weights=False, load_activations=True`
+                        # follow-up call for the same stage re-arms
+                        # neither and no transaction is left outstanding.
+                        wr_mbar.unsafe_value()[0].expect_bytes(
+                            Int32(weight_txn_bytes)
+                        )
+                        tiles.expect_bytes(activation_txn_bytes)
+                    else:
+                        tiles.expect_bytes(Self.input_expected_bytes)
 
             var barrier = tiles.barrier()
+            # Per-side completion barriers. Both are the stage barrier
+            # unless the caller split the transaction, in which case the
+            # WEIGHT side (A+SFA when AB_swapped, B+SFB otherwise) moves
+            # onto the caller's weight-ready barrier.
+            var a_side_barrier = barrier
+            var b_side_barrier = barrier
+            comptime if split_txn:
+                comptime if Self.config.AB_swapped:
+                    a_side_barrier = wr_mbar.unsafe_value()
+                else:
+                    b_side_barrier = wr_mbar.unsafe_value()
 
             comptime for jj in range(Self.config.k_group_size):
                 var j = UInt32(jj)
@@ -2596,11 +2915,11 @@ struct Grouped1D1DMatmulKernel[
 
                 # Peer CTA slice using TileTensor pattern (ptr + layout)
                 var a_peer_tt = type_of(a_tt)(
-                    a_tt.ptr + peer_m_rank * Self.a_tma_load_size,
+                    a_tt._storage + peer_m_rank * Self.a_tma_load_size,
                     a_tt.layout,
                 )
                 var b_peer_tt = type_of(b_tt)(
-                    b_tt.ptr + peer_rank_m * Self.b_tma_load_size,
+                    b_tt._storage + peer_rank_m * Self.b_tma_load_size,
                     b_tt.layout,
                 )
 
@@ -2610,21 +2929,21 @@ struct Grouped1D1DMatmulKernel[
                 if load_a_side:
                     a_tma_op.async_multicast_load[Self.cta_group](
                         a_peer_tt,
-                        barrier[0],
+                        a_side_barrier[0],
                         (k_coord, a_gmem_m_coord),
                         a_multicast_mask,
                     )
                 if load_b_side:
                     b_tma_op.async_multicast_load[Self.cta_group](
                         b_peer_tt,
-                        barrier[0],
+                        b_side_barrier[0],
                         (k_coord, b_gmem_n_coord),
                         b_multicast_mask,
                     )
 
                 # Scale factor load with offset
                 # TMA 4D now has TileTensor overload - pass tiles directly
-                var a_scale_offset = a_scale_offsets[Int(group_idx)]
+                var a_scale_offset = a_scale_offsets[Int(group_idx)][0]
 
                 var sfa_m_coord: Int
                 var sfb_n_coord: Int
@@ -2649,20 +2968,20 @@ struct Grouped1D1DMatmulKernel[
                         Self.sf_tma_dtype,
                         type_of(sfa_tt).LayoutType,
                         MutAnyOrigin,
-                        address_space=AddressSpace.SHARED,
+                        address_space=.SHARED,
                     ](
                         rebind[
                             UnsafePointer[
                                 Scalar[Self.sf_tma_dtype],
                                 MutAnyOrigin,
-                                address_space=AddressSpace.SHARED,
+                                address_space=.SHARED,
                             ]
-                        ](sfa_tt.ptr),
+                        ](sfa_tt._storage),
                         sfa_tt.layout,
                     )
                     sfa_tma_op.async_copy_4d[Self.cta_group](
                         sfa_tt_u16,
-                        barrier[0],
+                        a_side_barrier[0],
                         (
                             0,
                             Int(
@@ -2681,20 +3000,20 @@ struct Grouped1D1DMatmulKernel[
                             Self.sf_tma_dtype,
                             type_of(sfb_tt).LayoutType,
                             MutAnyOrigin,
-                            address_space=AddressSpace.SHARED,
+                            address_space=.SHARED,
                         ](
                             rebind[
                                 UnsafePointer[
                                     Scalar[Self.sf_tma_dtype],
                                     MutAnyOrigin,
-                                    address_space=AddressSpace.SHARED,
+                                    address_space=.SHARED,
                                 ]
-                            ](sfb_tt.ptr),
+                            ](sfb_tt._storage),
                             sfb_tt.layout,
                         )
                         sfb_tma_op.async_copy_4d[Self.cta_group](
                             sfb_tt_u16,
-                            barrier[0],
+                            b_side_barrier[0],
                             (
                                 0,
                                 Int(
@@ -2720,7 +3039,7 @@ struct Grouped1D1DMatmulKernel[
         The adjustment selects the correct half.
 
         For MMA_N < 64, each SF atom covers 32 N positions in one TMEM
-        column.  The adj selects which column (atom) within the 128-N SF
+        column. The adj selects which column (atom) within the 128-N SF
         group to read: adj = n_in_sf_group // SF_ATOM_M[0].
 
         Divides by MMA_N (not BN): in 2SM mode BN = MMA_N/2, but both CTAs
@@ -2729,7 +3048,7 @@ struct Grouped1D1DMatmulKernel[
         """
         comptime if Self.MMA_N < 64:
             # SFB is loaded externally to TMEM via dedicated SFB load
-            # warps using tcgen05_st.  Data is placed at dp 0..MMA_N-1
+            # warps using tcgen05_st. Data is placed at dp 0..MMA_N-1
             # of the base TMEM column, so no adjustment is needed.
             return UInt32(0)
         elif Self.MMA_N % SF_MN_GROUP_SIZE != 0:
@@ -2768,6 +3087,30 @@ struct Grouped1D1DMatmulKernel[
         For MMA_N < 64: SFB is pre-loaded by dedicated SFB load warps
         via tcgen05_st. The MMA warp waits on sfb_load_mbars before
         entering this function.
+
+        Parameters:
+            tiles_origin: Memory origin of the consumer tiles payload
+                (inferred).
+
+        Args:
+            tiles: Consumer tiles holding the A, B, SFA, and SFB
+                payloads for the current k-group iteration.
+            mma_op: Block-scaled MMA operation object that issues
+                `tcgen05` MMAs and commits the accumulator.
+            tmem_addr: TMEM column address of the output accumulator
+                for this tile.
+            tmem_region: TMEM region allocation tracking the SFA and
+                SFB accumulator column addresses.
+            iter_idx: Global k-tile iteration index (`k_tile *
+                k_group_size + jj`) used to detect the first k
+                iteration for accumulator initialization.
+            k_start: K-tile index at which accumulation begins for
+                this output tile; `is_first_k` is `True` when
+                `iter_idx + j` equals this value.
+            sfb_tmem_adj: SFB TMEM column adjustment for the current
+                tile, computed by `_compute_sfb_tmem_adj`, that
+                accounts for the SFB layout offset at this `(m, n,
+                m_start)` position.
         """
         if elect_one_sync():
             comptime for jj in range(Self.config.k_group_size):
@@ -2897,8 +3240,8 @@ struct Grouped1D1DMatmulKernel[
         # body strips entirely. The TMEM load, SMEM scatter, and both
         # WarpGroupBarrier syncs still execute — isolates "structural epi
         # cost" from "cooperative compute cost". OUTPUT IS INVALID.
-        comptime iters_per_stage = 0 if Self.swiglu_disable_compute else (
-            (work_per_stage + total_threads - 1) // total_threads
+        comptime iters_per_stage = 0 if Self.swiglu_disable_compute else ceildiv(
+            work_per_stage, total_threads
         )
 
         # Per-tile pipeline START/END events are recorded by the outer
@@ -2986,11 +3329,9 @@ struct Grouped1D1DMatmulKernel[
             # MXFP8 cross-warp amax staging: 32 fp32 slots indexed
             # warp * 8 + token. Reuses the c_tiles SMEM, idle in this
             # path (no bf16 scatter).
-            var amax_smem = c_tiles[0].ptr.bitcast[Float32]()
+            var amax_smem = c_tiles[0]._storage.bitcast[Float32]()
 
-            comptime PartialType = InlineArray[
-                Scalar[Self.accum_type], rep_frag_size
-            ]
+            comptime PartialType = Array[Scalar[Self.accum_type], rep_frag_size]
             var lane_row_is_even = (lane_row & UInt32(1)) == UInt32(0)
 
             comptime for loop_stage in range(num_stages):
@@ -3003,9 +3344,9 @@ struct Grouped1D1DMatmulKernel[
                     )
 
                 var upper_ip = rebind[PartialType](frags_ip.upper).copy()
-                var lower_ip = InlineArray[
-                    Scalar[Self.accum_type], rep_frag_size
-                ](uninitialized=True)
+                var lower_ip = Array[Scalar[Self.accum_type], rep_frag_size](
+                    uninitialized=True
+                )
                 comptime if is_lower_frag_required:
                     lower_ip = rebind[PartialType](frags_ip.lower).copy()
 
@@ -3023,7 +3364,7 @@ struct Grouped1D1DMatmulKernel[
                             src_u[_j] = upper_ip[r0 * 4 + _off + _j]
                         var dst_u = (
                             (src_u * scale)
-                            .cast[DType.bfloat16]()
+                            .cast[.bfloat16]()
                             .cast[Self.accum_type]()
                         )
                         comptime for _j in range(SIMD_CAST_W):
@@ -3035,7 +3376,7 @@ struct Grouped1D1DMatmulKernel[
                                 src_l[_j] = lower_ip[r0 * 4 + _off + _j]
                             var dst_l = (
                                 (src_l * scale)
-                                .cast[DType.bfloat16]()
+                                .cast[.bfloat16]()
                                 .cast[Self.accum_type]()
                             )
                             comptime for _j in range(SIMD_CAST_W):
@@ -3049,7 +3390,7 @@ struct Grouped1D1DMatmulKernel[
                 # writer downstream.
                 # Storage: per repeat, 8 SwiGLU values per thread.
                 comptime n_swiglu_per_repeat = 8 if is_lower_frag_required else 4
-                var sw_ip = InlineArray[
+                var sw_ip = Array[
                     Scalar[Self.accum_type],
                     n_swiglu_per_repeat * repeats,
                 ](uninitialized=True)
@@ -3214,12 +3555,10 @@ struct Grouped1D1DMatmulKernel[
                         var output_scale = Float32(0.0)
                         if block_max != Float32(0.0):
                             comptime if is_mxfp8:
-                                output_scale = recip(
-                                    sf_byte.cast[DType.float32]()
-                                )
+                                output_scale = recip(sf_byte.cast[.float32]())
                             else:
                                 output_scale = tensor_sf * recip(
-                                    sf_byte.cast[DType.float32]()
+                                    sf_byte.cast[.float32]()
                                 )
 
                         var p_scaled = pack16 * output_scale
@@ -3240,7 +3579,7 @@ struct Grouped1D1DMatmulKernel[
                                 Int(n_abs) // 2 + Int(warp_row_offset) // 2
                             )
                             if lane_row == UInt32(0) and token_g < m_end:
-                                var packed_u32 = bitcast[DType.uint32, 4](
+                                var packed_u32 = bitcast[.uint32, 4](
                                     packed16_ip
                                 )
                                 swiglu_out.store_packed_word(
@@ -3330,11 +3669,9 @@ struct Grouped1D1DMatmulKernel[
         # GMEM); the GMEM round trip is replaced by a SMEM round trip. bf16
         # SMEM matches the unfused kernel's BF16-from-GMEM read pattern
         # exactly, so swiglu_match_bf16 precision is automatic.
-        var smem_bf16_ptr = c_tiles[0].ptr.bitcast[BFloat16]()
+        var smem_bf16_ptr = c_tiles[0]._storage.bitcast[BFloat16]()
 
-        comptime PartialType = InlineArray[
-            Scalar[Self.accum_type], rep_frag_size
-        ]
+        comptime PartialType = Array[Scalar[Self.accum_type], rep_frag_size]
 
         var tid_within_epi = UInt32(warp_id_v) * UInt32(WARP_SIZE) + UInt32(
             lane_v
@@ -3355,13 +3692,13 @@ struct Grouped1D1DMatmulKernel[
         # bf16 SMEM scratchpad is byte-identical to the standalone
         # matmul's BF16 GMEM output (chain reference).
         @always_inline
-        @parameter
+        @__parameter
         def store_scaled_pair(
             smem_idx_a: UInt32,
             smem_idx_b: UInt32,
             pair_fp32: SIMD[Self.accum_type, 2],
         ):
-            var pair_bf = pair_fp32.cast[DType.bfloat16]()
+            var pair_bf = pair_fp32.cast[.bfloat16]()
             smem_bf16_ptr.store(Int(SWIZZLE_BF(smem_idx_a)), pair_bf[0])
             smem_bf16_ptr.store(Int(SWIZZLE_BF(smem_idx_b)), pair_bf[1])
 
@@ -3395,9 +3732,9 @@ struct Grouped1D1DMatmulKernel[
                 )
 
             var upper_partial = rebind[PartialType](frags.upper).copy()
-            var lower_partial = InlineArray[
-                Scalar[Self.accum_type], rep_frag_size
-            ](uninitialized=True)
+            var lower_partial = Array[Scalar[Self.accum_type], rep_frag_size](
+                uninitialized=True
+            )
             comptime if is_lower_frag_required:
                 lower_partial = rebind[PartialType](frags.lower).copy()
 
@@ -3498,15 +3835,15 @@ struct Grouped1D1DMatmulKernel[
                 comptime BF16_LOAD_W = 8
                 comptime n_loads = (2 * src_width) // BF16_LOAD_W
                 var smem_base = UInt32(token_idx) * UInt32(BM) + UInt32(k_raw)
-                var pair_bf = SIMD[DType.bfloat16, 2 * src_width]()
+                var pair_bf = SIMD[.bfloat16, 2 * src_width]()
                 comptime for li in range(n_loads):
                     var chunk = smem_bf16_ptr.load[width=BF16_LOAD_W](
                         Int(SWIZZLE_BF(smem_base + UInt32(li * BF16_LOAD_W)))
                     )
                     comptime for ci in range(BF16_LOAD_W):
                         pair_bf[li * BF16_LOAD_W + ci] = chunk[ci]
-                var pair = pair_bf.cast[DType.float32]()
-                gate, up = pair.deinterleave()
+                var pair = pair_bf.cast[.float32]()
+                var gate, up = pair.deinterleave()
 
                 # silu(g) and the final SF reciprocal use `recip()`
                 # (`rcp.approx.ftz.f32`) rather than fp32 `/`: with only
@@ -3555,10 +3892,10 @@ struct Grouped1D1DMatmulKernel[
                 var output_scale = Float32(0.0)
                 if block_max != Float32(0.0):
                     comptime if is_mxfp8:
-                        output_scale = recip(sf_byte.cast[DType.float32]())
+                        output_scale = recip(sf_byte.cast[.float32]())
                     else:
                         output_scale = tensor_sf * recip(
-                            sf_byte.cast[DType.float32]()
+                            sf_byte.cast[.float32]()
                         )
 
                 var z_scaled = z * output_scale
@@ -3569,10 +3906,10 @@ struct Grouped1D1DMatmulKernel[
                 # under the kernel's MMA geometry, so word stores
                 # coalesce on the L2 sector.
                 comptime if is_mxfp8:
-                    var packed16 = z_scaled.cast[DType.float8_e4m3fn]()
+                    var packed16 = z_scaled.cast[.float8_e4m3fn]()
                     if in_bounds and m_global < m_end:
                         var byte_base_global = Int(n_abs // 2) + Int(k_post)
-                        var packed_u32 = bitcast[DType.uint32, 4](packed16)
+                        var packed_u32 = bitcast[.uint32, 4](packed16)
                         swiglu_out.store_packed_word(
                             Int(m_global), byte_base_global, packed_u32[0]
                         )
@@ -3690,6 +4027,27 @@ struct Grouped1D1DMatmulKernel[
         per-tile sub-phase trace events (`T_EPI_S0_*` slots at offset
         `72 + 5*tile_idx_epi`). When `swiglu_enable_trace=False` the
         sub-phase records DCE; the parameter is otherwise unused.
+
+        Args:
+            c_tiles: SMEM C tile array used as the output staging buffer
+                (or reinterpreted as fp32/bf16 scratchpad on the fused
+                SwiGLU path).
+            c_tma_op: C TMA store operation for the non-fused BF16 output
+                path; an empty placeholder when `fuse_swiglu=True`.
+            c_device: C device `TileTensor` used for bounds-checked
+                GMEM stores on the non-fused path.
+            stage: `TileWriterType.Stage` from the output pipeline
+                consumer, holding the TMEM accumulator slot.
+            work_ctx: `GroupedWorkContext1D1D` carrying the tile's
+                coordinates, expert ID, expert scale, and token bounds.
+            a_scale_offsets: Per-group A-side scale factor offsets used
+                to compute the SF block base in the fused path.
+            swiglu_out: `SwiGLUOutputT` fused output sink; pass
+                `NullSwiGLUOutput[]()` for non-fused callers.
+            trace_buf: `TraceBufT` for diagnostic per-tile timing
+                records; zero-sized when `swiglu_enable_trace=False`.
+            tile_idx_epi: Per-tile epilogue counter for trace event
+                indexing (defaults to 0).
         """
 
         # For 1D-1D, pass absolute coordinates directly (not tile indices)

@@ -23,6 +23,7 @@ import numpy as np
 import numpy.typing as npt
 from max.pipelines.request import RequestID
 from max.pipelines.request.open_responses import OutputImageContent
+from typing_extensions import Self
 
 from .eos_tracking import EOSTracker
 from .log_probabilities import LogProbabilities
@@ -49,8 +50,13 @@ class TextGenerationResponseFormat:
     type: str
     """The type of response format, for example, ``json_object`` or ``grammar``."""
 
-    json_schema: dict[str, Any] = field(default_factory=dict)
-    """A JSON schema dictionary that defines the structure and validation rules for the generated response."""
+    json_schema: dict[str, Any] | None = None
+    """A JSON schema dictionary that defines the structure and validation rules for the generated response.
+
+    ``None`` means no schema was provided (no structured-output enforcement). An
+    explicit ``{}`` means "any valid JSON value" and IS enforced (the grammar
+    forces exactly one well-formed JSON value); it is distinct from ``None``.
+    """
 
     grammar: str | None = None
     """Grammar for constrained decoding.
@@ -181,10 +187,12 @@ specific type information through the type system.
 
 .. code-block:: python
 
+    from max.pipelines.context.context import BaseContextType
+
     def process_context(context: BaseContextType) -> BaseContextType:
         # Function that accepts any BaseContext implementation
         # and returns the same type
-        ...
+        return context
 """
 
 
@@ -284,6 +292,15 @@ class GrammarEnforcementState:
     has_json_schema: bool = False
     """Whether this request includes a JSON schema response format."""
 
+    dead_matcher_reported: bool = False
+    """Whether this request already logged that its matcher stopped without accepting.
+
+    A matcher in that state has erred and stays erred, so the bitmask path would
+    otherwise log once per slot per decode step for the rest of the request.
+    Deliberately outside :meth:`snapshot` / :meth:`restore`, so the speculative
+    walk's rollback cannot clear the latch and re-arm the log.
+    """
+
     tool_region: StructuredOutputRegionDelimiters | None = None
     """Token sequences defining tool call boundaries, if conditional enforcement."""
 
@@ -335,13 +352,22 @@ class GrammarEnforcementState:
         Returns:
             True if the matcher should consume the token.
         """
-        # Check thinking region transitions FIRST (higher priority).
-        # Thinking-end delimiter is NOT grammar content — return False
-        # so the caller skips the matcher even though enforcement resumed.
         if (
             self.thinking_region_delimiters is not None
             and self._in_thinking_region
         ):
+            if (
+                self.tool_region is not None
+                and self.tool_region.start_token_ids is not None
+                and self._check_sequence_match(
+                    token, self.tool_region.start_token_ids
+                )
+            ):
+                self._in_thinking_region = False
+                self._thinking_match_buffer.clear()
+                self.grammar_enforced = True
+                return True
+
             if (
                 self.thinking_region_delimiters.end_token_ids is not None
                 and self._check_sequence_match_with_buffer(
@@ -503,30 +529,22 @@ class TextContext:
 
     target_endpoint: str | None = field(default=None)
 
-    external_block_metadata: Any = field(default=None)
-    """Block metadata from the Orchestrator for distributed KV cache (dKV).
+    dkv_cache_hint: bytes | None = field(default=None)
+    """The Orchestrator's ``dkv_cache_hint`` for this request, as JSON bytes.
 
-    When set, the DKVConnector reads this during lookup() to determine
-    which blocks are available in the external BlockStore system.
+    Opaque here. The serving layer only carries it across the API-server to
+    model-worker boundary and hands it to the KV connector's ``load``; the dKV
+    connector parses it in Rust to route each block to the peer that holds it.
+    ``None`` when the request carried no hint.
     """
     cache_salt: str | None = field(default=None)
     """Optional per-request salt that isolates this prompt's prefix-cache
     entries from other requests sharing the same tokens.
 
-    Combined with the cluster-level ``kv_cache_hash_seed`` via XOR inside
-    ``BlockManager.compute_hashes_for_request`` to derive the root parent
-    hash. Has effect only when ``kv_cache_hash_algo`` is ``sha256`` or
-    ``sha256_64``; under ``ahash64`` the salt is dropped with a one-time
-    warning. Capped at 512 chars at the OpenAI schema layer.
-    """
-
-    dkv_hint_instance_name: str = field(default="")
-    """Instance name from the Orchestrator's dkv_cache_hint identifying
-    the dKV instance that owns the cached blocks. The DKVConnector
-    compares this to its own instance name (learned via
-    ExchangeMetadata) and skips the fetch when they match — those
-    blocks are owned locally and surface through MAX's own prefix
-    cache instead.
+    Combined with ``kv_cache_hash_seed`` via XOR to seed the block hash.
+    Works under any ``kv_cache_hash_algo``: a cryptographic guarantee
+    under ``sha256``/``sha256_64``, best-effort under ``ahash64``. Capped
+    at 512 chars at the OpenAI schema layer.
     """
 
     cached_prefix_length: int | None = field(default=None)
@@ -539,8 +557,29 @@ class TextContext:
     chunked-prefill follow-up calls.
     """
 
+    cached_prefix_external_length: int = field(default=0)
+    """How many of :obj:`cached_prefix_length` tokens the KV connector served.
+
+    Set alongside :obj:`cached_prefix_length` on first admission. The remainder
+    came from the on-device prefix cache, which is what lets the scheduler tag
+    its hit counter per tier without a second lookup. Always ``0`` when no
+    connector is configured.
+
+    Not split into the connector's own tiers: :meth:`KVConnector.load` reports
+    only a loaded-block count, so the host/disk (dKV G1/G2) breakdown does not
+    cross that boundary and these tokens are reported as ``external`` rather
+    than guessed at.
+    """
+
     _cache_metrics_emitted: bool = field(default=False)
     """Set to ``True`` after the first CE batch to prevent re-emitting cache hit metrics on chunked-prefill follow-up calls."""
+
+    trace_carrier: dict[str, str] | None = field(default=None)
+    """Serialized W3C trace context (via ``opentelemetry.propagate.inject``)
+    captured from the inbound request's OTel context. Threaded onto this
+    context because it crosses into the model-worker process by value, so the
+    scheduler can re-``extract`` it and parent its phase spans under the
+    caller's trace instead of starting new root spans."""
 
     def __post_init__(self) -> None:
         """Initialize context state after deserialization.
@@ -565,10 +604,65 @@ class TextContext:
                     f"target_endpoint must contain a port if using tcp: {self.target_endpoint}"
                 )
 
+    @classmethod
+    def new_padding_context(cls, *, max_length: int, model_name: str) -> Self:
+        """Creates a single-token dummy context for DP batch padding.
+
+        DP batch padding must construct dummies of the architecture's
+        concrete context type: for VLMs the overlap pipeline narrows every
+        context in an executed batch to :obj:`TextAndVisionContext`, so a
+        plain ``TextContext`` dummy would fail that check. Subclasses with
+        required constructor fields supply empty defaults via
+        :meth:`_padding_context_required_fields`.
+
+        Args:
+            max_length: The maximum sequence length for the dummy context.
+            model_name: The model name recorded on the dummy context.
+
+        Returns:
+            A fresh padding dummy of type ``cls``.
+        """
+        return cls(
+            max_length=max_length,
+            tokens=TokenBuffer(np.zeros(1, dtype=np.int64)),
+            model_name=model_name,
+            _is_padding_ctx=True,
+            **cls._padding_context_required_fields(),
+        )
+
+    @classmethod
+    def _padding_context_required_fields(cls) -> dict[str, Any]:
+        """Returns empty defaults for required subclass constructor fields.
+
+        Subclasses that add required (no-default) constructor fields must
+        override this so :meth:`new_padding_context` can construct a valid
+        empty dummy of the subclass type.
+        """
+        return {}
+
     @property
     def is_done(self) -> bool:
         """Whether text generation has finished."""
         return self.status.is_done
+
+    def _has_pending_future_token(self) -> bool:
+        """Whether the last generated token is an unrealized overlap placeholder."""
+        return (
+            self.tokens.generated_length > 0
+            and int(self.tokens[-1]) == FUTURE_TOKEN
+        )
+
+    @property
+    def last_realized_token(self) -> int:
+        """The most recent realized (non-placeholder) token in the buffer.
+
+        Overlap decode appends a single ``FUTURE_TOKEN`` placeholder while a
+        forward is in flight, so ``tokens[-1]`` may be unrealized. Readers that
+        need a real token must use this instead.
+        """
+        if self._has_pending_future_token():
+            return int(self.tokens[-2])
+        return int(self.tokens[-1])
 
     @property
     def min_tokens(self) -> int:
@@ -740,15 +834,25 @@ class TextContext:
                 num_cached_tokens=self.cached_prefix_length,
             )
 
+        # Hold back an in-flight overlap placeholder so it cannot stream.
+        trailing_future = 1 if self._has_pending_future_token() else 0
+        consumable_end = max(
+            self.tokens._completion_range.start,
+            self.tokens._completion_range.end - trailing_future,
+        )
         element_ids = range(
             self.tokens._completion_range.start,
-            self.tokens._completion_range.end,
+            consumable_end,
         )
         # Consume Generated Tokens
         if len(element_ids) > 0:
             generated_tokens = [
-                int(x) for x in self.tokens.consume_recently_generated_tokens()
+                int(x)
+                for x in self.tokens.array[
+                    self.tokens._completion_range.start : consumable_end
+                ]
             ]
+            self.tokens._completion_range.bump_start(len(element_ids))
             if FUTURE_TOKEN in generated_tokens:
                 raise ValueError(
                     "Attempted to create generation output while future token is not yet realized."
@@ -819,7 +923,9 @@ class TextContext:
 
         self.tokens.advance_with_token(new_token)
 
-        if self.eos_tracker.is_eos_from_tokens(self.tokens.generated):
+        if new_token != FUTURE_TOKEN and self.eos_tracker.is_eos_from_tokens(
+            self.tokens.generated
+        ):
             self.status = GenerationStatus.END_OF_SEQUENCE
         elif self.tokens.current_position >= self.max_length:
             self.status = GenerationStatus.MAXIMUM_LENGTH
@@ -930,7 +1036,7 @@ class TextContext:
         The FSM will be advanced later when the future token is realized
         with the actual generated token.
         """
-        if self.tokens.all[-1] == FUTURE_TOKEN:
+        if self._has_pending_future_token():
             raise ValueError("Cannot have multiple future tokens.")
 
         if self.matcher is not None:
@@ -953,7 +1059,7 @@ class TextContext:
                 "Cannot realize a future token when there are no generated tokens."
             )
 
-        if self.tokens.all[-1] != FUTURE_TOKEN:
+        if not self._has_pending_future_token():
             raise ValueError(
                 "Attempted to realize a non-future token. Found token: ",
                 self.tokens.all[-1],
@@ -972,9 +1078,8 @@ class TextContext:
 
     def reset(self) -> None:
         """Resets the context's state by combining all tokens into a new prompt."""
-        delete_last_generated_token = self.tokens.all[-1] == FUTURE_TOKEN
         self.tokens.reset_as_new_prompt(
-            delete_last_generated_token=delete_last_generated_token
+            delete_last_generated_token=self._has_pending_future_token()
         )
         self._is_initial_prompt = True
         self._spec_decoding_state = None
@@ -1089,6 +1194,14 @@ class TextAndVisionContext(TextContext):
 
         self._validate_state()
 
+    @classmethod
+    def _padding_context_required_fields(cls) -> dict[str, Any]:
+        """Supplies empty vision tokens so padding dummies are valid "no image" contexts."""
+        return {
+            **super()._padding_context_required_fields(),
+            "vision_token_ids": [],
+        }
+
     @property
     def image_idx(self) -> int:
         """Index of the next unencoded image in the prompt."""
@@ -1099,11 +1212,27 @@ class TextAndVisionContext(TextContext):
 
     @property
     def next_images(self) -> list[ImageMetadata]:
-        """Returns the images that are not yet encoded."""
+        """Unencoded images."""
         image_idx = self.image_idx
         if len(self.images) == 0 or self.image_idx == len(self.images):
             return []
         return self.images[image_idx:]
+
+    @property
+    def next_images_in_window(self) -> list[ImageMetadata]:
+        """Unencoded images overlapping the active window.
+
+        An image the window bisects is included whole (the encoder
+        cannot split an image); an image fully ahead of the window is
+        deferred to the iteration whose chunk covers it.
+        """
+        start = self.tokens.processed_length
+        end = self.tokens.current_position
+        return [
+            img
+            for img in self.next_images
+            if img.start_idx < end and img.end_idx > start
+        ]
 
     @property
     def needs_vision_encoding(self) -> bool:
@@ -1321,6 +1450,78 @@ class PixelContext:
         )
 
 
+@dataclass(kw_only=True)
+class AudioContext:
+    """A model-ready context for audio generation requests.
+
+    Like :class:`PixelContext`, this carries only what the model executes
+    against: the caller's text has already been through the tokenizer, and
+    what is left is token ids plus the numbers that size the generation.
+
+    Configuration:
+        tokens: The conditional prompt's token ids.
+        request_id: A unique identifier for this generation request.
+        model_name: Name of the model being used.
+        negative_tokens: The unconditional prompt's token ids, for models
+            that generate with classifier-free guidance.
+        audio_duration: Upper bound on the generated audio, in seconds. A
+            model may stop earlier, so the waveform's own length is the
+            authority on what was produced. Required, because what a request
+            leaves unset is the checkpoint's default rather than any value
+            this framework could pick, and the tokenizer resolves it.
+        num_inference_steps: Denoising steps, for models whose audio comes
+            from a diffusion or flow-matching stage. Required, for the same
+            reason as ``audio_duration``.
+        guidance_scale: Classifier-free guidance scale, or ``None`` to leave
+            it to the model. Audio models often bake distinct scales into
+            distinct stages, and a single request-level number cannot say
+            which one it means.
+        seed: RNG seed for the sampling the model does.
+        audio_format: Container the waveform is encoded into for the
+            response.
+        waveform: The generated samples, once there are any.
+    """
+
+    tokens: TokenBuffer
+    """Conditional prompt tokens."""
+
+    request_id: RequestID = field(default_factory=RequestID)
+
+    model_name: str = field(default="")
+
+    negative_tokens: TokenBuffer | None = field(default=None)
+    """Unconditional prompt tokens. None for models that do not guide."""
+
+    audio_duration: float
+    num_inference_steps: int
+    guidance_scale: float | None = field(default=None)
+    seed: int | None = field(default=None)
+    audio_format: str = field(default="wav")
+
+    waveform: npt.NDArray[np.float32] | None = field(default=None)
+    """Generated samples in ``(channels, samples)`` layout, in ``[-1, 1]``."""
+
+    status: GenerationStatus = field(default=GenerationStatus.ACTIVE)
+
+    @property
+    def is_done(self) -> bool:
+        """Whether the request has completed generation."""
+        return self.status.is_done
+
+    def compute_num_available_steps(self, max_seq_len: int) -> int:
+        """Returns the denoising steps, for scheduler compatibility."""
+        return self.num_inference_steps
+
+    def reset(self) -> None:
+        """Resets the context's state."""
+        self.status = GenerationStatus.ACTIVE
+        self.waveform = None
+
+    def update(self, waveform: npt.NDArray[np.float32]) -> None:
+        """Stores the generated samples on the context."""
+        self.waveform = waveform
+
+
 # ---------------------------------------------------------------------------
 # Context TypeVars (bound to concrete implementations)
 # ---------------------------------------------------------------------------
@@ -1338,3 +1539,8 @@ PixelGenerationContextType = TypeVar(
     "PixelGenerationContextType", bound=PixelContext
 )
 """Type variable for pixel generation context types, constrained to PixelContext."""
+
+AudioGenerationContextType = TypeVar(
+    "AudioGenerationContextType", bound=AudioContext
+)
+"""Type variable for audio generation context types, constrained to AudioContext."""

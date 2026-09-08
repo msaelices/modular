@@ -11,9 +11,6 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-
-import json
-
 from max.pipelines.context.exceptions import InputError
 from max.serve.config import Settings
 from max.serve.router.openai_routes import (
@@ -587,33 +584,10 @@ def test_openai_response_format_accepts_boolean_schema(schema: bool) -> None:
     assert response_format["json_schema"]["schema"] is schema
 
 
-def test_create_response_format_probes_normalized_schema() -> None:
-    """``_create_response_format`` validates the *normalized* schema against
-    the active backend (via the injected validator), so an uncompilable schema
-    is a 400 here rather than a worker crash later."""
-    probed: list[str] = []
-
-    class _RecordingValidator:
-        """GrammarValidator that records the schema it is asked to check."""
-
-        def check_tool_grammar(self, grammar: str) -> None:
-            return None
-
-        def check_json_schema(self, json_schema: str) -> None:
-            probed.append(json_schema)
-
-    class _RaisingValidator:
-        """GrammarValidator that rejects everything, as an uncompilable
-        schema would."""
-
-        def check_tool_grammar(self, grammar: str) -> None:
-            raise InputError("cannot compile")
-
-        def check_json_schema(self, json_schema: str) -> None:
-            raise InputError("cannot compile")
-
-    # A schema with no root ``type`` — normalization defaults it to "object",
-    # and that normalized form is what the validator (and worker) must compile.
+def test_create_response_format_normalizes_schema() -> None:
+    """The worker compiles what this returns, so it must carry the
+    *normalized* schema: an untyped root defaults to "object", which is what
+    keeps a looping model from running to max_length."""
     response_format = cast(
         Any,
         {
@@ -622,19 +596,30 @@ def test_create_response_format_probes_normalized_schema() -> None:
         },
     )
 
-    _create_response_format(
-        response_format,
-        enable_response_format_schema=True,
-        grammar_validator=_RecordingValidator(),
+    result = _create_response_format(
+        response_format, enable_response_format_schema=True
     )
-    assert len(probed) == 1
-    assert json.loads(probed[0])["type"] == "object"
+
+    assert result is not None
+    assert result.json_schema is not None
+    assert result.json_schema["type"] == "object"
+
+
+def test_create_response_format_rejects_schema_without_the_flag() -> None:
+    """The flag check stays at the route: the worker's grammar gate skips
+    requests ``update_context`` would reject, so one reaching the worker
+    would raise from inside ``execute()``."""
+    response_format = cast(
+        Any,
+        {
+            "type": "json_schema",
+            "json_schema": {"name": "t", "schema": {"type": "object"}},
+        },
+    )
 
     with pytest.raises(InputError):
         _create_response_format(
-            response_format,
-            enable_response_format_schema=True,
-            grammar_validator=_RaisingValidator(),
+            response_format, enable_response_format_schema=False
         )
 
 
@@ -1003,6 +988,127 @@ def test_thinking_does_not_override_explicit_chat_template_kwargs() -> None:
     }
 
 
+def _chat_template_kwargs_for(payload: dict[str, Any]) -> dict[str, Any] | None:
+    request = CreateChatCompletionRequest.model_validate(
+        {
+            "model": "gpt-3.5-turbo",
+            "messages": [{"role": "user", "content": "Hello"}],
+            **payload,
+        }
+    )
+    return request.resolved_chat_template_kwargs
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        pytest.param({}, None, id="no_reasoning_controls"),
+        pytest.param(
+            {"chat_template_kwargs": {"enable_thinking": False}},
+            {"enable_thinking": False},
+            id="passthrough_without_reasoning_controls",
+        ),
+        pytest.param(
+            {"reasoning_effort": "high"},
+            {
+                "enable_thinking": True,
+                "thinking": True,
+                "reasoning_effort": "high",
+            },
+            id="top_level_effort",
+        ),
+        pytest.param(
+            {"reasoning_effort": "none"},
+            {
+                "enable_thinking": False,
+                "thinking": False,
+                "reasoning_effort": "none",
+            },
+            id="effort_none_disables_thinking",
+        ),
+        pytest.param(
+            {"chat_template_kwargs": {"reasoning_effort": "none"}},
+            {
+                "enable_thinking": False,
+                "thinking": False,
+                "reasoning_effort": "none",
+            },
+            id="client_effort_none_disables_thinking",
+        ),
+        pytest.param(
+            {"chat_template_kwargs": {"reasoning_effort": "low"}},
+            {
+                "enable_thinking": True,
+                "thinking": True,
+                "reasoning_effort": "low",
+            },
+            id="client_effort_enables_thinking",
+        ),
+        pytest.param(
+            {
+                "chat_template_kwargs": {
+                    "reasoning_effort": "none",
+                    "enable_thinking": True,
+                }
+            },
+            {
+                "enable_thinking": True,
+                "thinking": True,
+                "reasoning_effort": "none",
+            },
+            id="client_toggle_wins_over_client_effort",
+        ),
+        pytest.param(
+            {"reasoning": {"effort": "low"}},
+            {
+                "enable_thinking": True,
+                "thinking": True,
+                "reasoning_effort": "low",
+            },
+            id="openrouter_effort",
+        ),
+        pytest.param(
+            {"reasoning": {"enabled": False, "effort": "high"}},
+            {
+                "enable_thinking": False,
+                "thinking": False,
+                "reasoning_effort": "high",
+            },
+            id="openrouter_enabled_wins_over_effort",
+        ),
+        pytest.param(
+            {"reasoning_effort": "high", "reasoning": {"effort": "low"}},
+            {
+                "enable_thinking": True,
+                "thinking": True,
+                "reasoning_effort": "high",
+            },
+            id="top_level_effort_wins",
+        ),
+        pytest.param(
+            {
+                "reasoning_effort": "high",
+                "chat_template_kwargs": {
+                    "reasoning_effort": "low",
+                    "enable_thinking": False,
+                },
+            },
+            {
+                "reasoning_effort": "low",
+                "enable_thinking": False,
+                "thinking": False,
+            },
+            id="client_kwargs_win",
+        ),
+    ],
+)
+def test_resolved_chat_template_kwargs(
+    payload: dict[str, Any], expected: dict[str, Any] | None
+) -> None:
+    """Reasoning controls are folded into the kwargs the chat template sees."""
+    assert _chat_template_kwargs_for(payload) == expected
+
+
 # ---------------------------------------------------------------------------
 # MiniMax v1/chat/completions format-correctness conformance.
 # ---------------------------------------------------------------------------
@@ -1135,6 +1241,24 @@ async def test_openai_rejects_invalid_json_tool_call_arguments() -> None:
         }
     )
     with pytest.raises(InputError):
+        await openai_parse_chat_completion_request(
+            request, wrap_content=True, settings=Settings()
+        )
+
+
+async def test_openai_rejects_text_content_part_without_text_field() -> None:
+    """``{'type': 'text'}`` parts must include ``text`` and error cleanly."""
+    request = CreateChatCompletionRequest.model_validate(
+        {
+            "model": "test",
+            "messages": [{"role": "user", "content": [{"type": "text"}]}],
+        }
+    )
+
+    with pytest.raises(
+        InputError,
+        match=r"Content part of type 'text' must include a 'text' field\.",
+    ):
         await openai_parse_chat_completion_request(
             request, wrap_content=True, settings=Settings()
         )

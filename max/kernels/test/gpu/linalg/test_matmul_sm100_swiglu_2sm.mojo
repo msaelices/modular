@@ -58,8 +58,8 @@ from std.math import exp, recip
 from std.sys import size_of
 
 import linalg.matmul.vendor.blas as vendor_blas
-from std.gpu.host import DeviceContext
-from std.gpu.host.nvidia.tma import TensorMapSwizzle
+from max.gpu.host import DeviceContext
+from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from internal_utils import assert_almost_equal
 from std.random import rand
 from layout import TileTensor, Coord, CoordLike, row_major, Idx
@@ -77,8 +77,8 @@ from std.utils.static_tuple import StaticTuple
 
 
 def swiglu_reference(
-    full_ptr: UnsafePointer[Scalar[DType.float32], _],
-    ref_ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    full_ptr: ImmPointer[Float32, _],
+    ref_ptr: MutPointer[BFloat16, MutAnyOrigin],
     M: Int,
     N: Int,
 ):
@@ -92,9 +92,9 @@ def swiglu_reference(
         for h in range(H):
             var gate = full_ptr[m * N + 2 * h]
             var up = full_ptr[m * N + 2 * h + 1]
-            var sigmoid = recip(Scalar[DType.float32](1.0) + exp(-gate))
+            var sigmoid = recip(Float32(1.0) + exp(-gate))
             var result = gate * sigmoid * up
-            ref_ptr.store(m * H + h, result.cast[DType.bfloat16]())
+            ref_ptr.store(m * H + h, result.cast[.bfloat16]())
 
 
 def test_swiglu[
@@ -102,9 +102,7 @@ def test_swiglu[
     NType: CoordLike,
     KType: CoordLike,
     //,
-    config: FusedSwiGLUMatmulConfig[
-        DType.bfloat16, DType.bfloat16, DType.bfloat16, True
-    ],
+    config: FusedSwiGLUMatmulConfig[.bfloat16, .bfloat16, .bfloat16, True],
 ](ctx: DeviceContext, m: MType, n: NType, k: KType) raises:
     comptime dtype = DType.bfloat16
 
@@ -151,7 +149,7 @@ def test_swiglu[
     var a_host = TileTensor(a_host_buf, a_shape)
     var b_host_buf = ctx.enqueue_create_host_buffer[dtype](b_size)
     var b_host = TileTensor(b_host_buf, b_shape)
-    var full_host_buf = ctx.enqueue_create_host_buffer[DType.float32](full_size)
+    var full_host_buf = ctx.enqueue_create_host_buffer[.float32](full_size)
     var full_host = TileTensor(full_host_buf, full_shape)
     var c_host_buf = ctx.enqueue_create_host_buffer[dtype](c_size)
     var c_host = TileTensor(c_host_buf, c_shape)
@@ -162,12 +160,12 @@ def test_swiglu[
     var a_tensor = TileTensor(a_device, a_shape)
     var b_device = ctx.enqueue_create_buffer[dtype](b_size)
     var b_tensor = TileTensor(b_device, b_shape)
-    var full_device = ctx.enqueue_create_buffer[DType.float32](full_size)
+    var full_device = ctx.enqueue_create_buffer[.float32](full_size)
     var full_tensor = TileTensor(full_device, full_shape)
     var c_device = ctx.enqueue_create_buffer[dtype](c_size)
 
-    rand(a_host.ptr, a_host.num_elements())
-    rand(b_host.ptr, b_host.num_elements())
+    rand(a_host._storage, a_host.num_elements())
+    rand(b_host._storage, b_host.num_elements())
 
     ctx.enqueue_copy(a_device, a_host_buf)
     ctx.enqueue_copy(b_device, b_host_buf)
@@ -184,7 +182,9 @@ def test_swiglu[
     ctx.enqueue_copy(full_host_buf, full_device)
     ctx.synchronize()
 
-    swiglu_reference(full_host.ptr, c_ref.ptr.as_unsafe_any_origin(), M, N)
+    swiglu_reference(
+        full_host._storage, c_ref._storage.as_unsafe_any_origin(), M, N
+    )
 
     var c_tensor = TileTensor(c_device, c_shape)
     matmul_swiglu_dispatch_sm100[config](c_tensor, a_tensor, b_tensor, ctx)
@@ -193,8 +193,8 @@ def test_swiglu[
     ctx.synchronize()
 
     assert_almost_equal(
-        c_host.ptr,
-        c_ref.ptr,
+        c_host._storage,
+        c_ref._storage,
         c_size,
         atol=1e-2,
         rtol=1e-2,

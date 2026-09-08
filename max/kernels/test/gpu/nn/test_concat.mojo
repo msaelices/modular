@@ -15,7 +15,7 @@ from std.collections import Optional
 from std.math import ceildiv
 from std.sys import size_of
 
-from std.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu.host import DeviceBuffer, DeviceContext
 from layout import Coord, TileTensor, row_major
 from nn.concat import (
     _concat_gpu,
@@ -120,11 +120,11 @@ def test_concat_4_inputs_rank5[test_epilogue: Bool](ctx: DeviceContext) raises:
 
     comptime B_SIZE = 32
 
-    @parameter
+    @__parameter
     @always_inline
     @__copy_capture(output_dyn)
     def epilogue_plus_one[
-        c_type: DType, _rank: Int, width: SIMDSize, *, alignment: Int
+        c_type: DType, _rank: Int, width: SIMDLength, *, alignment: Int
     ](indices: IndexList[_rank], val: SIMD[c_type, width]):
         var coord = Coord(indices)
         comptime assert output_dyn.flat_rank >= coord.flat_rank
@@ -136,10 +136,10 @@ def test_concat_4_inputs_rank5[test_epilogue: Bool](ctx: DeviceContext) raises:
     comptime kernel = _concat_inner_most_single_dim[
         OutputLayoutType=output_dyn.LayoutType,
         output_origin=MutAnyOrigin,
-        OutputStorage=output_dyn.Storage,
+        OutputEngine=output_dyn.Engine,
         InputLayoutType=input_0_dyn.LayoutType,
         input_origin=ImmutAnyOrigin,
-        InputStorage=input_0_dyn.Storage,
+        InputEngine=input_0_dyn.Engine,
         dtype=dtype,
         num_inputs=4,
         block_size=B_SIZE,
@@ -149,15 +149,16 @@ def test_concat_4_inputs_rank5[test_epilogue: Bool](ctx: DeviceContext) raises:
     ]
 
     @always_inline
-    @__copy_capture(
-        output_dyn,
-        input_0_dyn,
-        input_1_dyn,
-        input_2_dyn,
-        input_3_dyn,
-    )
-    @parameter
-    def run_concat_inner_most_single_dim(ctx: DeviceContext) raises:
+    def run_concat_inner_most_single_dim(
+        ctx: DeviceContext,
+    ) raises {
+        var output_dyn,
+        var input_0_dyn,
+        var input_1_dyn,
+        var input_2_dyn,
+        var input_3_dyn,
+        imm,
+    }:
         ctx.enqueue_function[kernel](
             output_dyn.as_unsafe_any_origin(),
             StaticTuple[
@@ -173,7 +174,7 @@ def test_concat_4_inputs_rank5[test_epilogue: Bool](ctx: DeviceContext) raises:
             block_dim=(B_SIZE),
         )
 
-    var nstime_kernel = ctx.execution_time[run_concat_inner_most_single_dim](1)
+    var nstime_kernel = ctx.execution_time(run_concat_inner_most_single_dim, 1)
     print(
         "concat_inner_most_single_dim time = ",
         Float64(nstime_kernel) * 1e-6,
@@ -193,7 +194,7 @@ def test_concat_4_inputs_rank5[test_epilogue: Bool](ctx: DeviceContext) raises:
     ctx.enqueue_copy(output_host_buffer, output_device_buffer)
     ctx.synchronize()
 
-    def validate_results() raises {read}:
+    def validate_results() raises {imm}:
         for i in range(d0):
             for j in range(d1):
                 for k in range(d2):
@@ -223,15 +224,16 @@ def test_concat_4_inputs_rank5[test_epilogue: Bool](ctx: DeviceContext) raises:
     validate_results()
 
     @always_inline
-    @__copy_capture(
-        output_dyn,
-        input_0_dyn,
-        input_1_dyn,
-        input_2_dyn,
-        input_3_dyn,
-    )
-    @parameter
-    def run_concat_gpu(ctx: DeviceContext) raises:
+    def run_concat_gpu(
+        ctx: DeviceContext,
+    ) raises {
+        var output_dyn,
+        var input_0_dyn,
+        var input_1_dyn,
+        var input_2_dyn,
+        var input_3_dyn,
+        imm,
+    }:
         # uses default stream
         _concat_gpu[
             epilogue_fn=Optional[elementwise_epilogue_type](
@@ -252,7 +254,7 @@ def test_concat_4_inputs_rank5[test_epilogue: Bool](ctx: DeviceContext) raises:
             ctx,
         )
 
-    var nstime = ctx.execution_time[run_concat_gpu](1)
+    var nstime = ctx.execution_time(run_concat_gpu, 1)
     print("concat_gpu time = ", Float64(nstime) * 1e-6, " ms")
     print(
         "transfer rate = ",
@@ -325,7 +327,7 @@ def test_inner_most_single_dim_static_vs_dynamic(ctx: DeviceContext) raises:
     # Static-layout tensors (fold fires).
     comptime StaticInLayout = type_of(input_layout)
     var out_static = TileTensor(out_static_dev, static_output_layout)
-    # Name the input tile type so the kernel's `InputStorage` param matches the
+    # Name the input tile type so the kernel's `InputEngine` param matches the
     # `DeviceBuffer` constructor's storage exactly (the tuple elements are built
     # from the same expression); the tuple can't be indexed at comptime.
     comptime StaticInTile = type_of(
@@ -343,10 +345,10 @@ def test_inner_most_single_dim_static_vs_dynamic(ctx: DeviceContext) raises:
     comptime kernel_static = _concat_inner_most_single_dim[
         OutputLayoutType=out_static.LayoutType,
         output_origin=MutAnyOrigin,
-        OutputStorage=out_static.Storage,
+        OutputEngine=out_static.Engine,
         InputLayoutType=StaticInLayout,
         input_origin=ImmutAnyOrigin,
-        InputStorage=StaticInTile.Storage,
+        InputEngine=StaticInTile.Engine,
         dtype=dtype,
         num_inputs=num_inputs,
         block_size=B_SIZE,
@@ -385,10 +387,10 @@ def test_inner_most_single_dim_static_vs_dynamic(ctx: DeviceContext) raises:
     comptime kernel_dynamic = _concat_inner_most_single_dim[
         OutputLayoutType=out_dynamic.LayoutType,
         output_origin=MutAnyOrigin,
-        OutputStorage=out_dynamic.Storage,
+        OutputEngine=out_dynamic.Engine,
         InputLayoutType=DynInLayout,
         input_origin=ImmutAnyOrigin,
-        InputStorage=DynInTile.Storage,
+        InputEngine=DynInTile.Engine,
         dtype=dtype,
         num_inputs=num_inputs,
         block_size=B_SIZE,

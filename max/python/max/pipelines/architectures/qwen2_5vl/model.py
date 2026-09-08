@@ -41,9 +41,11 @@ from max.pipelines.lib import (
     KVCacheConfig,
     ModelInputs,
     ModelOutputs,
+    MultiGraphPipelineModelWithKVCache,
     PipelineConfig,
-    PipelineModelWithKVCache,
 )
+from max.pipelines.lib.memory_estimation import MemoryPlan
+from max.profiler import traced
 
 from .batch_processor import Qwen2_5VLBatchProcessor
 from .model_config import Qwen2_5VLConfig
@@ -119,7 +121,8 @@ class Qwen2_5VLInputs(ModelInputs):
 
 
 class Qwen2_5VLModel(
-    AlwaysSignalBuffersMixin, PipelineModelWithKVCache[TextAndVisionContext]
+    AlwaysSignalBuffersMixin,
+    MultiGraphPipelineModelWithKVCache[TextAndVisionContext],
 ):
     """A Qwen2.5VL pipeline model for multimodal text generation."""
 
@@ -129,7 +132,7 @@ class Qwen2_5VLModel(
 
     model_config_cls: ClassVar[type[Any]] = Qwen2_5VLConfig
 
-    vision_model: Model
+    vision_model: Model | None
     """The compiled vision model for processing images."""
 
     language_model: Model
@@ -145,6 +148,8 @@ class Qwen2_5VLModel(
         devices: list[Device],
         kv_cache_config: KVCacheConfig,
         weights: Weights,
+        *,
+        memory_plan: MemoryPlan,
         adapter: WeightsAdapter | None = None,
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
         max_batch_size: int = 1,
@@ -155,9 +160,10 @@ class Qwen2_5VLModel(
             devices,
             kv_cache_config,
             weights,
-            adapter,
-            return_logits,
+            adapter=adapter,
+            return_logits=return_logits,
             max_batch_size=max_batch_size,
+            memory_plan=memory_plan,
         )
 
         self.model_config = None
@@ -169,12 +175,7 @@ class Qwen2_5VLModel(
 
         self.vision_model, self.language_model = self.load_model(session)
 
-    def load_model(self, session: InferenceSession) -> tuple[Model, Model]:
-        """Loads the compiled Qwen2.5VL models into the MAX Engine session.
-
-        Returns:
-            A tuple of (vision_model, language_model).
-        """
+    def _load_state_dict(self) -> dict[str, Any]:
         # Get LLM weights dictionary. Needed before model config generation
         # because we need to know if word embeddings are tied or not.
         if not isinstance(self.weights, SafetensorWeights):
@@ -202,16 +203,24 @@ class Qwen2_5VLModel(
                     f"Key: {key} is not part of the vision or language model"
                 )
 
+        self._vision_weights_dict = vision_state_dict
+        self._language_weights_dict = llm_state_dict
+        return model_state_dict
+
+    def _create_model_config(
+        self, model_state_dict: dict[str, WeightData]
+    ) -> Qwen2_5VLConfig:
         # Generate Qwen2.5VL config from HuggingFace config
         qwen2_5vl_config = Qwen2_5VLConfig.initialize_from_config(
             pipeline_config=self.pipeline_config,
             huggingface_config=self.huggingface_config,
+            max_seq_len=self.max_seq_len,
         )
         qwen2_5vl_config.finalize(
             huggingface_config=self.huggingface_config,
             pipeline_config=self.pipeline_config,
-            llm_state_dict=llm_state_dict,
-            vision_state_dict=vision_state_dict,
+            llm_state_dict=self._language_weights_dict,
+            vision_state_dict=self._vision_weights_dict,
             return_logits=self.return_logits,
         )
         self.model_config = qwen2_5vl_config
@@ -219,23 +228,46 @@ class Qwen2_5VLModel(
         assert self.model_config is not None, "Model config must be initialized"
         self.model: Module = Qwen2_5VL(self.model_config)
         self.model.load_state_dict(model_state_dict, strict=True)
+        return qwen2_5vl_config
 
-        # Build and compile vision + language models in parallel
+    @traced
+    def load_model(
+        self, session: InferenceSession
+    ) -> tuple[Model | None, Model]:
+        """Override: incompatible tower graph capture signature.
+
+        ``_build_*`` is ``(module) -> Graph`` (not the base
+        ``(config, state_dict, module) -> (Graph, registry)``), because
+        graphs are captured from a pre-instantiated ``Qwen2_5VL`` module after
+        ``load_state_dict`` in ``_create_model_config``. Registry keys come
+        from the tower splits in ``_load_state_dict``, not from per-tower
+        ``nn.state_dict()`` returns.
+        """
+        state_dict = self._load_state_dict()
+        self._create_model_config(state_dict)
+
         with CompilationTimer("vision + language model") as timer:
             graph_module = GraphModule()
+
             vision_graph = self._build_vision_graph(module=graph_module)
             language_graph = self._build_language_graph(module=graph_module)
             timer.mark_build_complete()
-            combined_registry = {**vision_state_dict, **llm_state_dict}
-            models = session.load_all(
-                graph_module, weights_registry=combined_registry
-            )
-            vision_model = models[vision_graph.name]
-            language_model = models[language_graph.name]
 
+            models = session.load_all(
+                graph_module,
+                weights_registry={
+                    **self._vision_weights_dict,
+                    **self._language_weights_dict,
+                },
+            )
+
+        vision_model = models[vision_graph.name]
+        language_model = models[language_graph.name]
         return vision_model, language_model
 
-    def _build_vision_graph(self, module: GraphModule | None = None) -> Graph:
+    def _build_vision_graph(  # type: ignore[override]
+        self, module: GraphModule | None = None
+    ) -> Graph:
         """Build the vision model graph for processing images.
 
         Now supports multi-GPU processing for the vision encoder.
@@ -326,18 +358,16 @@ class Qwen2_5VLModel(
         # Build the vision graph
         with Graph(
             "qwen2_5vl_vision",
-            input_types=tuple(
-                [
-                    *pixel_values_types,
-                    *rot_pos_ids_types,
-                    *window_index_types,
-                    *cu_seqlens_types,
-                    *cu_window_seqlens_types,
-                    *max_seqlen_types,
-                    *max_window_seqlen_types,
-                    *max_grid_size_types,
-                    *signals.input_types(),
-                ]
+            input_types=(
+                *pixel_values_types,
+                *rot_pos_ids_types,
+                *window_index_types,
+                *cu_seqlens_types,
+                *cu_window_seqlens_types,
+                *max_seqlen_types,
+                *max_window_seqlen_types,
+                *max_grid_size_types,
+                *signals.input_types(),
             ),
             module=module,
         ) as graph:
@@ -390,7 +420,9 @@ class Qwen2_5VLModel(
 
         return graph
 
-    def _build_language_graph(self, module: GraphModule | None = None) -> Graph:
+    def _build_language_graph(  # type: ignore[override]
+        self, module: GraphModule | None = None
+    ) -> Graph:
         """Build the language model graph for text generation with image embeddings."""
 
         assert isinstance(self.model, Qwen2_5VL)
@@ -535,6 +567,7 @@ class Qwen2_5VLModel(
         image_embeddings: list[Buffer]
 
         if model_inputs.has_vision_inputs:
+            assert self.vision_model is not None
             assert model_inputs.image_token_indices is not None
             assert model_inputs.pixel_values is not None
             assert model_inputs.vision_position_ids is not None

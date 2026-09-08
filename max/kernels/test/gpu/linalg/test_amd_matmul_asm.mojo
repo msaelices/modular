@@ -13,9 +13,10 @@
 
 from std.sys import has_amd_gpu_accelerator
 
-from std.gpu.host import get_gpu_target
-from std.gpu.host.compile import _compile_code
+from max.gpu.host import get_gpu_target
+from max.gpu.host.compile import _compile_code
 from layout import ComptimeInt, RowMajorLayout
+from layout.tensor_engine import DefaultEngine
 from linalg.matmul.gpu import _amdgpu_matmul_config_from_block_shape
 from linalg.matmul.gpu.amd import AMDMatmul, AMDPingPongMatmul, KernelConfig
 from std.testing import assert_true
@@ -148,6 +149,9 @@ def compile_kernel_to_asm[
         c_tt_layout,
         a_tt_layout,
         b_tt_layout,
+        DefaultEngine[element_width=1],
+        DefaultEngine[element_width=1],
+        DefaultEngine[element_width=1],
     ]
 
     # Compile for AMD GPU
@@ -203,6 +207,9 @@ def compile_pingpong_kernel_to_asm[
         a_tt_layout,
         b_tt_layout,
         c_tt_layout,
+        DefaultEngine[element_width=1],
+        DefaultEngine[element_width=1],
+        DefaultEngine[element_width=1],
     ]
 
     # Compile for AMD GPU
@@ -266,9 +273,9 @@ def test_amd_matmul_bf16_max_config() raises:
         return
 
     test_matmul_config[
-        DType.bfloat16,  # c_type
-        DType.bfloat16,  # a_type
-        DType.bfloat16,  # b_type
+        .bfloat16,  # c_type
+        .bfloat16,  # a_type
+        .bfloat16,  # b_type
         block_m=256,
         block_n=256,
     ]()
@@ -283,9 +290,9 @@ def test_amd_matmul_fp8_max_config() raises:
         return
 
     test_matmul_config[
-        DType.bfloat16,  # c_type
-        DType.float8_e4m3fn,  # a_type
-        DType.float8_e4m3fn,  # b_type
+        .bfloat16,  # c_type
+        .float8_e4m3fn,  # a_type
+        .float8_e4m3fn,  # b_type
         block_m=256,
         block_n=256,
     ]()
@@ -305,9 +312,9 @@ def test_amd_pingpong_fp8_max_config() raises:
     print("MMA shape: 16x16x128")
 
     var asm = compile_pingpong_kernel_to_asm[
-        DType.bfloat16,  # c_type
-        DType.float8_e4m3fn,  # a_type
-        DType.float8_e4m3fn,  # b_type
+        .bfloat16,  # c_type
+        .float8_e4m3fn,  # a_type
+        .float8_e4m3fn,  # b_type
         M=8192,
         N=8192,
         K=256,
@@ -336,9 +343,9 @@ def test_amd_pingpong_bf16_max_config() raises:
     print("MMA shape: 16x16x32")
 
     var asm = compile_pingpong_kernel_to_asm[
-        DType.bfloat16,  # c_type
-        DType.bfloat16,  # a_type
-        DType.bfloat16,  # b_type
+        .bfloat16,  # c_type
+        .bfloat16,  # a_type
+        .bfloat16,  # b_type
         M=8192,
         N=8192,
         K=256,

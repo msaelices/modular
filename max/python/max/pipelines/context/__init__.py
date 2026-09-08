@@ -13,6 +13,8 @@
 
 from .context import (
     FUTURE_TOKEN,
+    AudioContext,
+    AudioGenerationContextType,
     BaseContext,
     BaseContextType,
     GrammarEnforcementSnapshot,
@@ -64,9 +66,12 @@ from .tokens import (
     TokenHashOverride,
     TokenSlice,
 )
+from .video import open_video_container
 
 __all__ = [
     "FUTURE_TOKEN",
+    "AudioContext",
+    "AudioGenerationContextType",
     "BaseContext",
     "BaseContextType",
     "BatchLogitsProcessor",
@@ -100,6 +105,7 @@ __all__ = [
     "TokenHashOverride",
     "TokenSlice",
     "VLMContextType",
+    "open_video_container",
     "validate_aspect_ratio_args",
     "validate_flux2_max_pixel_area",
     "validate_image_grid_thw_args",

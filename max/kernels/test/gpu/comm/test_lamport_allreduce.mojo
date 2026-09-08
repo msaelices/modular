@@ -53,8 +53,8 @@ from comm.allreduce import (
 )
 from comm.device_query import get_sm_version
 from internal_utils import human_readable_size
-from std.gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
-from std.gpu.primitives.grid_controls import PDLLevel
+from max.gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
+from max.gpu.primitives.grid_controls import PDLLevel
 from std.memory import bitcast
 from std.testing import assert_equal, assert_true
 from std.collections import Optional
@@ -99,15 +99,15 @@ def lamport_allreduce_test[
 
     var in_dev = List[DeviceBuffer[dtype]](capacity=ngpus)
     var out_dev = List[DeviceBuffer[dtype]](capacity=ngpus)
-    var host_buffers = List[UnsafePointer[Scalar[dtype], MutUntrackedOrigin]](
+    var host_buffers = List[MutPointer[Scalar[dtype], MutUntrackedOrigin]](
         capacity=ngpus
     )
 
     # Signal buffers: Signal header + scratch for the Lamport region
     # (3 generations * ngpus slots * max-small-message).
     var scratch_bytes = 3 * ngpus * Lamport.MAX_SMALL_MESSAGE_BYTES
-    var signal_buffers = List[DeviceBuffer[DType.uint8]](capacity=ngpus)
-    var rank_sigs = InlineArray[UnsafePointer[Signal, MutAnyOrigin], MAX_GPUS](
+    var signal_buffers = List[DeviceBuffer[.uint8]](capacity=ngpus)
+    var rank_sigs = Array[MutPointer[Signal, MutAnyOrigin], MAX_GPUS](
         uninitialized=True
     )
 
@@ -136,7 +136,7 @@ def lamport_allreduce_test[
                 host_buffer[j] = Scalar[dtype](i + 1)
 
         signal_buffers.append(
-            list_of_ctx[i].create_buffer_sync[DType.uint8](
+            list_of_ctx[i].create_buffer_sync[.uint8](
                 size_of[Signal]() + scratch_bytes
             )
         )
@@ -151,21 +151,25 @@ def lamport_allreduce_test[
     comptime InTensorType = TileTensor[
         dtype, type_of(row_major(length)), ImmutAnyOrigin
     ]
-    var in_tensors = InlineArray[InTensorType, ngpus](uninitialized=True)
-    for i in range(ngpus):
-        in_tensors[i] = TileTensor(
-            rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+    var in_tensors = Array[_, ngpus](
+        fill_with=lambda (i: Int) -> InTensorType: TileTensor(
+            rebind[ImmPointer[Scalar[dtype], ImmutAnyOrigin]](
                 in_dev[i].unsafe_ptr()
             ),
             row_major(length),
         )
+    )
 
     comptime OutTensorType = TileTensor[
         dtype, type_of(row_major(length)), MutAnyOrigin
     ]
-    var out_tensors = InlineArray[OutTensorType, ngpus](uninitialized=True)
-    for i in range(ngpus):
-        out_tensors[i] = TileTensor(out_dev[i], row_major(length))
+    var out_tensors = Array[_, ngpus](
+        fill_with=lambda (i: Int) {
+            mut out_dev, imm
+        } -> OutTensorType: TileTensor(
+            out_dev[i], row_major(length)
+        ).as_unsafe_any_origin()
+    )
 
     for i in range(ngpus):
         list_of_ctx[i].synchronize()
@@ -203,12 +207,12 @@ def lamport_allreduce_test[
     for it in range(NUM_ITERS):
 
         @always_inline
-        @parameter
+        @__parameter
         @__copy_capture(out_capture)
         def lamport_epilogue[
             input_index: Int,
             _dtype: DType,
-            _width: SIMDSize,
+            _width: SIMDLength,
             *,
             _alignment: Int,
         ](coords: Coord, val: SIMD[_dtype, _width]) -> None:
@@ -230,6 +234,7 @@ def lamport_allreduce_test[
                 rank_sigs,
                 lamport_cfg,
                 list_of_ctx[i],
+                i,
             )
         for i in range(ngpus):
             list_of_ctx[i].synchronize()
@@ -308,13 +313,13 @@ def lamport_mixed_size_test[
 
     var in_dev = List[DeviceBuffer[dtype]](capacity=ngpus)
     var out_dev = List[DeviceBuffer[dtype]](capacity=ngpus)
-    var host = List[UnsafePointer[Scalar[dtype], MutUntrackedOrigin]](
+    var host = List[MutPointer[Scalar[dtype], MutUntrackedOrigin]](
         capacity=ngpus
     )
 
     var scratch_bytes = 3 * ngpus * Lamport.MAX_SMALL_MESSAGE_BYTES
-    var signal_buffers = List[DeviceBuffer[DType.uint8]](capacity=ngpus)
-    var rank_sigs = InlineArray[UnsafePointer[Signal, MutAnyOrigin], MAX_GPUS](
+    var signal_buffers = List[DeviceBuffer[.uint8]](capacity=ngpus)
+    var rank_sigs = Array[MutPointer[Signal, MutAnyOrigin], MAX_GPUS](
         uninitialized=True
     )
 
@@ -323,7 +328,7 @@ def lamport_mixed_size_test[
         out_dev.append(list_of_ctx[i].enqueue_create_buffer[dtype](max_length))
         host.append(alloc[Scalar[dtype]](max_length))
         signal_buffers.append(
-            list_of_ctx[i].create_buffer_sync[DType.uint8](
+            list_of_ctx[i].create_buffer_sync[.uint8](
                 size_of[Signal]() + scratch_bytes
             )
         )
@@ -345,12 +350,12 @@ def lamport_mixed_size_test[
         out_capture[i] = TileTensor(out_dev[i], row_major(max_length))
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_capture)
     def mixed_epilogue[
         input_index: Int,
         _dtype: DType,
-        _width: SIMDSize,
+        _width: SIMDLength,
         *,
         _alignment: Int,
     ](coords: Coord, val: SIMD[_dtype, _width]) -> None:
@@ -394,21 +399,22 @@ def lamport_mixed_size_test[
             comptime OutType = TileTensor[
                 dtype, type_of(row_major(length)), MutAnyOrigin
             ]
-            var in_tensors = InlineArray[InType, ngpus](uninitialized=True)
-            var out_tensors = InlineArray[OutType, ngpus](uninitialized=True)
-            for i in range(ngpus):
-                in_tensors[i] = TileTensor(
-                    rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+            var in_tensors = Array[_, ngpus](
+                fill_with=lambda (i: Int) -> InType: TileTensor(
+                    rebind[ImmPointer[Scalar[dtype], ImmutAnyOrigin]](
                         in_dev[i].unsafe_ptr()
                     ),
                     row_major(length),
                 )
-                out_tensors[i] = TileTensor(
-                    rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+            )
+            var out_tensors = Array[_, ngpus](
+                fill_with=lambda (i: Int) -> OutType: TileTensor(
+                    rebind[MutPointer[Scalar[dtype], MutAnyOrigin]](
                         out_dev[i].unsafe_ptr()
                     ),
                     row_major(length),
                 )
+            )
 
             var cfg = AllReduceTuningConfig(
                 ngpus=ngpus,
@@ -429,6 +435,7 @@ def lamport_mixed_size_test[
                     rank_sigs,
                     cfg,
                     list_of_ctx[i],
+                    i,
                 )
             for i in range(ngpus):
                 list_of_ctx[i].synchronize()
@@ -494,15 +501,15 @@ def lamport_coexist_test[
     var sout_dev = List[DeviceBuffer[dtype]](capacity=ngpus)
     var lin_dev = List[DeviceBuffer[dtype]](capacity=ngpus)
     var lout_dev = List[DeviceBuffer[dtype]](capacity=ngpus)
-    var shost = List[UnsafePointer[Scalar[dtype], MutUntrackedOrigin]](
+    var shost = List[MutPointer[Scalar[dtype], MutUntrackedOrigin]](
         capacity=ngpus
     )
 
     # Buffer = sizeof(Signal) (counters + embedded Lamport region) + the 2-stage
     # scratch (ngpus * large message), which trails the struct.
     var scratch_bytes = ngpus * large_len * size_of[dtype]()
-    var signal_buffers = List[DeviceBuffer[DType.uint8]](capacity=ngpus)
-    var rank_sigs = InlineArray[UnsafePointer[Signal, MutAnyOrigin], MAX_GPUS](
+    var signal_buffers = List[DeviceBuffer[.uint8]](capacity=ngpus)
+    var rank_sigs = Array[MutPointer[Signal, MutAnyOrigin], MAX_GPUS](
         uninitialized=True
     )
 
@@ -517,7 +524,7 @@ def lamport_coexist_test[
         lout_dev.append(list_of_ctx[i].enqueue_create_buffer[dtype](large_len))
         shost.append(alloc[Scalar[dtype]](small_len))
         signal_buffers.append(
-            list_of_ctx[i].create_buffer_sync[DType.uint8](
+            list_of_ctx[i].create_buffer_sync[.uint8](
                 size_of[Signal]() + scratch_bytes
             )
         )
@@ -535,16 +542,19 @@ def lamport_coexist_test[
     comptime LOutType = TileTensor[
         dtype, type_of(row_major(large_len)), MutAnyOrigin
     ]
-    var lin_tensors = InlineArray[LType, ngpus](uninitialized=True)
-    var lout_tensors = InlineArray[LOutType, ngpus](uninitialized=True)
-    for i in range(ngpus):
-        lin_tensors[i] = LType(
-            rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+    var lin_tensors = Array[_, ngpus](
+        fill_with=lambda (i: Int) -> LType: LType(
+            rebind[ImmPointer[Scalar[dtype], ImmutAnyOrigin]](
                 lin_dev[i].unsafe_ptr()
             ),
             row_major(large_len),
         )
-        lout_tensors[i] = LOutType(lout_dev[i], row_major(large_len))
+    )
+    var lout_tensors = Array[_, ngpus](
+        fill_with=lambda (i: Int) {mut lout_dev, imm} -> LOutType: TileTensor(
+            lout_dev[i], row_major(large_len)
+        ).as_unsafe_any_origin()
+    )
 
     comptime SInType = TileTensor[
         dtype, type_of(row_major(small_len)), ImmutAnyOrigin
@@ -552,28 +562,31 @@ def lamport_coexist_test[
     comptime SOutType = TileTensor[
         dtype, type_of(row_major(small_len)), MutAnyOrigin
     ]
-    var sin_tensors = InlineArray[SInType, ngpus](uninitialized=True)
-    var sout_tensors = InlineArray[SOutType, ngpus](uninitialized=True)
-    for i in range(ngpus):
-        sin_tensors[i] = SInType(
-            rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+    var sin_tensors = Array[_, ngpus](
+        fill_with=lambda (i: Int) -> SInType: SInType(
+            rebind[ImmPointer[Scalar[dtype], ImmutAnyOrigin]](
                 sin_dev[i].unsafe_ptr()
             ),
             row_major(small_len),
         )
-        sout_tensors[i] = SOutType(sout_dev[i], row_major(small_len))
+    )
+    var sout_tensors = Array[_, ngpus](
+        fill_with=lambda (i: Int) {mut sout_dev, imm} -> SOutType: TileTensor(
+            sout_dev[i], row_major(small_len)
+        ).as_unsafe_any_origin()
+    )
 
     var out_capture = StaticTuple[SOutType, ngpus]()
     for i in range(ngpus):
         out_capture[i] = TileTensor(sout_dev[i], row_major(small_len))
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_capture)
     def coexist_epilogue[
         input_index: Int,
         _dtype: DType,
-        _width: SIMDSize,
+        _width: SIMDLength,
         *,
         _alignment: Int,
     ](coords: Coord, val: SIMD[_dtype, _width]) -> None:
@@ -626,6 +639,7 @@ def lamport_coexist_test[
                 rank_sigs,
                 cfg,
                 list_of_ctx[i],
+                i,
             )
         for i in range(ngpus):
             list_of_ctx[i].synchronize()
@@ -695,13 +709,13 @@ def lamport_unsynced_skew_test[
     var total = NUM_UNSYNCED_ITERS * length
     var in_dev = List[DeviceBuffer[dtype]](capacity=ngpus)
     var out_dev = List[DeviceBuffer[dtype]](capacity=ngpus)
-    var host = List[UnsafePointer[Scalar[dtype], MutUntrackedOrigin]](
+    var host = List[MutPointer[Scalar[dtype], MutUntrackedOrigin]](
         capacity=ngpus
     )
 
     var scratch_bytes = 3 * ngpus * Lamport.MAX_SMALL_MESSAGE_BYTES
-    var signal_buffers = List[DeviceBuffer[DType.uint8]](capacity=ngpus)
-    var rank_sigs = InlineArray[UnsafePointer[Signal, MutAnyOrigin], MAX_GPUS](
+    var signal_buffers = List[DeviceBuffer[.uint8]](capacity=ngpus)
+    var rank_sigs = Array[MutPointer[Signal, MutAnyOrigin], MAX_GPUS](
         uninitialized=True
     )
 
@@ -722,7 +736,7 @@ def lamport_unsynced_skew_test[
         list_of_ctx[i].enqueue_copy(in_dev[i], h)
 
         signal_buffers.append(
-            list_of_ctx[i].create_buffer_sync[DType.uint8](
+            list_of_ctx[i].create_buffer_sync[.uint8](
                 size_of[Signal]() + scratch_bytes
             )
         )
@@ -749,29 +763,30 @@ def lamport_unsynced_skew_test[
         comptime OutType = TileTensor[
             dtype, type_of(row_major(length)), MutAnyOrigin
         ]
-        var in_tensors = InlineArray[InType, ngpus](uninitialized=True)
-        var out_capture = StaticTuple[OutType, ngpus]()
-        for i in range(ngpus):
-            in_tensors[i] = InType(
-                rebind[UnsafePointer[Scalar[dtype], ImmutAnyOrigin]](
+        var in_tensors = Array[_, ngpus](
+            fill_with=lambda (i: Int) -> InType: InType(
+                rebind[ImmPointer[Scalar[dtype], ImmutAnyOrigin]](
                     in_dev[i].unsafe_ptr() + base
                 ),
                 row_major(length),
             )
+        )
+        var out_capture = StaticTuple[OutType, ngpus]()
+        for i in range(ngpus):
             out_capture[i] = OutType(
-                rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+                rebind[MutPointer[Scalar[dtype], MutAnyOrigin]](
                     out_dev[i].unsafe_ptr() + base
                 ),
                 row_major(length),
             )
 
         @always_inline
-        @parameter
+        @__parameter
         @__copy_capture(out_capture)
         def skew_epilogue[
             input_index: Int,
             _dtype: DType,
-            _width: SIMDSize,
+            _width: SIMDLength,
             *,
             _alignment: Int,
         ](coords: Coord, val: SIMD[_dtype, _width]) -> None:
@@ -800,6 +815,7 @@ def lamport_unsynced_skew_test[
                 rank_sigs,
                 cfg,
                 list_of_ctx[i],
+                i,
             )
         # NO synchronize() here -- ranks are free to drift in `flag`.
 
@@ -873,9 +889,9 @@ def main() raises:
         range(len(test_dtypes)),
         range(len(test_lengths)),
     ):
-        comptime num_gpus = test_gpu_counts[gpu_idx]
-        comptime dtype = test_dtypes[dtype_idx]
-        comptime length = test_lengths[length_idx]
+        comptime num_gpus = rebind[Int](test_gpu_counts[gpu_idx])
+        comptime dtype = rebind[DType](test_dtypes[dtype_idx])
+        comptime length = rebind[Int](test_lengths[length_idx])
 
         if DeviceContext.number_of_devices() < num_gpus:
             continue
@@ -890,7 +906,7 @@ def main() raises:
     # Producer-sanitize edge case: inputs containing -0.0 lanes, one mid-size
     # case per dtype on 2 GPUs (the property is rank-count independent).
     comptime for dtype_idx in range(len(test_dtypes)):
-        comptime dtype = test_dtypes[dtype_idx]
+        comptime dtype = rebind[DType](test_dtypes[dtype_idx])
         comptime length = 8 * 1024
         if DeviceContext.number_of_devices() < 2:
             continue
@@ -906,7 +922,7 @@ def main() raises:
     # expose the per-generation clear-extent bug. 2 GPUs is sufficient (the bug
     # is rank-count independent). Race-dependent -- run under `--runs_per_test`.
     comptime for dtype_idx in range(len(test_dtypes)):
-        comptime dtype = test_dtypes[dtype_idx]
+        comptime dtype = rebind[DType](test_dtypes[dtype_idx])
         if DeviceContext.number_of_devices() < 2:
             continue
         var ctx = List[DeviceContext]()
@@ -919,7 +935,7 @@ def main() raises:
     # the same signal buffer must not corrupt the Lamport results -- proves the
     # embedded Lamport region is disjoint from the trailing 2-stage scratch.
     comptime for dtype_idx in range(len(test_dtypes)):
-        comptime dtype = test_dtypes[dtype_idx]
+        comptime dtype = rebind[DType](test_dtypes[dtype_idx])
         if DeviceContext.number_of_devices() < 2:
             continue
         var ctx = List[DeviceContext]()
@@ -938,8 +954,8 @@ def main() raises:
     comptime for gpu_idx, dtype_idx in product(
         range(len(test_gpu_counts)), range(len(test_dtypes))
     ):
-        comptime num_gpus = test_gpu_counts[gpu_idx]
-        comptime dtype = test_dtypes[dtype_idx]
+        comptime num_gpus = rebind[Int](test_gpu_counts[gpu_idx])
+        comptime dtype = rebind[DType](test_dtypes[dtype_idx])
         if DeviceContext.number_of_devices() < num_gpus:
             continue
         var ctx = List[DeviceContext]()

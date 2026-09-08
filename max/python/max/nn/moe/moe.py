@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 
 from max.dtype import DType
 from max.graph import (
@@ -73,6 +74,31 @@ def make_concatenated_gated_activation_fn(
         return gate * up
 
     return _concatenated_gated_activation_fn
+
+
+@dataclass
+class _InterleavedGatedActivation:
+    """Gated activation for interleaved ``[g0, u0, g1, u1, ...]`` projections.
+
+    Reads the gate and up halves with a stride rather than a split point,
+    which lets a checkpoint with interleaved gate/up rows reach the matmul
+    unrearranged. A distinct type carrying ``activation_fn`` so
+    :class:`MoEQuantized` can recognize both the layout and the activation
+    when selecting the fused SwiGLU kernel.
+    """
+
+    activation_fn: Callable[[TensorValue], TensorValue]
+
+    def __call__(self, gate_up: TensorValue, moe_dim: int) -> TensorValue:
+        del moe_dim  # The halves are separated by a stride, not a split point.
+        return self.activation_fn(gate_up[:, 0::2]) * gate_up[:, 1::2]
+
+
+def make_interleaved_gated_activation_fn(
+    activation_fn: Callable[[TensorValue], TensorValue],
+) -> Callable[[TensorValue, int], TensorValue]:
+    """Builds a gated activation for interleaved ``[gate | up]`` projections."""
+    return _InterleavedGatedActivation(activation_fn)
 
 
 def _swigluoai_activation(
@@ -153,6 +179,15 @@ class MoEGate(Module):
     @sharding_strategy.setter
     def sharding_strategy(self, strategy: ShardingStrategy) -> None:
         """Set the sharding strategy for the module."""
+        self._set_sharding_strategy(strategy)
+
+    def _set_sharding_strategy(self, strategy: ShardingStrategy) -> None:
+        """Applies ``strategy`` to this gate's weights.
+
+        Subclasses that add per-weight strategies override this and call
+        ``super()._set_sharding_strategy(strategy)``; a property setter cannot
+        be extended through ``super()``.
+        """
         if strategy.is_replicate:
             self._sharding_strategy = strategy
             self.gate_score.sharding_strategy = ShardingStrategy.replicate(
@@ -436,6 +471,15 @@ class MoE(Module, Shardable):
     @sharding_strategy.setter
     def sharding_strategy(self, strategy: ShardingStrategy) -> None:
         """Set the sharding strategy for the module."""
+        self._set_sharding_strategy(strategy)
+
+    def _set_sharding_strategy(self, strategy: ShardingStrategy) -> None:
+        """Applies ``strategy`` to the gate, shared experts, and experts.
+
+        Subclasses that add per-weight strategies override this and call
+        ``super()._set_sharding_strategy(strategy)``; a property setter cannot
+        be extended through ``super()``.
+        """
         if strategy.is_tensor_parallel:
             self._sharding_strategy = strategy
             self.gate.sharding_strategy = ShardingStrategy.replicate(
@@ -729,10 +773,8 @@ class MoE(Module, Shardable):
         if self._ep_batch_manager:
             raise ValueError(
                 "Use forward_moe_sharded_layers for expert-parallel inference "
-                "instead of calling MoE directly."
+                f"instead of calling {type(self).__name__} directly."
             )
-
-        seq_len = x.shape[0]
 
         # Get the topk experts per token and their weights
         router_idx, router_weight = self.gate(x)
@@ -740,9 +782,54 @@ class MoE(Module, Shardable):
         if self.pre_expert_norm is not None:
             x = self.pre_expert_norm(x)
 
-        router_idx = ops.reshape(
-            router_idx, [-1]
-        )  # (seq_len * n_expert_per_token,)
+        down_projs = self._expert_matmuls(
+            x, ops.reshape(router_idx, [-1]), router_weight
+        )
+
+        if not self.apply_router_weight_first:
+            # (seq_len, 1, n_expert) @ (seq_len, n_expert, hidden_dim) -> (seq_len, 1, hidden_dim)
+            routed_expert_out = (
+                ops.unsqueeze(router_weight, axis=1) @ down_projs
+            )
+            routed_expert_out = ops.squeeze(routed_expert_out, axis=1).cast(
+                x.dtype
+            )
+        else:
+            routed_expert_out = down_projs.transpose(1, 2)
+            routed_expert_out = ops.squeeze(
+                ops.sum(routed_expert_out, axis=2), axis=2
+            ).cast(x.dtype)
+
+        if self.has_shared_experts:
+            routed_expert_out += self.shared_experts(x)
+
+        return routed_expert_out
+
+    def _expert_matmuls(
+        self,
+        x: TensorValue,
+        router_idx: TensorValue,
+        router_weight: TensorValue | None = None,
+    ) -> TensorValue:
+        """Runs the unquantized expert matmuls for one flat expert assignment.
+
+        Args:
+            x: ``[seq_len, hidden_dim]`` expert input.
+            router_idx: ``[seq_len * num_experts_per_token]`` selected expert
+                ids, in token-major order.
+            router_weight: ``[seq_len, num_experts_per_token]`` router weights,
+                read only when ``apply_router_weight_first`` is set.
+
+        Returns:
+            ``[seq_len, num_experts_per_token, hidden_dim]``, each selected
+            expert's output before the router weights are applied.
+
+        A subclass whose router carries state beyond the ids and weights
+        overrides ``__call__`` and calls this from there. ``MoEQuantized``
+        overrides it with the quantized expert matmuls, so such a subclass
+        works against either base.
+        """
+        seq_len = x.shape[0]
 
         (
             token_expert_order,
@@ -764,6 +851,9 @@ class MoE(Module, Shardable):
         )
 
         if self.apply_router_weight_first:
+            assert router_weight is not None, (
+                "router_weight is required when apply_router_weight_first is set"
+            )
             permutated_states = permutated_states * ops.gather(
                 router_weight.reshape([-1, 1]), token_expert_order, axis=0
             ).cast(x.dtype)
@@ -793,25 +883,6 @@ class MoE(Module, Shardable):
             expert_usage_stats,
         )
 
-        down_projs = ops.gather(
-            down_projs, restore_token_order, axis=0
-        ).reshape([seq_len, self.num_experts_per_token, self.hidden_dim])
-
-        if not self.apply_router_weight_first:
-            # (seq_len, 1, n_expert) @ (seq_len, n_expert, hidden_dim) -> (seq_len, 1, hidden_dim)
-            routed_expert_out = (
-                ops.unsqueeze(router_weight, axis=1) @ down_projs
-            )
-            routed_expert_out = ops.squeeze(routed_expert_out, axis=1).cast(
-                x.dtype
-            )
-        else:
-            routed_expert_out = down_projs.transpose(1, 2)
-            routed_expert_out = ops.squeeze(
-                ops.sum(routed_expert_out, axis=2), axis=2
-            ).cast(x.dtype)
-
-        if self.has_shared_experts:
-            routed_expert_out += self.shared_experts(x)
-
-        return routed_expert_out
+        return ops.gather(down_projs, restore_token_order, axis=0).reshape(
+            [seq_len, self.num_experts_per_token, self.hidden_dim]
+        )

@@ -76,7 +76,8 @@ class UnifiedMTPGemma4(Module):
         self.enable_structured_output = enable_structured_output
         self.num_draft_steps = (
             speculative_config.num_speculative_tokens
-            if speculative_config
+            if speculative_config is not None
+            and speculative_config.num_speculative_tokens is not None
             else 1
         )
         # Greedy acceptance (argmax) has no mid-graph allocation, so the fused
@@ -198,7 +199,9 @@ class UnifiedMTPGemma4(Module):
                 self.acceptance_sampler,
                 draft_tokens,
                 logits,
-                seed=seed[0],
+                # Per-row seeds: each row's sampling is keyed off its own
+                # seed, never coupled to co-residents' draws.
+                seed=seed,
                 temperature=temperature,
                 top_k=top_k,
                 max_k=max_k,

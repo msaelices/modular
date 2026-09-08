@@ -20,22 +20,22 @@ SF_VECTOR_SIZE (32) consecutive elements.
 """
 
 from std.math import ceildiv
-from std.gpu import block_idx, thread_idx, grid_dim, block_dim
-from std.gpu.host import DeviceContext
-from std.gpu.host.info import GPUInfo
+from max.gpu import block_idx, thread_idx, grid_dim, block_dim
+from max.gpu.host import DeviceContext
+from max.gpu.host.info import GPUInfo
 from std.sys.info import _accelerator_arch
-from std.gpu.primitives.grid_controls import (
+from max.gpu.primitives.grid_controls import (
     PDL,
     PDLLevel,
     pdl_launch_attributes,
 )
 from std.utils import StaticTuple
-from std.gpu import MAX_THREADS_PER_BLOCK_METADATA
-from layout import TensorStorage, TileTensor
+from max.gpu import MAX_THREADS_PER_BLOCK_METADATA
+from layout import TensorEngine, TileTensor
 from layout.coord import Coord, Idx
 from layout.tile_layout import TensorLayout
 from .fp4_utils import cast_uint_to_fp4e2m1, MXFP4_SF_VECTOR_SIZE
-from std.algorithm.functional import elementwise
+from max.algorithm.functional import elementwise
 from std.utils.coord import Coord, coord_to_index_list
 from std.utils.index import Index, IndexList
 from std.sys.info import simd_width_of
@@ -52,45 +52,47 @@ def _dequant_mxfp4_to_fp8_kernel[
     output_layout: TensorLayout,
     scales_layout: TensorLayout,
     input_layout: TensorLayout,
-    output_storage: TensorStorage,
-    scales_storage: TensorStorage,
-    input_storage: TensorStorage,
+    output_engine: TensorEngine,
+    scales_engine: TensorEngine,
+    input_engine: TensorEngine,
     *,
     SF_VECTOR_SIZE: Int = 32,
     ELEMENTS_PER_THREAD: Int = 8,
 ](
     output: TileTensor[
-        out_dtype, output_layout, MutAnyOrigin, Storage=output_storage
+        out_dtype, output_layout, MutAnyOrigin, Engine=output_engine
     ],
     input: TileTensor[
-        in_dtype, input_layout, MutAnyOrigin, Storage=input_storage
+        in_dtype, input_layout, MutAnyOrigin, Engine=input_engine
     ],
     scales: TileTensor[
-        scales_dtype, scales_layout, MutAnyOrigin, Storage=scales_storage
+        scales_dtype, scales_layout, MutAnyOrigin, Engine=scales_engine
     ],
-    num_rows: Int,
-    num_cols: Int,
+    num_rows: Int32,
+    num_cols: Int32,
 ):
     """Kernel that dequantizes MXFP4 packed uint8 to out_dtype (FP8 or BF16).
 
     Scales are 2D [num_rows, num_cols // SF_VECTOR_SIZE], one scale per block
     of SF_VECTOR_SIZE elements.
     """
+    var _num_rows = Int(num_rows)
+    var _num_cols = Int(num_cols)
     comptime assert output.flat_rank >= 2
     comptime assert input.flat_rank >= 2
     comptime assert scales.flat_rank >= 2
     comptime BYTES_PER_THREAD = ELEMENTS_PER_THREAD // 2
 
     with PDL():
-        for global_row_idx in range(block_idx.x, num_rows, grid_dim.x):
+        for global_row_idx in range(block_idx.x, _num_rows, grid_dim.x):
             for col_thread_idx in range(
                 thread_idx.x,
-                ceildiv(num_cols, ELEMENTS_PER_THREAD),
+                ceildiv(_num_cols, ELEMENTS_PER_THREAD),
                 block_dim.x,
             ):
                 var global_col_idx = col_thread_idx * ELEMENTS_PER_THREAD
 
-                if global_col_idx >= num_cols:
+                if global_col_idx >= _num_cols:
                     continue
 
                 # Load packed uint8 bytes
@@ -117,7 +119,7 @@ def _dequant_mxfp4_to_fp8_kernel[
                 # On SM100+ this uses PTX cvt.rn.bf16x2.ue8m0x2; on SM90
                 # it falls back to the bitcast approach with correct
                 # special-case handling for 0x00 and 0xFF.
-                var scale_f32 = scale_e8m0.cast[DType.float32]()
+                var scale_f32 = scale_e8m0.cast[.float32]()
 
                 # Apply scale and cast to output dtype
                 var scaled_values = fp32_values * scale_f32
@@ -144,6 +146,9 @@ def dequant_mxfp4[
 ) raises:
     """Dequantize MXFP4 packed weights to FP8 or BF16.
 
+    Parameters:
+        SF_VECTOR_SIZE: Number of consecutive elements each E8M0 block scale covers (defaults to 32).
+
     Args:
         ctx: Device context for kernel launch.
         output: Output tensor [num_rows, num_cols] of float8_e4m3fn or bfloat16.
@@ -162,9 +167,9 @@ def dequant_mxfp4[
         DType.bfloat16,
     ), "output must be float8_e4m3fn or bfloat16"
     comptime assert (
-        scales_dtype == DType.float8_e8m0fnu
+        scales_dtype == .float8_e8m0fnu
     ), "scales must be float8_e8m0fnu"
-    comptime assert in_dtype == DType.uint8, "input must be uint8 (packed FP4)"
+    comptime assert in_dtype == .uint8, "input must be uint8 (packed FP4)"
     comptime assert (
         SF_VECTOR_SIZE == MXFP4_SF_VECTOR_SIZE
     ), "SF_VECTOR_SIZE must be 32 for MXFP4"
@@ -202,7 +207,7 @@ def dequant_mxfp4[
             in_dtype,
             type_of(input).LayoutType,
             MutAnyOrigin,
-            Storage=type_of(input).Storage,
+            Engine=type_of(input).Engine,
         ]
     ](input)
     var scales_tt = rebind[
@@ -210,7 +215,7 @@ def dequant_mxfp4[
             scales_dtype,
             type_of(scales).LayoutType,
             MutAnyOrigin,
-            Storage=type_of(scales).Storage,
+            Engine=type_of(scales).Engine,
         ]
     ](scales)
 
@@ -221,9 +226,9 @@ def dequant_mxfp4[
         type_of(output).LayoutType,
         type_of(scales_tt).LayoutType,
         type_of(input_tt).LayoutType,
-        type_of(output).Storage,
-        type_of(scales_tt).Storage,
-        type_of(input_tt).Storage,
+        type_of(output).Engine,
+        type_of(scales_tt).Engine,
+        type_of(input_tt).Engine,
         SF_VECTOR_SIZE=SF_VECTOR_SIZE,
         ELEMENTS_PER_THREAD=ELEMENTS_PER_THREAD,
     ]
@@ -232,8 +237,8 @@ def dequant_mxfp4[
         output,
         input_tt,
         scales_tt,
-        num_rows,
-        num_cols,
+        Int32(num_rows),
+        Int32(num_cols),
         block_dim=block_dim_val,
         grid_dim=grid_dim_val,
         attributes=pdl_launch_attributes(pdl_level),

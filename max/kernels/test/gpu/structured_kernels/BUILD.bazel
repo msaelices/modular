@@ -1,4 +1,5 @@
 load("//bazel:api.bzl", "mojo_test")
+load("//max/kernels/src:deprecations.bzl", "IGNORED_POINTER_DEPRECATIONS_COPTS")
 
 package(default_visibility = ["//max:consumers"])
 
@@ -11,6 +12,9 @@ _EXTRA_CONSTRAINTS = {
     "test_mha_prefill_v2_paged.mojo": ["//:mi355_gpu"],
     "test_mha_prefill_v2_gqa.mojo": ["//:mi355_gpu"],
     "test_mha_prefill_v2_rescale.mojo": ["//:mi355_gpu"],
+    "test_mha_prefill_v2_lazy_rescale_crossrow_canary.mojo": [
+        "//:mi355_gpu",
+    ],
     "test_mha_i2i_repro.mojo": ["//:mi355_gpu"],
     "test_mha_i2i_random_ref.mojo": ["//:mi355_gpu"],
     "test_mla_prefill_v2.mojo": ["//:mi355_gpu"],
@@ -33,12 +37,16 @@ _EXTRA_COPTS = {
     ],
 }
 
+_EXTRA_DEPS = {
+    "test_mfma_fragment_lane_mapping.mojo": ["//max:max_mojo"],
+}
+
 [
     mojo_test(
         name = src + ".test",
         size = "medium",
         srcs = [src],
-        copts = _EXTRA_COPTS.get(src, []),
+        copts = IGNORED_POINTER_DEPRECATIONS_COPTS + _EXTRA_COPTS.get(src, []),
         tags = ["gpu"],
         target_compatible_with = _EXTRA_CONSTRAINTS.get(
             src,
@@ -52,7 +60,7 @@ _EXTRA_COPTS = {
             "//max:nn",
             "//max:structured_kernels",
             "@mojo//:std",
-        ],
+        ] + _EXTRA_DEPS.get(src, []),
     )
     # Excluded from this glob:
     #  - nkv8 gate harness: built via the explicit per-shape targets below
@@ -77,6 +85,7 @@ mojo_test(
     name = "test_v227_adapter_round_trip.mojo.test",
     size = "medium",
     srcs = ["test_v227_adapter_round_trip.mojo"],
+    copts = IGNORED_POINTER_DEPRECATIONS_COPTS,
     tags = [
         "gpu",
         "manual",
@@ -121,7 +130,7 @@ _R3_BASE_COPTS = [
         # seq=8192 cases whose host FP32 reference overran were dropped).
         size = test_size,
         srcs = ["test_mla_prefill_v2_nkv8_gate.mojo"],
-        copts = _R3_BASE_COPTS + [
+        copts = IGNORED_POINTER_DEPRECATIONS_COPTS + _R3_BASE_COPTS + [
             "-D",
             "num_kv_heads={}".format(nkv),
             "-D",

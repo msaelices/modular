@@ -20,7 +20,7 @@ final-state output, and (crucially) varlen no-cross-sequence-bleed equivalence:
 a packed ragged batch must equal independent per-sequence runs.
 """
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from layout import TileTensor, row_major
 from std.random import rand
 from state_space.mamba2_ssd_scan import (
@@ -28,9 +28,10 @@ from state_space.mamba2_ssd_scan import (
     mamba2_ssd_chunk_scan_varlen_fwd_gpu,
     mamba2_ssd_chunk_scan_varlen_fwd_inplace_cpu,
     mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu,
+    mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_apple,
     mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_dstate_split,
 )
-from std.gpu.host.info import B200
+from max.gpu.host.info import B200
 from std.testing import TestSuite, assert_almost_equal
 from std.utils.index import Index, IndexList
 
@@ -69,18 +70,14 @@ def run_mamba2_ssd_fwd_gpu_vs_cpu[
     var D_h = alloc[Scalar[dtype]](max(D_size, 1))
     var dt_bias_size = nheads if has_dt_bias else 0
     var dt_bias_h = alloc[Scalar[dtype]](max(dt_bias_size, 1))
-    var initial_states_h = alloc[Scalar[DType.float32]](1)  # empty (no init)
-    var query_start_loc_h = alloc[Scalar[DType.int32]](batch + 1)
-    var has_initial_state_h = alloc[Scalar[DType.bool]](1)  # empty
+    var initial_states_h = alloc[Float32](1)  # empty (no init)
+    var query_start_loc_h = alloc[Int32](batch + 1)
+    var has_initial_state_h = alloc[Scalar[.bool]](1)  # empty
 
     var y_cpu_h = alloc[Scalar[dtype]](total_len * nheads * head_dim)
     var y_gpu_h = alloc[Scalar[dtype]](total_len * nheads * head_dim)
-    var fs_cpu_h = alloc[Scalar[DType.float32]](
-        batch * nheads * head_dim * dstate
-    )
-    var fs_gpu_h = alloc[Scalar[DType.float32]](
-        batch * nheads * head_dim * dstate
-    )
+    var fs_cpu_h = alloc[Float32](batch * nheads * head_dim * dstate)
+    var fs_gpu_h = alloc[Float32](batch * nheads * head_dim * dstate)
 
     # Initialise random inputs (uniform [0, 1)).
     rand(x_h, total_len * nheads * head_dim)
@@ -104,10 +101,10 @@ def run_mamba2_ssd_fwd_gpu_vs_cpu[
 
     # query_start_loc cumulative.
     var cum = 0
-    query_start_loc_h.store(0, Scalar[DType.int32](0))
+    query_start_loc_h.store(0, Int32(0))
     for i in range(batch):
         cum += seq_lengths[i]
-        query_start_loc_h.store(i + 1, Scalar[DType.int32](cum))
+        query_start_loc_h.store(i + 1, Int32(cum))
 
     # TileTensors for CPU.
     var x_tt = TileTensor(x_h, row_major(total_len, nheads, head_dim))
@@ -182,11 +179,11 @@ def run_mamba2_ssd_fwd_gpu_vs_cpu[
     var C_d = ctx.enqueue_create_buffer[dtype](total_len * ngroups * dstate)
     var D_d = ctx.enqueue_create_buffer[dtype](max(D_size, 1))
     var dt_bias_d = ctx.enqueue_create_buffer[dtype](max(dt_bias_size, 1))
-    var is_d = ctx.enqueue_create_buffer[DType.float32](1)
-    var qsl_d = ctx.enqueue_create_buffer[DType.int32](batch + 1)
-    var his_d = ctx.enqueue_create_buffer[DType.bool](1)
+    var is_d = ctx.enqueue_create_buffer[.float32](1)
+    var qsl_d = ctx.enqueue_create_buffer[.int32](batch + 1)
+    var his_d = ctx.enqueue_create_buffer[.bool](1)
     var y_d = ctx.enqueue_create_buffer[dtype](total_len * nheads * head_dim)
-    var fs_d = ctx.enqueue_create_buffer[DType.float32](
+    var fs_d = ctx.enqueue_create_buffer[.float32](
         batch * nheads * head_dim * dstate
     )
 
@@ -233,16 +230,16 @@ def run_mamba2_ssd_fwd_gpu_vs_cpu[
             fs_gtt.LayoutType,
             qsl_gtt.LayoutType,
             his_gtt.LayoutType,
-            x_gtt.Storage,
+            x_gtt.Engine,
         ]
     ]()
     ctx.enqueue_function(
         compiled,
-        nheads,
-        head_dim,
-        ngroups,
-        nheads_ngroups_ratio,
-        batch,
+        Int32(nheads),
+        Int32(head_dim),
+        Int32(ngroups),
+        Int32(nheads_ngroups_ratio),
+        Int32(batch),
         dt_sp_int8,
         x_gtt,
         dt_gtt,
@@ -322,8 +319,8 @@ def run_varlen_no_bleed_cpu[
     var C_h = alloc[Scalar[dtype]](total_len * ngroups * dstate)
     var D_h = alloc[Scalar[dtype]](nheads)
     var dt_bias_h = alloc[Scalar[dtype]](nheads)
-    var is_h = alloc[Scalar[DType.float32]](1)
-    var his_h = alloc[Scalar[DType.bool]](1)
+    var is_h = alloc[Float32](1)
+    var his_h = alloc[Scalar[.bool]](1)
 
     rand(x_h, total_len * nheads * head_dim)
     rand(dt_h, total_len * nheads)
@@ -354,15 +351,13 @@ def run_varlen_no_bleed_cpu[
 
     # ---- Packed run over the whole ragged batch ----
     var y_packed = alloc[Scalar[dtype]](total_len * nheads * head_dim)
-    var fs_packed = alloc[Scalar[DType.float32]](
-        batch * nheads * head_dim * dstate
-    )
-    var qsl_h = alloc[Scalar[DType.int32]](batch + 1)
+    var fs_packed = alloc[Float32](batch * nheads * head_dim * dstate)
+    var qsl_h = alloc[Int32](batch + 1)
     var cum = 0
-    qsl_h.store(0, Scalar[DType.int32](0))
+    qsl_h.store(0, Int32(0))
     for i in range(batch):
         cum += seq_lengths[i]
-        qsl_h.store(i + 1, Scalar[DType.int32](cum))
+        qsl_h.store(i + 1, Int32(cum))
 
     var x_tt = TileTensor(x_h, row_major(total_len, nheads, head_dim))
     var dt_tt = TileTensor(dt_h, row_major(total_len, nheads))
@@ -413,9 +408,7 @@ def run_varlen_no_bleed_cpu[
 
     # ---- Independent per-sequence runs ----
     var y_indep = alloc[Scalar[dtype]](total_len * nheads * head_dim)
-    var fs_indep = alloc[Scalar[DType.float32]](
-        batch * nheads * head_dim * dstate
-    )
+    var fs_indep = alloc[Float32](batch * nheads * head_dim * dstate)
     var off = 0
     for s in range(batch):
         var slen = seq_lengths[s]
@@ -439,9 +432,9 @@ def run_varlen_no_bleed_cpu[
             fs_indep + s * nheads * head_dim * dstate,
             row_major(1, nheads, head_dim, dstate),
         )
-        var qsl_s_h = alloc[Scalar[DType.int32]](2)
-        qsl_s_h.store(0, Scalar[DType.int32](0))
-        qsl_s_h.store(1, Scalar[DType.int32](slen))
+        var qsl_s_h = alloc[Int32](2)
+        qsl_s_h.store(0, Int32(0))
+        qsl_s_h.store(1, Int32(slen))
         var qsl_s = TileTensor(qsl_s_h, row_major(2))
 
         mamba2_ssd_chunk_scan_varlen_fwd_cpu[dtype, DSTATE](
@@ -511,7 +504,7 @@ def test_mamba2_ssd_small_parity_shape() raises:
     with DeviceContext() as ctx:
         if not ctx.is_compatible():
             return
-        run_mamba2_ssd_fwd_gpu_vs_cpu[DType.bfloat16, 16](
+        run_mamba2_ssd_fwd_gpu_vs_cpu[.bfloat16, 16](
             nheads=8,
             head_dim=16,
             ngroups=2,
@@ -525,7 +518,7 @@ def test_mamba2_ssd_fp32_exact() raises:
     with DeviceContext() as ctx:
         if not ctx.is_compatible():
             return
-        run_mamba2_ssd_fwd_gpu_vs_cpu[DType.float32, 16](
+        run_mamba2_ssd_fwd_gpu_vs_cpu[.float32, 16](
             nheads=4,
             head_dim=8,
             ngroups=2,
@@ -540,7 +533,7 @@ def test_mamba2_ssd_variable_lengths() raises:
     with DeviceContext() as ctx:
         if not ctx.is_compatible():
             return
-        run_mamba2_ssd_fwd_gpu_vs_cpu[DType.bfloat16, 64](
+        run_mamba2_ssd_fwd_gpu_vs_cpu[.bfloat16, 64](
             nheads=12,
             head_dim=16,
             ngroups=4,
@@ -555,7 +548,7 @@ def test_mamba2_ssd_production_grouping() raises:
     with DeviceContext() as ctx:
         if not ctx.is_compatible():
             return
-        run_mamba2_ssd_fwd_gpu_vs_cpu[DType.bfloat16, 128](
+        run_mamba2_ssd_fwd_gpu_vs_cpu[.bfloat16, 128](
             nheads=96,
             head_dim=80,
             ngroups=8,
@@ -582,7 +575,7 @@ def test_mamba2_ssd_no_D_no_bias() raises:
 
 def test_mamba2_ssd_varlen_no_cross_sequence_bleed() raises:
     """Packed ragged batch == per-sequence runs (CPU-reference invariant)."""
-    run_varlen_no_bleed_cpu[DType.float32, 16](
+    run_varlen_no_bleed_cpu[.float32, 16](
         nheads=8,
         head_dim=16,
         ngroups=2,
@@ -594,6 +587,14 @@ def run_mamba2_ssd_inplace_vs_functional[
     dtype: DType,
     DSTATE: Int,
     DSTATE_SPLIT: Int = 0,
+    use_apple: Bool = False,
+    # SSM-pool STORAGE dtype for the GPU run (the CPU references stay fp32).
+    # Only the Apple kernel implements non-fp32 state.
+    state_dtype: DType = .float32,
+    # Seed the pool with (state_dtype-representable) random initial states and
+    # set has_initial_state, exercising the state LOAD path — with a zero pool
+    # and has_initial_state=False the initial-state load is dead code.
+    init_state: Bool = False,
 ](
     nheads: Int,
     head_dim: Int,
@@ -617,7 +618,14 @@ def run_mamba2_ssd_inplace_vs_functional[
     CH_PER_BLOCK, 1)`` launch; the split kernel's output must equal the v1 /
     functional reference. The split path is only invoked from a B200-gated
     caller because its full-warp shuffle assumes warp width 32.
+
+    ``state_dtype`` sets the GPU pool's storage dtype (the CPU references stay
+    fp32); ``init_state`` seeds the pool and enables has_initial_state so the
+    state LOAD path runs. See ``test_..._apple_bf16_state_vs_functional``.
     """
+    comptime assert (
+        state_dtype == .float32 or use_apple
+    ), "non-fp32 SSM state is only implemented by the Apple kernel"
     comptime dstate = DSTATE
     var batch = len(seq_lengths)
     var nheads_ngroups_ratio = nheads // ngroups
@@ -634,14 +642,12 @@ def run_mamba2_ssd_inplace_vs_functional[
     var C_h = alloc[Scalar[dtype]](total_len * ngroups * dstate)
     var D_h = alloc[Scalar[dtype]](nheads)
     var dt_bias_h = alloc[Scalar[dtype]](nheads)
-    var his_h = alloc[Scalar[DType.bool]](batch)
-    var qsl_h = alloc[Scalar[DType.int32]](batch + 1)
+    var his_h = alloc[Scalar[.bool]](batch)
+    var qsl_h = alloc[Int32](batch + 1)
     # slot_indices: identity mapping (slot b -> b) for simplicity.
-    var slot_idx_h = alloc[Scalar[DType.uint32]](batch)
+    var slot_idx_h = alloc[UInt32](batch)
     # ssm_pool: [max_slots, nheads, head_dim, dstate] — zero-initialised.
-    var pool_h = alloc[Scalar[DType.float32]](
-        max_slots * nheads * head_dim * dstate
-    )
+    var pool_h = alloc[Float32](max_slots * nheads * head_dim * dstate)
 
     rand(x_h, total_len * nheads * head_dim)
     rand(dt_h, total_len * nheads)
@@ -654,21 +660,37 @@ def run_mamba2_ssd_inplace_vs_functional[
         A_h.store(i, Scalar[dtype](Float32(A_h.load(i)) * -1.0 - 0.1))
     for i in range(total_len * nheads):
         dt_h.store(i, Scalar[dtype](Float32(dt_h.load(i)) - 0.5))
-    # has_initial_state=False for all (no initial state; pool starts at zero).
+    # has_initial_state: all-False by default (pool starts at zero); all-True
+    # under init_state (pool seeded below, state load path exercised).
     for i in range(batch):
-        his_h.store(i, Scalar[DType.bool](False))
+        his_h.store(i, Scalar[.bool](init_state))
     # Slot indices: sequence b -> slot b.
     for i in range(batch):
-        slot_idx_h.store(i, Scalar[DType.uint32](i))
-    # Zero out pool.
+        slot_idx_h.store(i, UInt32(i))
+    # Initial states (functional-reference input + pool seed). Values are
+    # pre-rounded to state_dtype so the fp32 references and a bf16 GPU pool
+    # start from bit-identical states; the only remaining state_dtype effect
+    # is then the single final write-back rounding.
+    var is_count = (batch * nheads * head_dim * dstate) if init_state else 1
+    var is_h = alloc[Float32](is_count)
+    comptime if init_state:
+        rand(is_h, is_count)
+        for i in range(is_count):
+            is_h.store(i, is_h.load(i).cast[state_dtype]().cast[.float32]())
+    # Zero out pool, then (under init_state) seed slot b — identity slot
+    # mapping — with sequence b's initial state so the inplace variants read
+    # exactly what the functional reference receives via its initial_states.
     for i in range(max_slots * nheads * head_dim * dstate):
-        pool_h.store(i, Scalar[DType.float32](0.0))
+        pool_h.store(i, Float32(0.0))
+    comptime if init_state:
+        for i in range(batch * nheads * head_dim * dstate):
+            pool_h.store(i, is_h.load(i))
 
     var cum = 0
-    qsl_h.store(0, Scalar[DType.int32](0))
+    qsl_h.store(0, Int32(0))
     for i in range(batch):
         cum += seq_lengths[i]
-        qsl_h.store(i + 1, Scalar[DType.int32](cum))
+        qsl_h.store(i + 1, Int32(cum))
 
     var x_strides = IndexList[3](nheads * head_dim, head_dim, 1)
     var dt_strides = IndexList[2](nheads, 1)
@@ -689,12 +711,8 @@ def run_mamba2_ssd_inplace_vs_functional[
     )
 
     # ---- Functional variant (CPU reference) ----
-    var is_h_empty = alloc[Scalar[DType.float32]](1)
-    var his_empty_h = alloc[Scalar[DType.bool]](1)
     var y_ref_h = alloc[Scalar[dtype]](total_len * nheads * head_dim)
-    var fs_ref_h = alloc[Scalar[DType.float32]](
-        batch * nheads * head_dim * dstate
-    )
+    var fs_ref_h = alloc[Float32](batch * nheads * head_dim * dstate)
 
     var x_tt = TileTensor(x_h, row_major(total_len, nheads, head_dim))
     var dt_tt = TileTensor(dt_h, row_major(total_len, nheads))
@@ -703,8 +721,13 @@ def run_mamba2_ssd_inplace_vs_functional[
     var C_tt = TileTensor(C_h, row_major(total_len, ngroups, dstate))
     var D_tt = TileTensor(D_h, row_major(nheads))
     var dt_bias_tt = TileTensor(dt_bias_h, row_major(nheads))
-    var is_empty_tt = TileTensor(is_h_empty, row_major(0, 0, 0, 0))
-    var his_empty_tt = TileTensor(his_empty_h, row_major(0))
+    # Empty (dim0 == 0) when init_state is False — the kernels key "has an
+    # initial state" off the has_initial_state tensor's length.
+    var func_is_dim0 = batch if init_state else 0
+    var is_tt = TileTensor(
+        is_h, row_major(func_is_dim0, nheads, head_dim, dstate)
+    )
+    var func_his_tt = TileTensor(his_h, row_major(func_is_dim0))
     var qsl_tt = TileTensor(qsl_h, row_major(batch + 1))
     var y_ref_tt = TileTensor(y_ref_h, row_major(total_len, nheads, head_dim))
     var fs_ref_tt = TileTensor(
@@ -725,11 +748,11 @@ def run_mamba2_ssd_inplace_vs_functional[
         C_tt,
         D_tt,
         dt_bias_tt,
-        is_empty_tt,
+        is_tt,
         y_ref_tt,
         fs_ref_tt,
         qsl_tt,
-        his_empty_tt,
+        func_his_tt,
         x_strides,
         dt_strides,
         A_strides,
@@ -816,21 +839,26 @@ def run_mamba2_ssd_inplace_vs_functional[
     var C_d = ctx.enqueue_create_buffer[dtype](total_len * ngroups * dstate)
     var D_d = ctx.enqueue_create_buffer[dtype](nheads)
     var dt_bias_d = ctx.enqueue_create_buffer[dtype](nheads)
-    var qsl_d = ctx.enqueue_create_buffer[DType.int32](batch + 1)
-    var his_d = ctx.enqueue_create_buffer[DType.bool](batch)
-    var slot_d = ctx.enqueue_create_buffer[DType.uint32](batch)
+    var qsl_d = ctx.enqueue_create_buffer[.int32](batch + 1)
+    var his_d = ctx.enqueue_create_buffer[.bool](batch)
+    var slot_d = ctx.enqueue_create_buffer[.uint32](batch)
     var y_gpu_h = alloc[Scalar[dtype]](total_len * nheads * head_dim)
     var y_d = ctx.enqueue_create_buffer[dtype](total_len * nheads * head_dim)
-    # GPU pool: zero-initialised.
-    var pool_d = ctx.enqueue_create_buffer[DType.float32](
+    # GPU pool: state_dtype storage (fp32 default; bf16 exercises the Apple
+    # bf16-state path), zero-initialised then seeded exactly like pool_h.
+    var pool_d = ctx.enqueue_create_buffer[state_dtype](
         max_slots * nheads * head_dim * dstate
     )
-    var zero_pool = alloc[Scalar[DType.float32]](
+    var init_pool = alloc[Scalar[state_dtype]](
         max_slots * nheads * head_dim * dstate
     )
     for i in range(max_slots * nheads * head_dim * dstate):
-        zero_pool.store(i, Scalar[DType.float32](0.0))
-    ctx.enqueue_copy(pool_d, zero_pool)
+        init_pool.store(i, Scalar[state_dtype](0.0))
+    comptime if init_state:
+        # is_h values are state_dtype-representable, so this cast is exact.
+        for i in range(batch * nheads * head_dim * dstate):
+            init_pool.store(i, is_h.load(i).cast[state_dtype]())
+    ctx.enqueue_copy(pool_d, init_pool)
 
     ctx.enqueue_copy(x_d, x_h)
     ctx.enqueue_copy(dt_d, dt_h)
@@ -882,16 +910,17 @@ def run_mamba2_ssd_inplace_vs_functional[
                 qsl_gtt.LayoutType,
                 his_gtt.LayoutType,
                 slot_gtt.LayoutType,
+                x_gtt.Engine,
                 DSTATE_SPLIT,
             ]
         ]()
         ctx.enqueue_function(
             compiled_split,
-            nheads,
-            head_dim,
-            ngroups,
-            nheads_ngroups_ratio,
-            batch,
+            Int32(nheads),
+            Int32(head_dim),
+            Int32(ngroups),
+            Int32(nheads_ngroups_ratio),
+            Int32(batch),
             Int8(1),
             x_gtt,
             dt_gtt,
@@ -917,6 +946,65 @@ def run_mamba2_ssd_inplace_vs_functional[
             grid_dim=(num_p_blocks, nheads, batch),
             block_dim=(DSTATE_SPLIT, CH_PER_BLOCK, 1),
         )
+    elif use_apple:
+        # Apple-M5 vectorized-I/O kernel (same one-thread-per-channel launch as
+        # v1). Portable fp32 SIMD, so it runs and validates on any GPU here.
+        comptime BLOCK_SIZE = 64
+        var num_p_blocks = (head_dim + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+        var compiled_apple = ctx.compile_function[
+            mamba2_ssd_chunk_scan_varlen_fwd_inplace_gpu_apple[
+                dtype,
+                DSTATE,
+                x_gtt.LayoutType,
+                dt_gtt.LayoutType,
+                A_gtt.LayoutType,
+                B_gtt.LayoutType,
+                C_gtt.LayoutType,
+                D_gtt.LayoutType,
+                dt_bias_gtt.LayoutType,
+                y_gtt.LayoutType,
+                pool_gtt.LayoutType,
+                qsl_gtt.LayoutType,
+                his_gtt.LayoutType,
+                slot_gtt.LayoutType,
+                state_dtype,
+                4,
+                x_gtt.Engine,
+            ]
+        ]()
+        ctx.enqueue_function(
+            compiled_apple,
+            Int32(nheads),
+            Int32(head_dim),
+            Int32(ngroups),
+            Int32(nheads_ngroups_ratio),
+            Int32(batch),
+            Int8(1),
+            x_gtt,
+            dt_gtt,
+            A_gtt,
+            B_gtt,
+            C_gtt,
+            D_gtt,
+            dt_bias_gtt,
+            y_gtt,
+            pool_gtt,
+            qsl_gtt,
+            his_gtt,
+            slot_gtt,
+            x_strides,
+            dt_strides,
+            A_strides,
+            B_strides,
+            C_strides,
+            D_strides,
+            dt_bias_strides,
+            y_strides,
+            pool_strides,
+            grid_dim=(num_p_blocks, nheads, batch),
+            block_dim=(BLOCK_SIZE, 1, 1),
+        )
     else:
         comptime BLOCK_SIZE = 64
         var num_p_blocks = (head_dim + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -937,16 +1025,16 @@ def run_mamba2_ssd_inplace_vs_functional[
                 qsl_gtt.LayoutType,
                 his_gtt.LayoutType,
                 slot_gtt.LayoutType,
-                x_gtt.Storage,
+                x_gtt.Engine,
             ]
         ]()
         ctx.enqueue_function(
             compiled_inplace,
-            nheads,
-            head_dim,
-            ngroups,
-            nheads_ngroups_ratio,
-            batch,
+            Int32(nheads),
+            Int32(head_dim),
+            Int32(ngroups),
+            Int32(nheads_ngroups_ratio),
+            Int32(batch),
             Int8(1),
             x_gtt,
             dt_gtt,
@@ -973,7 +1061,7 @@ def run_mamba2_ssd_inplace_vs_functional[
             block_dim=(BLOCK_SIZE, 1, 1),
         )
 
-    var pool_gpu_h = alloc[Scalar[DType.float32]](
+    var pool_gpu_h = alloc[Scalar[state_dtype]](
         max_slots * nheads * head_dim * dstate
     )
     ctx.enqueue_copy(y_gpu_h, y_d)
@@ -994,9 +1082,11 @@ def run_mamba2_ssd_inplace_vs_functional[
         for i in range(nheads * head_dim * dstate):
             var pool_off = slot * nheads * head_dim * dstate + i
             var fs_off = b * nheads * head_dim * dstate + i
+            # For bf16 state the GPU value carries one extra rounding (the
+            # final write-back; <= 2^-9 relative), well inside rtol.
             assert_almost_equal(
                 fs_ref_h.load(fs_off),
-                pool_gpu_h.load(pool_off),
+                Float32(pool_gpu_h.load(pool_off)),
                 rtol=rtol,
                 msg="GPU pool/fs mismatch at batch="
                 + String(b)
@@ -1016,14 +1106,13 @@ def run_mamba2_ssd_inplace_vs_functional[
     qsl_h.free()
     slot_idx_h.free()
     pool_h.free()
-    is_h_empty.free()
-    his_empty_h.free()
+    is_h.free()
     y_ref_h.free()
     fs_ref_h.free()
     y_inplace_h.free()
     y_gpu_h.free()
     pool_gpu_h.free()
-    zero_pool.free()
+    init_pool.free()
 
 
 def test_mamba2_ssd_inplace_vs_functional_small() raises:
@@ -1031,7 +1120,7 @@ def test_mamba2_ssd_inplace_vs_functional_small() raises:
     with DeviceContext() as ctx:
         if not ctx.is_compatible():
             return
-        run_mamba2_ssd_inplace_vs_functional[DType.bfloat16, 16](
+        run_mamba2_ssd_inplace_vs_functional[.bfloat16, 16](
             nheads=8,
             head_dim=16,
             ngroups=2,
@@ -1047,7 +1136,7 @@ def test_mamba2_ssd_inplace_vs_functional_production() raises:
     with DeviceContext() as ctx:
         if not ctx.is_compatible():
             return
-        run_mamba2_ssd_inplace_vs_functional[DType.bfloat16, 128](
+        run_mamba2_ssd_inplace_vs_functional[.bfloat16, 128](
             nheads=96,
             head_dim=80,
             ngroups=8,
@@ -1075,7 +1164,7 @@ def test_mamba2_ssd_inplace_dstate_split_vs_functional() raises:
 
         comptime if ctx.default_device_info == B200:
             # Production grouping, ragged batch.
-            run_mamba2_ssd_inplace_vs_functional[DType.bfloat16, 128, 2](
+            run_mamba2_ssd_inplace_vs_functional[.bfloat16, 128, 2](
                 nheads=96,
                 head_dim=80,
                 ngroups=8,
@@ -1083,7 +1172,7 @@ def test_mamba2_ssd_inplace_dstate_split_vs_functional() raises:
                 seq_lengths=Index(3, 2),
                 ctx=ctx,
             )
-            run_mamba2_ssd_inplace_vs_functional[DType.bfloat16, 128, 4](
+            run_mamba2_ssd_inplace_vs_functional[.bfloat16, 128, 4](
                 nheads=96,
                 head_dim=80,
                 ngroups=8,
@@ -1091,7 +1180,7 @@ def test_mamba2_ssd_inplace_dstate_split_vs_functional() raises:
                 seq_lengths=Index(3, 2),
                 ctx=ctx,
             )
-            run_mamba2_ssd_inplace_vs_functional[DType.bfloat16, 128, 8](
+            run_mamba2_ssd_inplace_vs_functional[.bfloat16, 128, 8](
                 nheads=96,
                 head_dim=80,
                 ngroups=8,
@@ -1101,7 +1190,7 @@ def test_mamba2_ssd_inplace_dstate_split_vs_functional() raises:
             )
             # Exact decode shape: seqlen-1 sequences (the shape the r7 occupancy
             # lever targets), at DSTATE_SPLIT=8 (the production choice).
-            run_mamba2_ssd_inplace_vs_functional[DType.bfloat16, 128, 8](
+            run_mamba2_ssd_inplace_vs_functional[.bfloat16, 128, 8](
                 nheads=96,
                 head_dim=80,
                 ngroups=8,
@@ -1110,7 +1199,7 @@ def test_mamba2_ssd_inplace_dstate_split_vs_functional() raises:
                 ctx=ctx,
             )
             # Small grouping / smaller dstate, to exercise DSTATE=16 tiling.
-            run_mamba2_ssd_inplace_vs_functional[DType.bfloat16, 16, 4](
+            run_mamba2_ssd_inplace_vs_functional[.bfloat16, 16, 4](
                 nheads=8,
                 head_dim=16,
                 ngroups=2,
@@ -1118,6 +1207,133 @@ def test_mamba2_ssd_inplace_dstate_split_vs_functional() raises:
                 seq_lengths=Index(6, 4),
                 ctx=ctx,
             )
+
+
+def test_mamba2_ssd_inplace_apple_vs_functional() raises:
+    """Apple-M5 vectorized-I/O kernel: y and pool state must equal the
+    functional reference.
+
+    The kernel is portable fp32 SIMD (no warp-width assumption), so it runs on
+    any GPU here for cross-hardware numeric coverage; on Apple (cc==5) it is the
+    production decode path wired at ``kernels.mojo``. Sweeps the production
+    96h/8g/dstate128 grouping, the seqlen-1 decode shape, and a small DSTATE=16
+    grouping (exercises ``NCHUNK = DSTATE / VEC`` chunk tiling at VEC=4).
+    """
+    with DeviceContext() as ctx:
+        if not ctx.is_compatible():
+            return
+        run_mamba2_ssd_inplace_vs_functional[
+            DType.bfloat16, 128, use_apple=True
+        ](
+            nheads=96,
+            head_dim=80,
+            ngroups=8,
+            max_slots=4,
+            seq_lengths=Index(3, 2),
+            ctx=ctx,
+        )
+        # Exact seqlen-1 decode shape (the shape the Apple path targets).
+        run_mamba2_ssd_inplace_vs_functional[
+            DType.bfloat16, 128, use_apple=True
+        ](
+            nheads=96,
+            head_dim=80,
+            ngroups=8,
+            max_slots=8,
+            seq_lengths=Index(1, 1, 1, 1),
+            ctx=ctx,
+        )
+        # Small grouping / smaller dstate, to exercise DSTATE=16 tiling.
+        run_mamba2_ssd_inplace_vs_functional[
+            DType.bfloat16, 16, use_apple=True
+        ](
+            nheads=8,
+            head_dim=16,
+            ngroups=2,
+            max_slots=8,
+            seq_lengths=Index(6, 4),
+            ctx=ctx,
+        )
+
+
+def test_mamba2_ssd_inplace_apple_bf16_state_vs_functional() raises:
+    """Apple kernel with bf16 SSM-state storage vs the fp32 references.
+
+    ``init_state=True`` seeds the pool so BOTH bf16 boundary paths run: the
+    initial-state load (bf16 -> fp32 widen) and the final write-back
+    (fp32 -> bf16 round). Initial values are pre-rounded to bf16, so the only
+    state_dtype effect vs the fp32 reference is the single final write-back
+    rounding (<= 2^-9 relative) — a kernel that instead carried bf16 through
+    the per-timestep recurrence would drift across the long-sequence case
+    below (a canary only; the production gate is gsm8k + a long-generation
+    drift check, since serving re-rounds the stored state every decode step).
+    """
+    with DeviceContext() as ctx:
+        if not ctx.is_compatible():
+            return
+        # Production Nemotron-H grouping, ragged batch, bf16 state.
+        run_mamba2_ssd_inplace_vs_functional[
+            DType.bfloat16,
+            128,
+            use_apple=True,
+            state_dtype=DType.bfloat16,
+            init_state=True,
+        ](
+            nheads=96,
+            head_dim=80,
+            ngroups=8,
+            max_slots=4,
+            seq_lengths=Index(3, 2),
+            ctx=ctx,
+        )
+        # Exact seqlen-1 decode shape (the shape the bf16 pool targets).
+        run_mamba2_ssd_inplace_vs_functional[
+            DType.bfloat16,
+            128,
+            use_apple=True,
+            state_dtype=DType.bfloat16,
+            init_state=True,
+        ](
+            nheads=96,
+            head_dim=80,
+            ngroups=8,
+            max_slots=8,
+            seq_lengths=Index(1, 1, 1, 1),
+            ctx=ctx,
+        )
+        # Long-sequence fp32-accumulate canary (see docstring), small heads to
+        # keep the CPU reference cheap.
+        run_mamba2_ssd_inplace_apple_long_seq_case(ctx)
+        # fp32 state with init_state: pins the initial-state LOAD path on the
+        # unchanged fp32 route (previously only covered with a zero pool).
+        run_mamba2_ssd_inplace_vs_functional[
+            DType.bfloat16, 128, use_apple=True, init_state=True
+        ](
+            nheads=96,
+            head_dim=80,
+            ngroups=8,
+            max_slots=4,
+            seq_lengths=Index(3, 2),
+            ctx=ctx,
+        )
+
+
+def run_mamba2_ssd_inplace_apple_long_seq_case(ctx: DeviceContext) raises:
+    """Long-sequence bf16-state case, split out for readability."""
+    run_mamba2_ssd_inplace_vs_functional[
+        DType.bfloat16,
+        128,
+        use_apple=True,
+        state_dtype=DType.bfloat16,
+        init_state=True,
+    ](
+        nheads=8,
+        head_dim=16,
+        ngroups=2,
+        max_slots=4,
+        seq_lengths=Index(64, 33),
+        ctx=ctx,
+    )
 
 
 def main() raises:

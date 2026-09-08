@@ -25,7 +25,7 @@ prefill, `num_simdgroups=16`) against the fp32 reference for every shape/mask.
 """
 
 from std.collections import OptionalReg
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import exp, isinf, isnan, sqrt
 from std.random import rand, seed
 from std.sys.info import _accelerator_arch
@@ -80,7 +80,7 @@ def _host_attention[
             var kvh = h // group
             for qi in range(seq):
                 # Score row (no prior cache here: cache_len == seq).
-                var scores = [Float32(0)] * num_keys
+                var scores = List[Float32](length=num_keys, fill=0)
                 var m = Float32(-3.0e38)
                 for ki in range(num_keys):
                     var dot = Float32(0)
@@ -185,7 +185,7 @@ def _run[
 
     # Per-head raw sink weights (only used when use_sink). Large values so a
     # dropped sink seed clearly fails (the shared sink test uses 5.0 / 3.0).
-    var sink_w = [Float32(0)] * num_heads
+    var sink_w = List([Float32(0)]) * num_heads
     for h in range(num_heads):
         sink_w[h] = Float32(5.0) - Float32(h) * 0.7
 
@@ -194,10 +194,10 @@ def _run[
     var o_n = q_n
 
     # Host fp32 master data (so the reference and the device input agree).
-    var q_f = [Float32(0)] * q_n
-    var k_f = [Float32(0)] * k_n
-    var v_f = [Float32(0)] * k_n
-    var o_zero = [Float32(0)] * o_n
+    var q_f = List([Float32(0)]) * q_n
+    var k_f = List([Float32(0)]) * k_n
+    var v_f = List([Float32(0)]) * k_n
+    var o_zero = List([Float32(0)]) * o_n
     seed(123)
     for i in range(q_n):
         q_f[i] = Float32(((i * 53 + 17) % 197) - 98) * 0.01
@@ -277,7 +277,7 @@ def _run[
     var v_op = LayoutTensorMHAOperand(v_t)
 
     # Dummy valid_length (dense path doesn't read it).
-    var vl_d = ctx.enqueue_create_buffer[DType.uint32](batch + 1)
+    var vl_d = ctx.enqueue_create_buffer[.uint32](batch + 1)
     var vl_t = TileTensor(vl_d, row_major(batch + 1))
 
     # Sink weights device tensor (only consumed when use_sink).
@@ -297,7 +297,7 @@ def _run[
                 sink_d.unsafe_ptr(),
                 RuntimeLayout[sinks_layout].row_major(Index(num_heads)),
             )
-            .get_immutable()
+            .as_imm()
             .as_unsafe_any_origin()
         )
     else:
@@ -376,16 +376,16 @@ def _cases(ctx: DeviceContext) raises:
     print("== test_apple_fa_prefill (MMA prefill vs fp32 host attention)")
 
     # --- NullMask (full attention): aligned + ragged M/N, fp16 + bf16. ---
-    _run[DType.float16, 64, 4, 4, NullMask, 0](NullMask(), 1, 32, 32, ctx)
-    _run[DType.bfloat16, 64, 4, 4, NullMask, 0](NullMask(), 1, 32, 32, ctx)
+    _run[.float16, 64, 4, 4, NullMask, 0](NullMask(), 1, 32, 32, ctx)
+    _run[.bfloat16, 64, 4, 4, NullMask, 0](NullMask(), 1, 32, 32, ctx)
     # ragged M (seq=20) and N (num_keys=37): exercises bounded edges.
-    _run[DType.float16, 64, 4, 4, NullMask, 0](NullMask(), 1, 20, 37, ctx)
-    _run[DType.bfloat16, 32, 2, 2, NullMask, 0](NullMask(), 1, 17, 29, ctx)
+    _run[.float16, 64, 4, 4, NullMask, 0](NullMask(), 1, 20, 37, ctx)
+    _run[.bfloat16, 32, 2, 2, NullMask, 0](NullMask(), 1, 17, 29, ctx)
 
     # --- depth sweep: multiples of 16 up to 256. ---
-    _run[DType.float16, 16, 2, 2, NullMask, 0](NullMask(), 1, 32, 48, ctx)
-    _run[DType.float16, 128, 2, 2, NullMask, 0](NullMask(), 1, 33, 33, ctx)
-    _run[DType.float16, 256, 2, 2, NullMask, 0](NullMask(), 1, 18, 50, ctx)
+    _run[.float16, 16, 2, 2, NullMask, 0](NullMask(), 1, 32, 48, ctx)
+    _run[.float16, 128, 2, 2, NullMask, 0](NullMask(), 1, 33, 33, ctx)
+    _run[.float16, 256, 2, 2, NullMask, 0](NullMask(), 1, 18, 50, ctx)
 
     # --- OOB-V-poison regression (MOCO): NullMask cross-attention with
     # num_keys < seq, the last KV sub-tile reading V rows past num_keys. The
@@ -395,30 +395,30 @@ def _cases(ctx: DeviceContext) raises:
     # is partial). Group ratios 1/3/4, depths 64/128, fp16 + bf16. Mirrors the
     # `test_flash_attention.mojo` configs that previously NaN'd
     # (seq=1024/keys=100 group=3 d=128; seq=512/keys=37). ---
-    _run[DType.bfloat16, 128, 24, 8, NullMask, 0, oob_poison=True](
+    _run[.bfloat16, 128, 24, 8, NullMask, 0, oob_poison=True](
         NullMask(), 1, 1024, 100, ctx
     )
-    _run[DType.float16, 128, 24, 8, NullMask, 0, oob_poison=True](
+    _run[.float16, 128, 24, 8, NullMask, 0, oob_poison=True](
         NullMask(), 1, 512, 37, ctx
     )
     # group=1 (num_heads == kv_heads).
-    _run[DType.bfloat16, 64, 4, 4, NullMask, 0, oob_poison=True](
+    _run[.bfloat16, 64, 4, 4, NullMask, 0, oob_poison=True](
         NullMask(), 1, 256, 100, ctx
     )
     # group=4 (num_heads=4, kv_heads=1).
-    _run[DType.float16, 64, 4, 1, NullMask, 0, oob_poison=True](
+    _run[.float16, 64, 4, 1, NullMask, 0, oob_poison=True](
         NullMask(), 1, 256, 37, ctx
     )
     # Tiny key set (num_keys=5 << seq): entire valid KV in the first sub-tile,
     # rows 5..15 of sub-tile 0 plus sub-tiles 1..7 all OOB / NaN.
-    _run[DType.bfloat16, 128, 2, 2, NullMask, 0, oob_poison=True](
+    _run[.bfloat16, 128, 2, 2, NullMask, 0, oob_poison=True](
         NullMask(), 1, 320, 5, ctx
     )
 
     # --- CausalMask: aligned + ragged. ---
-    _run[DType.float16, 64, 4, 4, CausalMask, 1](CausalMask(), 1, 32, 32, ctx)
-    _run[DType.bfloat16, 64, 4, 4, CausalMask, 1](CausalMask(), 1, 48, 48, ctx)
-    _run[DType.float16, 128, 2, 2, CausalMask, 1](CausalMask(), 1, 35, 35, ctx)
+    _run[.float16, 64, 4, 4, CausalMask, 1](CausalMask(), 1, 32, 32, ctx)
+    _run[.bfloat16, 64, 4, 4, CausalMask, 1](CausalMask(), 1, 48, 48, ctx)
+    _run[.float16, 128, 2, 2, CausalMask, 1](CausalMask(), 1, 35, 35, ctx)
 
     # --- CausalMask spanning MULTIPLE SK tiles (SK = NumNMmas*16 = 128 with
     # the default 1x8 tile shape): exercises the upper-triangle tile-skip /
@@ -426,14 +426,12 @@ def _cases(ctx: DeviceContext) raises:
     # skip tiles 1 and 2 (kv0=128, 256) entirely, and a ragged tail
     # (seq=200 => 2 tiles, num_keys ragged) checks the partial diagonal tile
     # plus the bounded edge under a skip. ---
-    _run[DType.float16, 64, 4, 4, CausalMask, 1](CausalMask(), 1, 300, 300, ctx)
-    _run[DType.bfloat16, 64, 2, 2, CausalMask, 1](
-        CausalMask(), 1, 200, 200, ctx
-    )
-    _run[DType.float16, 64, 2, 2, CausalMask, 1](CausalMask(), 1, 257, 257, ctx)
+    _run[.float16, 64, 4, 4, CausalMask, 1](CausalMask(), 1, 300, 300, ctx)
+    _run[.bfloat16, 64, 2, 2, CausalMask, 1](CausalMask(), 1, 200, 200, ctx)
+    _run[.float16, 64, 2, 2, CausalMask, 1](CausalMask(), 1, 257, 257, ctx)
 
     # --- SlidingWindowCausalMask. ---
-    _run[DType.float16, 64, 2, 2, SlidingWindowCausalMask[16], 2, 16](
+    _run[.float16, 64, 2, 2, SlidingWindowCausalMask[16], 2, 16](
         SlidingWindowCausalMask[16](), 1, 48, 48, ctx
     )
     # Small window spanning a score-tile boundary (SK=128): the upper rows of
@@ -441,29 +439,29 @@ def _cases(ctx: DeviceContext) raises:
     # not skipped) tile [0,128) and only attend keys once their window opens in
     # the next tile -- exercises a row reaching the softmax fully masked with
     # its running max still at the NEG_INF floor.
-    _run[DType.bfloat16, 64, 2, 2, SlidingWindowCausalMask[8], 2, 8](
+    _run[.bfloat16, 64, 2, 2, SlidingWindowCausalMask[8], 2, 8](
         SlidingWindowCausalMask[8](), 1, 256, 256, ctx
     )
 
     # --- Grouped (GQA: num_heads > kv_heads). ---
-    _run[DType.float16, 64, 8, 2, CausalMask, 1](CausalMask(), 1, 40, 40, ctx)
+    _run[.float16, 64, 8, 2, CausalMask, 1](CausalMask(), 1, 40, 40, ctx)
 
     # --- Multi-batch. ---
-    _run[DType.float16, 64, 4, 4, CausalMask, 1](CausalMask(), 2, 32, 32, ctx)
+    _run[.float16, 64, 4, 4, CausalMask, 1](CausalMask(), 2, 32, 32, ctx)
 
     # --- Sink (attention sink as init-state): NullMask + CausalMask. ---
-    _run[DType.float16, 64, 2, 2, NullMask, 0, 0, use_sink=True](
+    _run[.float16, 64, 2, 2, NullMask, 0, 0, use_sink=True](
         NullMask(), 1, 32, 32, ctx
     )
-    _run[DType.float16, 64, 4, 4, CausalMask, 1, 0, use_sink=True](
+    _run[.float16, 64, 4, 4, CausalMask, 1, 0, use_sink=True](
         CausalMask(), 1, 48, 48, ctx
     )
-    _run[DType.bfloat16, 128, 2, 2, NullMask, 0, 0, use_sink=True](
+    _run[.bfloat16, 128, 2, 2, NullMask, 0, 0, use_sink=True](
         NullMask(), 1, 33, 40, ctx
     )
     # scale=0 sink case (mirrors test_flash_attention_sink_kernel exactly:
     # all QK logits 0, output == num_keys/(num_keys + exp(sink))).
-    _run[DType.bfloat16, 128, 2, 2, NullMask, 0, 0, use_sink=True](
+    _run[.bfloat16, 128, 2, 2, NullMask, 0, 0, use_sink=True](
         NullMask(), 1, 8, 64, ctx, scale_override=0.0
     )
 

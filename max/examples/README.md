@@ -6,7 +6,7 @@ READMEs for usage instructions.
 
 ## Mojo code examples
 
-We moved the Mojo examples to [/mojo/examples](../../mojo/examples/)
+We moved the Mojo examples to [/Mojo/examples](../../Mojo/examples/)
 
 ## [Modules](modules/)
 
@@ -32,6 +32,42 @@ written in Mojo.
 
 An example of how to define and register a custom architecture with MAX for
 text generation or serving.
+
+## [Mojo GPU functions](gpu-functions/)
+
+Introductory examples of how to program GPUs using Mojo, including: vector
+addition, grayscale conversion, matrix multiplication, reduction operations,
+and calculating a Mandelbrot set fractal.
+
+## [Get started with GPU programming](gpu-intro/)
+
+The complete solution for the [Get started with GPU
+programming](https://max.modular.com/gpu/intro-tutorial/) tutorial: a simple
+vector addition kernel written in Mojo.
+
+## [GPU block and warp operations](gpu-block-and-warp/)
+
+A tiled matrix multiplication that demonstrates block-level and warp-level
+synchronization, accompanying [GPU block and warp operations and
+synchronization](https://max.modular.com/gpu/block-and-warp/).
+
+## [Layouts](layouts/)
+
+Using the `Layout` type to describe how multidimensional data is arranged in
+memory, accompanying [Introduction to
+layouts](https://max.modular.com/layout/layouts/).
+
+## [LayoutTensor](layout_tensor/)
+
+Using the `LayoutTensor` type to manipulate multidimensional data on both CPU
+and GPU, accompanying [Using
+LayoutTensor](https://max.modular.com/layout/tensors/).
+
+## [Music generation](music_generation/)
+
+Rendering a full-length song from a caption and lyrics with MiniMax-Music3,
+either in process or through a running MAX server, and measuring the joins
+between the model's denoising windows.
 
 ---
 
@@ -112,7 +148,7 @@ You can run it directly to confirm it works like this (but notice this example
 requires a GPU):
 
 ```sh
-bt //oss/modular/mojo/examples/gpu-intro:vector_addition_test
+bt //max/examples/gpu-intro:vector_addition_test
 ```
 
 With this, we can now be sure that the code runs under specific build

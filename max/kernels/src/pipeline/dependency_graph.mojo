@@ -24,7 +24,7 @@ from .types import DepEdge, OpDesc, ResourceKind
 struct OpNode(ImplicitlyCopyable, Movable):
     """An operation in the Loop Dependency Graph (LDG).
 
-    Enriches OpDesc with resource assignment and latency — the information
+    Enriches OpDesc with resource assignment and latency, the information
     needed for modulo scheduling (GAG96). Each OpNode represents one vertex
     in the LDG.
 
@@ -178,9 +178,10 @@ struct LoopBody(Copyable, Movable):
             makespan: Target schedule length to compute ALAP relative to.
                 Typically the ASAP critical path length.
         """
-        var alap = List[Int]()
-        for i in range(len(self.ops)):
-            alap.append(makespan - self.ops[i].latency)
+        var alap = List(
+            length=len(self.ops),
+            fill_with=lambda (i: Int) -> Int: makespan - self.ops[i].latency,
+        )
         self._propagate_times(alap, forward=False)
         return alap^
 

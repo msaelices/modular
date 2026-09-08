@@ -56,6 +56,15 @@ python3 max/kernels/test/gpu/fuzz/fuzz.py --replay-corpus --timeout 30
 Confirmed failures and their shrunk specs are recorded under `corpus/<target>/`
 with their expected verdict, and the replay gate re-runs them deterministically.
 
+The orchestrator only writes an entry for a non-PASS verdict, so a `_pass_`
+entry is always hand-written: an anchor asserting a representative boundary
+shape still runs clean, which is what lets the gate catch a regression rather
+than only a change in a known failure. Keep them when pruning stale failures.
+Note the corpus is exempted from the unreferenced-files lint by a pattern in
+`bazel/internal/find_unreferenced_files.py`, and that lint also rejects an
+unused pattern — so emptying the corpus entirely means dropping the exemption
+in the same change.
+
 ## Oracles
 
 Select with `--oracle`:
@@ -101,6 +110,13 @@ reference, special-value contract, or split-K decomposition exists; likewise
 the corresponding flag (`--rerun` / `--batch-invariance` / `--batch-variance`).
 Cross-run comparisons always live inside the target process — the orchestrator
 issues one verdict per subprocess and never holds two cases' outputs.
+The M3 decode pair carries the cross-run oracles: `msa_decode` supports
+`determinism` (`--rerun`), and `sparse_indexer_decode` supports
+`batch_invariance` (`--batch-invariance`) on top of its `schedule` mode. The
+indexer's gate is the load-bearing one -- its scorer sizes split-K from the
+batch size, so a request really is decomposed differently depending on its
+neighbours, and its scores pick the blocks attention reads.
+
 Targets that fuzz the input value distribution expose a `dist` spec field
 (uniform/normal/sparse/large/all-equal); NaN/Inf specials are reachable but kept
 out of the auto-mix — they drive the `contract` oracle, not `ref`.
@@ -109,6 +125,34 @@ out of the auto-mix — they drive the `contract` oracle, not `ref`.
 > reads**; OOB **reads** need `memcheck` with the device pool disabled (the
 > orchestrator sets `MEMORY_MANAGER_SIZE=0` in the subprocess env, which works
 > because it runs the built binary directly rather than via `bazel test`).
+
+## Build-time configs
+
+A target compiles once per dtype/config and reads shapes at run time, so any
+parameter the kernel specializes on is a `-D` define rather than a spec field.
+Build the target by name with the define, then run with `--no-build`:
+
+```bash
+./bazelw build //max/kernels/test/gpu/fuzz:fuzz_topk_topp_sampling_dist.mojo.test \
+    --mojocopt=-D --mojocopt=ttsd_bf16=1 --curses=no --noshow_progress
+python3 max/kernels/test/gpu/fuzz/fuzz.py --target topk_topp_sampling_dist \
+    --oracle ref --no-build --budget 24
+```
+
+The sampler targets carry a dtype axis because speculative decoding runs them
+at both precisions: `float32` under `draft_proposal: argmax` and `bfloat16`
+under `draft_proposal: sampled`, which switches `sampling_logits_dtype` for the
+whole sampling path. The in-source default is `float32`, so the bfloat16 arm
+only gets covered when it is built explicitly.
+
+| Define        | Target                    | Effect             |
+|---------------|---------------------------|--------------------|
+| `ttsd_bf16=1` | `topk_topp_sampling_dist` | bfloat16 logits in |
+| `ttmp_bf16=1` | `topk_topp_masked_probs`  | bfloat16 logits in |
+
+The corpus records a spec, not a build config, so a replay entry always runs
+under the in-source default. Alternate configs belong in a live sweep, not the
+replay gate.
 
 ## Adding a kernel target
 
@@ -147,22 +191,28 @@ design's non-gating → gating rollout:
   ```
 
 - **Nightly (non-gating / notify-only, slow):** a time-boxed live search per
-  oracle. New findings surface as a soft-failed step + notify; the lane does
-  not redden `main`. The lane is `kernel-fuzz-b200` in
-  `ci/default/postsubmit.json`, running `ci/default/kernel-fuzz.sh`
-  (`soft_fail: true`), which sweeps the determinism/batch-invariance oracle
-  family over the wired targets with a bounded budget and a fresh
-  `$BUILDKITE_BUILD_NUMBER` seed.
+  oracle. Because the input set is random and fresh each night, a finding is an
+  EXPECTED, intermittent event; a red scheduled run means "the live search
+  surfaced a candidate finding to triage" and it never gates `main`. This runs
+  on GitHub Actions as `.github/workflows/nightlyKernelFuzz.yaml` (a
+  `modrunner-b200` self-hosted local-GPU runner — the direct-binary home this
+  section recommended), one matrix lane per oracle
+  (`memcheck/initcheck/redzone/ref/determinism/contract`), driving
+  `run_nightly_fuzz.sh <oracle>` over a curated per-oracle target list with a
+  fresh `${{ github.run_number }}` seed. It notifies #kernel-team-notifications
+  on a scheduled failure, mirroring the allocator-sweep and compute-sanitizer
+  nightlies.
+
+  `synccheck`/`racecheck` are deliberately NOT nightly lanes: `synccheck`
+  false-positives on warp-specialized SM100 kernels (block-wide `__syncthreads`
+  model vs warpgroup-scoped named barriers), so it is noise for a notify lane.
 
   GPU-locality caveat: `fuzz.py` runs the built target binaries **directly**
-  (not via `bazel test`), so it needs a **local** GPU on the agent. The
-  `persistent-b200` queue runs its bazel work via remote execution
-  (`--config=ci-remote-b200`), so a local GPU is not guaranteed there —
-  `kernel-fuzz.sh` self-checks `nvidia-smi` and no-ops cleanly when absent.
-  The proven home for direct-binary GPU fuzzing is a self-hosted local-GPU
-  GitHub Actions runner (the `.github/workflows/llmFuzzAdHoc.yaml` pattern);
-  porting the search there is the recommended long-term move. Also note
-  `manual`-tagged fuzz targets must be built by explicit name — `//...` and
-  `:all` wildcards skip them.
+  (not via `bazel test`), so it needs a **local** GPU on the agent — hence the
+  `modrunner-b200` runner rather than the remote-execution `persistent-b200`
+  queue. Also note `manual`-tagged fuzz targets must be built by explicit name
+  — `//...` and `:all` wildcards skip them (which is how the targets in the
+  default lists silently bit-rotted against a `LayoutTensor` origin API change;
+  give them a build-by-name presubmit to catch that).
 
   Validate the redzone/poison allocators on MI355 before adding an AMD lane.

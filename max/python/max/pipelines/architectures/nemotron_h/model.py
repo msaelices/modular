@@ -41,20 +41,20 @@ from max.nn.comm import (
 from max.nn.kv_cache import KVCacheParams
 from max.nn.transformer import ReturnHiddenStates, ReturnLogits
 from max.pipelines.lib import (
-    CompilationTimer,
     KVCacheConfig,
     ModelInputs,
     ModelOutputs,
     PipelineConfig,
     SupportsSSMStateWarmup,
 )
-from max.pipelines.lib.utils import parse_state_dict_from_weights
+from max.pipelines.lib.memory_estimation import MemoryPlan
 from max.pipelines.modeling.types import RequestID
 from max.profiler import traced
+from typing_extensions import override
 
 from ..llama3.model import Llama3Inputs, LlamaModelBase
 from .model_config import NemotronHConfig, build_fp8_quant_config
-from .nemotron_h import NemotronH
+from .nemotron_h import NemotronH, _ssm_state_dtype
 from .state_cache import NemotronHStateCache
 
 logger = logging.getLogger("max.pipelines")
@@ -121,6 +121,8 @@ class NemotronHModel(LlamaModelBase, SupportsSSMStateWarmup):
         devices: list[Device],
         kv_cache_config: KVCacheConfig,
         weights: Weights,
+        *,
+        memory_plan: MemoryPlan,
         adapter: WeightsAdapter | None = None,
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
         return_hidden_states: ReturnHiddenStates = ReturnHiddenStates.NONE,
@@ -132,14 +134,17 @@ class NemotronHModel(LlamaModelBase, SupportsSSMStateWarmup):
             devices,
             kv_cache_config,
             weights,
-            adapter,
-            return_logits,
-            return_hidden_states,
+            adapter=adapter,
+            return_logits=return_logits,
+            return_hidden_states=return_hidden_states,
             max_batch_size=max_batch_size,
+            memory_plan=memory_plan,
         )
 
     @traced
+    @override
     def load_model(self, session: InferenceSession) -> Model:
+        model = super().load_model(session)
         # Use the resolved batch size forwarded from the memory plan via
         # __init__ (stored on self by the base PipelineModel). The user-facing
         # pipeline_config.runtime.max_batch_size is only the requested cap and
@@ -148,12 +153,6 @@ class NemotronHModel(LlamaModelBase, SupportsSSMStateWarmup):
         assert max_batch_size is not None, (
             "max_batch_size must be set in runtime config"
         )
-
-        with CompilationTimer("model") as timer:
-            graph = self._build_graph(self.weights, self.adapter)
-            timer.mark_build_complete()
-            model = session.load(graph, weights_registry=self.state_dict)
-
         # Allocate the per-request state cache + per-step preallocs.
         self._state_cache = NemotronHStateCache(
             num_mamba_layers=self._num_mamba_layers,
@@ -165,6 +164,10 @@ class NemotronHModel(LlamaModelBase, SupportsSSMStateWarmup):
             max_slots=max_batch_size,
             device=self.devices[0],
             conv_dtype=self._model_dtype,
+            # bf16 on Apple GPUs (halves the dominant decode-step pool
+            # traffic; the scan still accumulates in fp32), fp32 elsewhere.
+            # Must match the graph-side BufferType in NemotronH.input_types.
+            ssm_dtype=_ssm_state_dtype(),
         )
         if not is_virtual_device_mode():
             self._slot_idx_prealloc = Buffer(
@@ -180,15 +183,10 @@ class NemotronHModel(LlamaModelBase, SupportsSSMStateWarmup):
             ).to(self.devices[0])
         return model
 
-    def _build_graph(
-        self,
-        weights: Weights,
-        adapter: WeightsAdapter | None = None,
-    ) -> Graph:
-        state_dict = parse_state_dict_from_weights(
-            self.pipeline_config, weights, adapter
-        )
-
+    @override
+    def _create_model_config(
+        self, state_dict: dict[str, Any]
+    ) -> NemotronHConfig:
         device_ref = DeviceRef.from_device(self.devices[0])
         assert isinstance(self.kv_params, KVCacheParams)
         model_config = NemotronHConfig.from_hf(
@@ -197,15 +195,26 @@ class NemotronHModel(LlamaModelBase, SupportsSSMStateWarmup):
             self.dtype,
             self.kv_params,
             [device_ref],
+            max_seq_len=self.max_seq_len,
         )
+        # FP8 is per-module: a Linear is FP8 iff its weight_scale is present in
+        # the checkpoint. Record which layers are FP8 from weight_scale keys.
+        model_config.populate_fp8_layers(state_dict)
+        return model_config
 
+    @override
+    def _build_graph_for_compile(
+        self,
+        session: InferenceSession,
+        state_dict: dict[str, Any],
+        model_config: NemotronHConfig,
+    ) -> tuple[Graph, dict[str, Any]]:
+        del session
         # FP8 is per-module: a Linear is FP8 iff its weight_scale is present in
         # the checkpoint. Build the FP8 layer sets + per-tensor static config.
         quant_config = build_fp8_quant_config(
             self.huggingface_config, state_dict
         )
-        model_config.populate_fp8_layers(state_dict)
-
         nn_model = NemotronH(
             model_config,
             quant_config=quant_config,
@@ -236,7 +245,7 @@ class NemotronHModel(LlamaModelBase, SupportsSSMStateWarmup):
             weight_alignment=1,
             strict=False,
         )
-        self.state_dict = nn_model.state_dict()
+        weights_registry = nn_model.state_dict()
 
         # Save dims for state-pool allocation.
         self._num_mamba_layers = nn_model.num_mamba_layers
@@ -291,13 +300,13 @@ class NemotronHModel(LlamaModelBase, SupportsSSMStateWarmup):
                 has_initial_state_g,
             )
             graph.output(*outputs)
-            return graph
+            return graph, weights_registry
 
     def execute(self, model_inputs: ModelInputs) -> ModelOutputs:
         assert isinstance(model_inputs, NemotronHInputs)
         assert model_inputs.kv_cache_inputs is not None
 
-        model_outputs = self.model.execute(*model_inputs.buffers)
+        model_outputs = list(self.model.execute(*model_inputs.buffers))
 
         # Both the conv pools and SSM pools are mutated in place by their
         # respective inplace ops; the only graph output is the logits (plus
@@ -312,7 +321,10 @@ class NemotronHModel(LlamaModelBase, SupportsSSMStateWarmup):
                 next_token_logits=logits,
                 logit_offsets=model_outputs[2],
             )
-        return ModelOutputs(logits=logits, next_token_logits=logits)
+        return ModelOutputs(
+            logits=logits,
+            next_token_logits=logits,
+        )
 
     def prepare_initial_token_inputs(
         self,

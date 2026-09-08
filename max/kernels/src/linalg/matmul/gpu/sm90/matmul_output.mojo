@@ -11,15 +11,23 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+"""Provides the output writer for SM90 warp-group matrix multiply-accumulate kernels.
+
+Defines `MatmulTileWriter`, which stores WGMMA accumulator register tiles to
+global memory using either TMA async stores or thread-wise stores, with support
+for swizzled shared memory layouts, optional elementwise epilogues, and the
+swapAB small-M strategy.
+"""
+
 from std.math import ceildiv
 from std.sys import simd_width_of, size_of
 
-from std.gpu.globals import WARPGROUP_SIZE
-from std.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.gpu.sync import named_barrier
+from max.gpu.globals import WARPGROUP_SIZE
+from max.gpu.host.nvidia.tma import TensorMapSwizzle
+from max.gpu.sync import named_barrier
 from layout import Coord, Idx, Layout, TensorLayout, TileTensor, row_major
 from layout.swizzle import make_ldmatrix_swizzle
-from layout.tensor_storage import TensorStorage
+from layout.tensor_engine import TensorEngine
 from layout.tma_async import TMATensorTile
 
 from std.utils.index import IndexList
@@ -42,7 +50,7 @@ import std.itertools
 struct MatmulTileWriter[
     dtype: DType,
     tensor_layout: TensorLayout,
-    tensor_storage: TensorStorage,
+    output_engine: TensorEngine,
     linear_idx_type: DType,
     smem_tile_layout: TensorLayout,
     //,
@@ -60,6 +68,48 @@ struct MatmulTileWriter[
     ] = None,
     swapAB: Bool = False,
 ](TrivialRegisterPassable):
+    """Writes WGMMA accumulator register tiles to global memory for SM90 matmul.
+
+    Provides two write paths: TMA store (shared memory → global via hardware
+    async copies) and thread-wise store (register → global directly). Handles
+    swizzled shared memory layouts, optional elementwise epilogues, and A/B swap
+    when the problem uses the swapAB small-M strategy.
+
+    Parameters:
+        dtype: Element type of the output tensor and shared memory tile
+            (inferred).
+        tensor_layout: Memory layout of the output tensor in global memory
+            (inferred).
+        output_engine: Engine backing the output tensor in global memory
+            (inferred).
+        linear_idx_type: Integer type used for linear index arithmetic
+            into the output tensor (inferred).
+        smem_tile_layout: Memory layout of the shared memory tile used to
+            stage output before storing to global memory; also defines the
+            workgroup tile dimensions `WG_BM` and `WG_BN` (inferred).
+        BM: Row (M) dimension of the matmul output tile per block.
+        BN: Column (N) dimension of the matmul output tile per block.
+        swizzle: TMA swizzle mode applied to shared memory for TMA async
+            stores.
+        wgmma_shape: Shape of each WGMMA instruction as a 3-element index
+            list `(M, N, K)`.
+        num_consumer: Number of consumer warp groups sharing the output
+            tile (defaults to 1).
+        use_tma_store: Whether to use TMA async stores for shared memory
+            to global memory copies (defaults to `False`).
+        elementwise_lambda_fn: Optional epilogue lambda invoked with
+            each output element's global coordinates and value,
+            writing directly to global memory
+            (defaults to `None`).
+        elementwise_compute_lambda_fn: Optional compute lambda that
+            transforms each output element value before it is written
+            back to shared memory and then to global memory (defaults
+            to `None`).
+        swapAB: Whether to swap the A and B operand roles for the small-M
+            strategy, transposing the tile and block coordinate mapping
+            (defaults to `False`).
+    """
+
     comptime N = Self.tensor_layout.static_shape[1]
     comptime frag_size = Self.wgmma_shape[0] * Self.wgmma_shape[
         1
@@ -75,15 +125,15 @@ struct MatmulTileWriter[
 
     comptime CTensorType = TileTensor[
         mut=True,
-        dtype=Self.dtype,
+        Self.dtype,
         LayoutType=Self.tensor_layout,
         origin=MutAnyOrigin,
-        Storage=Self.tensor_storage,
-        address_space=AddressSpace.GENERIC,
+        Engine=Self.output_engine,
+        address_space=.GENERIC,
         linear_idx_type=Self.linear_idx_type,
     ]
     comptime lambda_type = def[
-        dtype: DType, width: SIMDSize, *, alignment: Int = 1
+        dtype: DType, width: SIMDLength, *, alignment: Int = 1
     ](IndexList[2], mut SIMD[dtype, width]) -> None
 
     # Instance fields
@@ -93,10 +143,10 @@ struct MatmulTileWriter[
     @__allow_legacy_any_origin_fields
     var smem_tile: TileTensor[
         mut=True,
-        dtype=Self.dtype,
+        Self.dtype,
         LayoutType=Self.smem_tile_layout,
         origin=MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
     ]
     var warp_group_thread_idx: Int
     var local_warp_group_idx: Int
@@ -110,10 +160,10 @@ struct MatmulTileWriter[
         tensor: Self.CTensorType,
         smem_tile: TileTensor[
             mut=True,
-            dtype=Self.dtype,
+            Self.dtype,
             LayoutType=Self.smem_tile_layout,
             origin=MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
         ],
         warp_group_thread_idx: Int,
         local_warp_group_idx: Int,
@@ -195,7 +245,7 @@ struct MatmulTileWriter[
                 var shared_value = shared_fragment.load(Coord(Idx[i], Idx[0]))
                 epilogue[
                     dtype=type_of(shared_value).dtype,
-                    width=type_of(shared_value).size,
+                    width=type_of(shared_value).length,
                 ](IndexList[2](Int(row), Int(col)), shared_value)
                 shared_fragment.store(Coord(Idx[i], Idx[0]), shared_value)
 
@@ -382,7 +432,7 @@ struct MatmulTileWriter[
                 comptime compute_fn = Self.elementwise_compute_lambda_fn.value()
 
                 def _compute[
-                    dtype: DType, width: SIMDSize, *, alignment: Int = 1
+                    dtype: DType, width: SIMDLength, *, alignment: Int = 1
                 ](index: IndexList[2], mut val: SIMD[dtype, width]) {}:
                     val = compute_fn[alignment=alignment](index, val)
 
@@ -393,7 +443,7 @@ struct MatmulTileWriter[
                 comptime epilogue_fn = Self.elementwise_lambda_fn.value()
 
                 def _epilogue[
-                    dtype: DType, width: SIMDSize, *, alignment: Int = 1
+                    dtype: DType, width: SIMDLength, *, alignment: Int = 1
                 ](index: IndexList[2], mut val: SIMD[dtype, width]) {}:
                     _ = epilogue_fn[alignment=alignment](index, val)
 
@@ -403,7 +453,7 @@ struct MatmulTileWriter[
                     var tma_writer = TileWriterTMA(Pointer(to=tma_op))
 
                     if self.local_thread_idx < (Self.WG_BN // TMA_BN):
-                        var smem_offset = self.smem_tile.ptr + (
+                        var smem_offset = self.smem_tile._storage + (
                             Self.WG_BM * TMA_BN * self.local_thread_idx
                         )
                         comptime tma_smem_layout = row_major[
@@ -411,10 +461,10 @@ struct MatmulTileWriter[
                         ]()
                         var tma_tile = TileTensor[
                             mut=True,
-                            dtype=Self.dtype,
+                            Self.dtype,
                             LayoutType=type_of(tma_smem_layout),
                             origin=MutAnyOrigin,
-                            address_space=AddressSpace.SHARED,
+                            address_space=.SHARED,
                         ](smem_offset, tma_smem_layout)
 
                         var tma_coords = (
@@ -438,9 +488,7 @@ struct MatmulTileWriter[
                         half_tile=is_partial_tile,
                         swapAB=Self.swapAB,
                     ](
-                        workgroup_tile.address_space_cast[
-                            AddressSpace.GENERIC
-                        ](),
+                        workgroup_tile.address_space_cast[.GENERIC](),
                         self.local_thread_idx,
                     )
 
@@ -467,6 +515,21 @@ struct MatmulTileWriter[
 
         Selects optimized st.matrix path for bf16 when constraints are met,
         otherwise uses general register-to-global path.
+
+        Parameters:
+            tma_rank: Number of dimensions in the TMA tensor descriptor.
+            tma_tile_shape: Shape of each TMA store tile per async copy, as
+                an index list of length `tma_rank`.
+            tma_desc_shape: Full shape of the TMA tensor descriptor as an
+                index list of length `tma_rank`.
+            accum_type: Data type of the WGMMA accumulator register tile.
+            reg_tile_layout: Memory layout of the accumulator register tile.
+
+        Args:
+            tma_op: TMA tensor tile descriptor used for async stores from
+                shared memory to global memory.
+            reg_tile: WGMMA accumulator register tile containing the matmul
+                result to write.
         """
         # Output tile dimensions and block coordinates
         # For normal: tile is BM x BN, positioned at (block_y, block_x)
@@ -488,7 +551,7 @@ struct MatmulTileWriter[
         # Check if st.matrix optimization can be used
         # fmt: off
         comptime can_use_stmatrix_normal = (
-            accum_type == DType.float32 and Self.dtype == DType.bfloat16  # F32→BF16
+            accum_type == .float32 and Self.dtype == .bfloat16  # F32→BF16
             and Self.frag_size % 4 == 0                               # Register count
             and Self.BM % Self.wgmma_shape[0] == 0                              # M alignment
             and Self.WG_BN % 16 == 0                                  # Shared memory
@@ -499,7 +562,7 @@ struct MatmulTileWriter[
         )
 
         comptime can_use_stmatrix_swapAB = (
-            accum_type == DType.float32 and Self.dtype == DType.bfloat16             # F32→BF16
+            accum_type == .float32 and Self.dtype == .bfloat16             # F32→BF16
             and Self.frag_size % 4 == 0                                              # Register count (at least stmatrix x2 can be used)
             and Self.BM % Self.wgmma_shape[0] == 0                                   # each consumer should get one wgmma tile
             and Self.WG_BM % 8 == 0                                                  # Shared memory, must have at least 8 rows for swapAB

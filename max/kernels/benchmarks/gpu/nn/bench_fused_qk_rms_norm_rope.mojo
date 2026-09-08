@@ -33,18 +33,20 @@ from std.math import ceildiv
 from std.random import seed
 from std.sys import get_defined_int
 
+from max.benchmark import bencher_iter_custom
 from std.benchmark import (
     Bench,
     Bencher,
     BenchId,
 )
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from internal_utils import arg_parse
 from kv_cache.types import (
     KVCacheStaticParams,
     PagedKVCacheCollection,
 )
 from layout import (
+    Coord,
     Idx,
     Layout,
     LayoutTensor,
@@ -89,7 +91,7 @@ def bench_fused_qk_rms_norm_rope[
     rope_dim: Int,
     num_q_heads: Int,
     num_kv_heads: Int,
-](ctx: DeviceContext, mut m: Bench, batch_size: Int, seq_len: Int,) raises:
+](ctx: DeviceContext, mut m: Bench, batch_size: Int, seq_len: Int) raises:
     """Benchmarks two-step (norm+rope) vs fused at a given shape."""
     comptime kv_params = KVCacheStaticParams(
         num_heads=num_kv_heads, head_size=head_dim
@@ -119,10 +121,13 @@ def bench_fused_qk_rms_norm_rope[
     comptime cache_lengths_layout = Layout(UNKNOWN_VALUE)
     comptime paged_lut_layout = Layout.row_major[2]()
 
-    var row_offsets_d = ctx.enqueue_create_buffer[DType.uint32](
-        total_seq_len + 1
-    )
-    var cache_lengths_d = ctx.enqueue_create_buffer[DType.uint32](batch_size)
+    # row_offsets is a cumulative per-batch offset array (cu_seqlens-style):
+    # one entry per batch boundary, not per token -- must be sized
+    # batch_size + 1, not total_seq_len + 1 (which left the tail unfilled
+    # and fed garbage into get_batch_from_row_offsets' binary search for
+    # any seq_len > ~3).
+    var row_offsets_d = ctx.enqueue_create_buffer[.uint32](batch_size + 1)
+    var cache_lengths_d = ctx.enqueue_create_buffer[.uint32](batch_size)
     # Separate input Q buffers so each benchmark reads the same original data.
     # bench_two_step wrote its RoPE output back into q_d, which would corrupt
     # bench_fused's input if they shared a buffer.
@@ -146,19 +151,15 @@ def bench_fused_qk_rms_norm_rope[
     var kv_blocks_fused_d = ctx.enqueue_create_buffer[dtype](
         kv_block_shape.flattened_length()
     )
-    var paged_lut_d = ctx.enqueue_create_buffer[DType.uint32](
+    var paged_lut_d = ctx.enqueue_create_buffer[.uint32](
         paged_lut_shape.flattened_length()
     )
     comptime freqs_static_layout = Layout.row_major(max_seq_len, rope_dim)
     var freqs_d = ctx.enqueue_create_buffer[dtype](max_seq_len * rope_dim)
 
-    var row_offsets_h = ctx.enqueue_create_host_buffer[DType.uint32](
-        total_seq_len + 1
-    )
-    var cache_lengths_h = ctx.enqueue_create_host_buffer[DType.uint32](
-        batch_size
-    )
-    var paged_lut_h = ctx.enqueue_create_host_buffer[DType.uint32](
+    var row_offsets_h = ctx.enqueue_create_host_buffer[.uint32](batch_size + 1)
+    var cache_lengths_h = ctx.enqueue_create_host_buffer[.uint32](batch_size)
+    var paged_lut_h = ctx.enqueue_create_host_buffer[.uint32](
         paged_lut_shape.flattened_length()
     )
     for i in range(batch_size + 1):
@@ -225,19 +226,15 @@ def bench_fused_qk_rms_norm_rope[
     var gamma_k_tile = TileTensor(gamma_k_d, row_major[head_dim]())
     comptime freqs_tile_layout = row_major[max_seq_len, rope_dim]()
     var freqs_tile = TileTensor(freqs_d, freqs_tile_layout)
-    var row_offsets_tile = TileTensor(
-        row_offsets_d, row_major(total_seq_len + 1)
-    )
+    var row_offsets_tile = TileTensor(row_offsets_d, row_major(batch_size + 1))
 
     var cache_lengths_tensor = LayoutTensor[
-        mut=False, DType.uint32, cache_lengths_layout
+        mut=False, .uint32, cache_lengths_layout
     ](
         cache_lengths_d,
         RuntimeLayout[cache_lengths_layout].row_major(Index(batch_size)),
     )
-    var paged_lut_tensor = LayoutTensor[
-        mut=False, DType.uint32, paged_lut_layout
-    ](
+    var paged_lut_tensor = LayoutTensor[mut=False, .uint32, paged_lut_layout](
         paged_lut_d,
         RuntimeLayout[paged_lut_layout].row_major(paged_lut_shape),
     )
@@ -254,25 +251,25 @@ def bench_fused_qk_rms_norm_rope[
         kv_blocks_fused_d, kv_block_rt
     )
 
-    @parameter
-    @__copy_capture(
-        kv_blocks_ref_lt,
-        cache_lengths_tensor,
-        paged_lut_tensor,
-        q_tile,
-        q_out_ref_tile,
-        gamma_q_tile,
-        gamma_k_tile,
-        freqs_tile,
-        row_offsets_tile,
-        max_prompt_len,
-        max_cache_len,
-    )
     @always_inline
-    def bench_two_step(mut b: Bencher):
-        @parameter
+    def bench_two_step(
+        mut b: Bencher,
+    ) {
+        var kv_blocks_ref_lt,
+        var cache_lengths_tensor,
+        var paged_lut_tensor,
+        var q_tile,
+        var q_out_ref_tile,
+        var gamma_q_tile,
+        var gamma_k_tile,
+        var freqs_tile,
+        var row_offsets_tile,
+        var max_prompt_len,
+        var max_cache_len,
+        imm,
+    }:
         @always_inline
-        def kernel_launch(ctx: DeviceContext) raises:
+        def kernel_launch(ctx: DeviceContext) raises {imm}:
             var kv_ref = PagedKVCacheCollection[dtype, kv_params, page_size](
                 kv_blocks_ref_lt,
                 cache_lengths_tensor,
@@ -309,35 +306,36 @@ def bench_fused_qk_rms_norm_rope[
                 context=ctx,
             )
 
-        b.iter_custom[kernel_launch](ctx)
+        bencher_iter_custom(b, kernel_launch, ctx)
 
-    m.bench_function[bench_two_step](
+    m.bench_function(
+        bench_two_step,
         BenchId(
             _bench_name[
                 dtype, head_dim, rope_dim, num_q_heads, num_kv_heads, "two_step"
             ](batch_size, seq_len)
-        )
+        ),
     )
 
-    @parameter
-    @__copy_capture(
-        kv_blocks_fused_lt,
-        cache_lengths_tensor,
-        paged_lut_tensor,
-        q_fused_tile,
-        q_out_fused_tile,
-        gamma_q_tile,
-        gamma_k_tile,
-        freqs_tile,
-        row_offsets_tile,
-        max_prompt_len,
-        max_cache_len,
-    )
     @always_inline
-    def bench_fused(mut b: Bencher):
-        @parameter
+    def bench_fused(
+        mut b: Bencher,
+    ) {
+        var kv_blocks_fused_lt,
+        var cache_lengths_tensor,
+        var paged_lut_tensor,
+        var q_fused_tile,
+        var q_out_fused_tile,
+        var gamma_q_tile,
+        var gamma_k_tile,
+        var freqs_tile,
+        var row_offsets_tile,
+        var max_prompt_len,
+        var max_cache_len,
+        imm,
+    }:
         @always_inline
-        def kernel_launch(ctx: DeviceContext) raises:
+        def kernel_launch(ctx: DeviceContext) raises {imm}:
             var kv_fused = PagedKVCacheCollection[dtype, kv_params, page_size](
                 kv_blocks_fused_lt,
                 cache_lengths_tensor,
@@ -345,12 +343,22 @@ def bench_fused_qk_rms_norm_rope[
                 max_prompt_len,
                 max_cache_len,
             )
+            var q_src = q_fused_tile.as_immut()
+
+            @always_inline
+            @__parameter
+            @__copy_capture(q_src)
+            def q_input_fn[
+                width: Int, alignment: Int
+            ](token: Int, head: Int, col: Int) -> SIMD[dtype, width]:
+                return q_src.load[width=width](Coord(Index(token, head, col)))
+
             fused_qk_rms_norm_rope_ragged_paged[
                 target="gpu",
                 multiply_before_cast=True,
                 interleaved=False,
+                q_input_fn=q_input_fn,
             ](
-                q_fused_tile.as_immut(),
                 kv_fused,
                 gamma_q_tile.as_immut(),
                 gamma_k_tile.as_immut(),
@@ -363,14 +371,15 @@ def bench_fused_qk_rms_norm_rope[
                 ctx,
             )
 
-        b.iter_custom[kernel_launch](ctx)
+        bencher_iter_custom(b, kernel_launch, ctx)
 
-    m.bench_function[bench_fused](
+    m.bench_function(
+        bench_fused,
         BenchId(
             _bench_name[
                 dtype, head_dim, rope_dim, num_q_heads, num_kv_heads, "fused"
             ](batch_size, seq_len)
-        )
+        ),
     )
 
 

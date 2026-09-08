@@ -11,29 +11,52 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.collections import InlineArray
+"""Signal-based GPU synchronization primitives for multi-GPU collective kernels.
+
+Provides the `Signal` struct for counter-based cross-GPU thread-block
+synchronization, peer-to-peer memory access helpers, and the barrier utilities
+consumed by allreduce, scatter, and other collective operations.
+"""
+
+from std.collections import Array
 from std.utils import StaticTuple
 from std.math.uutils import umod
-from std.sys import size_of
+from std.sys import size_of, is_amd_gpu
 
 from std.atomic import Atomic, Ordering
-from std.gpu.host import DeviceBuffer, DeviceContext
-from std.gpu import (
-    barrier,
+from max.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu import (
     block_idx,
     grid_dim,
     thread_idx,
 )
-from std.gpu.sync import named_barrier
+from max.gpu.sync import barrier
+from max.gpu.sync import named_barrier
 from .lamport import LAMPORT_SENTINEL_U32, Lamport, LamportGeneration
 
 
 # No-op (currently) group operation functions (enables vendor_ccl drop in replacement)
 def group_start():
+    """Marks the start of a collective operation group.
+
+    Currently a no-op that exists as a drop-in placeholder for vendor CCL
+    (`ncclGroupStart` / `rcclGroupStart`). Wrapping a series of collective
+    calls between `group_start()` and `group_end()` allows a future
+    implementation to batch them as a single fused CCL operation without
+    changing call sites.
+    """
     return
 
 
 def group_end():
+    """Marks the end of a collective operation group.
+
+    Currently a no-op that exists as a drop-in placeholder for vendor CCL
+    (`ncclGroupEnd` / `rcclGroupEnd`). Wrapping a series of collective
+    calls between `group_start()` and `group_end()` allows a future
+    implementation to batch them as a single fused CCL operation without
+    changing call sites.
+    """
     return
 
 
@@ -89,6 +112,14 @@ def circular_add[n: Int](x: Int, y: Int) -> Int:
     Equivalent to (x + y) % n. When n is a power of 2, uses unsigned
     modulo which compiles to a single `and` instruction. Otherwise uses
     a conditional subtract to avoid expensive integer division on GPU.
+
+    Parameters:
+        n: The modulus. Must be positive. Both addends are assumed to
+            already lie in `[0, n)`.
+
+    Args:
+        x: The first addend, in `[0, n)`.
+        y: The second addend, in `[0, n)`.
     """
 
     comptime if n.is_power_of_two():
@@ -115,11 +146,17 @@ in-block thread index, not the global device rank. When subgroup collectives
 generation counters desync -- a subsequent full-world barrier then spins
 forever waiting for a generation a peer will never publish.
 
-Giving each collective scope its own counter bank makes the barrier histories
-disjoint so scopes can never poison each other. `MAX_GPUS` banks is the loosest
-sufficient bound: there can be at most one distinct device-group per GPU, so a
-`1 + group_start // group_size` scope mapping never exceeds this. The cost is
-negligible -- the counters are tiny next to the embedded Lamport region.
+Giving each collective domain its own counter bank makes the barrier histories
+disjoint so domains can never poison each other. `MAX_GPUS` banks is the loosest
+sufficient bound: there can be at most one distinct device-group per GPU.
+
+Callers map by group WIDTH (`0 if group_size == num_devices else group_size`),
+so DIFFERENT ops of the same width share a bank. Sharing is sound only while
+every rank in the domain issues the same barrier sequence: every collective must
+pair start with end (a start-only one lets a fast rank overwrite a shard its
+peers are still P2P-reading), and any conditional skip must be group-uniform.
+Sibling groups are safe regardless -- their `rank_sigs` are disjoint. The cost is
+negligible next to the embedded Lamport region.
 """
 
 
@@ -214,15 +251,15 @@ struct Signal:
     @always_inline
     def lamport_state_ptr(
         mut self,
-    ) -> UnsafePointer[Scalar[Self.flag_t], MutAnyOrigin]:
+    ) -> MutPointer[Scalar[Self.flag_t], MutAnyOrigin]:
         """Typed pointer to this `Signal`'s `lamport_state` block.
 
         Index it with the `Lamport.STATE_*` constants. The field is located by
-        its own address (`UnsafePointer(to=...)`), so there is no hand-computed
+        its own address (`Pointer(to=...)`), so there is no hand-computed
         byte offset to keep in sync with the field order.
         """
         return (
-            UnsafePointer(to=self.lamport_state)
+            Pointer(to=self.lamport_state)
             .bitcast[Scalar[Self.flag_t]]()
             .as_unsafe_any_origin()
         )
@@ -230,18 +267,24 @@ struct Signal:
     @always_inline
     def lamport_region_ptr[
         dtype: DType
-    ](mut self) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
+    ](mut self) -> MutPointer[Scalar[dtype], MutAnyOrigin]:
         """Typed pointer to the start of this `Signal`'s embedded Lamport region.
+
+        Parameters:
+            dtype: The element type to reinterpret the raw region bytes as.
+                The returned pointer is typed `Pointer[Scalar[dtype], ...]`
+                so callers can read and write Lamport message packs in this
+                dtype without an extra cast.
         """
         return (
-            UnsafePointer(to=self.lamport_region)
+            Pointer(to=self.lamport_region)
             .bitcast[Scalar[dtype]]()
             .as_unsafe_any_origin()
         )
 
 
 def _lamport_init(
-    signal_buffer: DeviceBuffer[DType.uint8], ctx: DeviceContext
+    signal_buffer: DeviceBuffer[.uint8], ctx: DeviceContext
 ) raises:
     """Sets a signal buffer's embedded Lamport region to the sentinel.
 
@@ -262,14 +305,14 @@ def _lamport_init(
         ctx: The device context for this rank's GPU.
     """
     comptime offset = (size_of[Signal]() - Signal._REGION_BYTES) // 4
-    var region = signal_buffer.create_sub_buffer[DType.uint32](
+    var region = signal_buffer.create_sub_buffer[.uint32](
         offset, Signal._REGION_BYTES // 4
     )
     ctx.enqueue_memset(region, LAMPORT_SENTINEL_U32)
 
 
 def init_signal_buffer(
-    signal_buffer: DeviceBuffer[DType.uint8], ctx: DeviceContext
+    signal_buffer: DeviceBuffer[.uint8], ctx: DeviceContext
 ) raises:
     """Initializes a freshly allocated signal buffer for any comm collective.
 
@@ -285,7 +328,7 @@ def init_signal_buffer(
             bytes).
         ctx: The device context for this rank's GPU.
     """
-    ctx.enqueue_memset[DType.uint8](signal_buffer, 0)
+    ctx.enqueue_memset[.uint8](signal_buffer, 0)
     _lamport_init(signal_buffer, ctx)
 
 
@@ -299,8 +342,8 @@ def _multi_gpu_barrier[
     named_barrier_id: Int = 1,
     domain_id: Int = 0,
 ](
-    rank_sigs: InlineArray[UnsafePointer[Signal, MutAnyOrigin], MAX_GPUS],
-    self_sg: UnsafePointer[Signal, MutAnyOrigin],
+    rank_sigs: Array[MutPointer[Signal, MutAnyOrigin], MAX_GPUS],
+    self_sg: MutPointer[Signal, MutAnyOrigin],
     my_rank: Int,
 ):
     """Implements a barrier synchronization across multiple GPUs to ensure all
@@ -421,13 +464,17 @@ def _multi_gpu_barrier[
 
         # Write the expected counter value to peer and wait for correct value from
         # peer.
-        comptime if need_fence:
+        # TODO(KERN-3443): Investigate why AMD GPUs require this to be a full fence
+        # instead of the lighter weight volatile loop used for nvidia GPUs.
+        comptime if need_fence or is_amd_gpu():
             # broadcast the value to all peers that I reached the barrier
-            Atomic[flag_t].store[ordering=Ordering.RELEASE](
+            Atomic[Scalar[flag_t]].store[ordering=Ordering.RELEASE](
                 peer_counter_ptr, val
             )
             while (
-                Atomic[flag_t].load[ordering=Ordering.ACQUIRE](self_counter_ptr)
+                Atomic[Scalar[flag_t]].load[ordering=Ordering.ACQUIRE](
+                    self_counter_ptr
+                )
                 != val
             ):
                 pass

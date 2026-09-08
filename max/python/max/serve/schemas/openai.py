@@ -78,6 +78,9 @@ from openai.types.completion_usage import (
     CompletionTokensDetails,
     PromptTokensDetails,
 )
+from openai.types.audio.speech_create_params import (
+    SpeechCreateParams as _OpenAISpeechParams,
+)
 from openai.types.embedding_create_params import (
     EmbeddingCreateParams as _OpenAIEmbeddingParams,
 )
@@ -358,9 +361,10 @@ class _MaxRequestExtensions(BaseModel):
         max_length=512,
         description=(
             "Per-request salt that isolates this prompt's prefix-cache "
-            "entries from other requests. Combined with the cluster-level "
-            "kv_cache_hash_seed via XOR. Requires kv_cache_hash_algo=sha256 "
-            "or sha256_64; ignored under ahash64 with a one-time warning."
+            "entries from other requests. Combined with "
+            "kv_cache_hash_seed via XOR. Works under any "
+            "kv_cache_hash_algo: a cryptographic guarantee under "
+            "sha256/sha256_64, best-effort under ahash64."
         ),
     )
 
@@ -383,6 +387,9 @@ _TextCompletionParamsBase = _model_from_typeddict(
 )
 _EmbeddingParamsBase = _model_from_typeddict(
     "_EmbeddingParamsBase", _OpenAIEmbeddingParams
+)
+_SpeechParamsBase = _model_from_typeddict(
+    "_SpeechParamsBase", _OpenAISpeechParams
 )
 
 
@@ -469,6 +476,53 @@ class CreateChatCompletionRequest(
             self.max_tokens = self.max_completion_tokens
         return self
 
+    @property
+    def resolved_chat_template_kwargs(self) -> dict[str, Any] | None:
+        """The kwargs to render the chat template with.
+
+        ``chat_template_kwargs`` is the only channel that reaches the Jinja
+        template, so OpenAI's top-level ``reasoning_effort`` and OpenRouter's
+        ``reasoning`` object are folded into it here (OpenRouter sends both).
+
+        The effort is taken from ``chat_template_kwargs`` first, then the
+        top-level field, then the ``reasoning`` object; whichever wins also
+        decides whether the model thinks at all, unless the client set the
+        toggle itself. Templates disagree on the name of that toggle, so both
+        ``enable_thinking`` and ``thinking`` are set.
+
+        Returns:
+            The chat-template kwargs, or ``None`` when the request carries
+            none at all.
+        """
+        kwargs = dict(self.chat_template_kwargs or {})
+        effort = (
+            kwargs.get("reasoning_effort")
+            or self.reasoning_effort
+            or (self.reasoning.effort if self.reasoning is not None else None)
+        )
+        if self.reasoning is None and effort is None:
+            return self.chat_template_kwargs
+
+        if self.reasoning is not None and self.reasoning.enabled is not None:
+            enable_thinking = self.reasoning.enabled
+        else:
+            # ``none`` is OpenAI's "don't reason" effort, and a bare
+            # ``reasoning`` object carrying neither field asks for no
+            # reasoning either.
+            enable_thinking = effort is not None and effort != "none"
+
+        # Client may set either spelling of the thinking toggle, here we merge
+        # both.
+        for key in ("enable_thinking", "thinking"):
+            if key in kwargs:
+                enable_thinking = bool(kwargs[key])
+                break
+        kwargs["enable_thinking"] = enable_thinking
+        kwargs["thinking"] = enable_thinking
+        if effort is not None:
+            kwargs["reasoning_effort"] = effort
+        return kwargs
+
 
 class CreateCompletionRequest(
     _MaxRequestExtensions,
@@ -486,6 +540,48 @@ class CreateEmbeddingRequest(_EmbeddingParamsBase):  # type: ignore[misc,valid-t
 
     model: str
     input: str | list[str] | list[int] | list[list[int]]
+
+
+class CreateSpeechRequest(_SpeechParamsBase):  # type: ignore[misc,valid-type]
+    """OpenAI speech request, extended for generative audio models.
+
+    ``input`` is the text the audio renders, which for a model that sings is
+    its lyrics, and ``instructions`` -- OpenAI's field for describing how the
+    audio should sound -- carries the style prompt such a model conditions on.
+
+    ``voice`` is required by OpenAI and has no meaning for a model with no
+    voice catalog, so it is optional here and ignored. The MAX extensions
+    below are the generation controls an audio model has and a text-to-speech
+    model does not; each one left unset keeps the model's own default.
+    """
+
+    model: str
+    input: str
+
+    voice: str | None = None
+
+    audio_duration: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Upper bound on the generated audio, in seconds.",
+    )
+    steps: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Denoising steps, for models whose audio comes from a diffusion "
+            "or flow-matching stage."
+        ),
+    )
+    guidance_scale: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Classifier-free guidance scale.",
+    )
+    seed: int | None = Field(
+        default=None,
+        description="Seed for the sampling and noise draws.",
+    )
 
 
 # ---------------------------------------------------------------------------

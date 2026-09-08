@@ -25,8 +25,8 @@ Flow:
   used at replay -- so capture and replay agree by construction.
 - Serving replays by bucketing the runtime cache length up to a recorded length
   and looking up the recorded ``GraphKey`` (a pure CPU lookup; no resolver
-  kernel op on the hot path). ``q_max_seq_len`` must equal
-  ``1 + num_speculative_tokens``; any other value raises ``RuntimeError``.
+  kernel op on the hot path). ``q_max_seq_len`` must be ``1 + w`` for one of the
+  captured verify widths ``w``; any other value raises ``RuntimeError``.
 """
 
 from __future__ import annotations
@@ -34,13 +34,14 @@ from __future__ import annotations
 import bisect
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import replace
 
 from max._core.driver import _release_buffers_to_borrowed
-from max.driver import Buffer
+from max.driver import Buffer, batch_inplace_copy
 from max.engine import Model
+from max.experimental.nn.module import CompiledModel
 from max.nn.kv_cache import BatchCharacteristics, KVCacheParamInterface
 from max.nn.kv_cache.utils import AttnKeyInterface, MultiAttnKey
 from max.profiler import traced
@@ -79,6 +80,7 @@ def _release_graph_capture_outputs_to_borrowed(
         "num_accepted_draft_tokens",
         "next_tokens",
         "next_draft_tokens",
+        "next_draft_probs_full",
     ):
         value = getattr(outputs, field_name, None)
         if isinstance(value, Buffer):
@@ -112,6 +114,8 @@ class ServeGraphCaptureRunner:
         max_cache_length_upper_bound: int,
         max_batch_size: int,
         num_speculative_tokens: int = 0,
+        verify_widths: Sequence[int] | None = None,
+        width_lookup: Sequence[int] | None = None,
     ) -> None:
         self._model = model
         self._warmup_model_inputs = warmup_model_inputs
@@ -133,8 +137,27 @@ class ServeGraphCaptureRunner:
         self._kv_params = kv_params
         self._is_spec_decode = num_speculative_tokens > 0
 
-        # The query (prompt) width every captured decode graph runs at.
-        self._q_max_seq_len = num_speculative_tokens + 1
+        widths = sorted(set(verify_widths or (num_speculative_tokens,)))
+        for width in widths:
+            if not 0 <= width <= num_speculative_tokens:
+                raise ValueError(
+                    f"Verify width {width} is outside [0, "
+                    f"{num_speculative_tokens}]: a step cannot verify more "
+                    "drafts than it carries."
+                )
+        self._verify_widths = widths
+        # ``batch_size -> verify width``. When set, only the width a batch size
+        # resolves to is reachable, so only that one is probed.
+        self._width_lookup = width_lookup
+        if width_lookup is not None:
+            for batch_size in range(1, self._max_batch_size + 1):
+                scheduled = width_lookup[min(batch_size, len(width_lookup) - 1)]
+                if scheduled not in widths:
+                    raise ValueError(
+                        f"Batch size {batch_size} resolves to verify width "
+                        f"{scheduled}, which is not among the captured widths "
+                        f"{widths}."
+                    )
         # Block drafts (DFlash) run at q=num_draft_tokens_per_step; autoregressive
         # drafts (eagle/mtp) run at q=1.
         self._draft_q_at_capture = kv_params.num_draft_tokens_per_step
@@ -158,10 +181,21 @@ class ServeGraphCaptureRunner:
         self.graph_entries.pop(key, None)
         self._model.release_captured_graph(_pack_model_graph_key(key))
 
+    def _probe_verify_widths(self, batch_size: int) -> list[int]:
+        """Returns the verify widths to capture for ``batch_size``.
+
+        Without a schedule any width is reachable at any batch size, so all of
+        them are probed. Here we pin one width per batch size.
+        """
+        if self._width_lookup is None:
+            return self._verify_widths
+        index = min(batch_size, len(self._width_lookup) - 1)
+        return [self._width_lookup[index]]
+
     def _resolve_graph_key(
-        self, batch_size: int, cache_length: int
+        self, batch_size: int, cache_length: int, q_max_seq_len: int
     ) -> AttnKeyInterface:
-        """Resolves the ``GraphKey`` for a ``(batch_size, cache_length)`` shape.
+        """Resolves the ``GraphKey`` for a ``(batch_size, q, cache_length)`` shape.
 
         Resolves the verify-width dispatch metadata tree and, under speculative
         decoding, the draft-width tree via the KV cache params, then folds them
@@ -171,7 +205,7 @@ class ServeGraphCaptureRunner:
         """
         children: dict[str, AttnKeyInterface] = {}
         children["verify"] = self._kv_params.resolve_attn_key(
-            batch_size, self._q_max_seq_len, cache_length
+            batch_size, q_max_seq_len, cache_length
         )
         if self._is_spec_decode:
             # Block drafts (DFlash) run the draft at q=num_draft_tokens_per_step;
@@ -188,29 +222,43 @@ class ServeGraphCaptureRunner:
         """Captures decode buckets before the worker becomes ready."""
         logger.info(
             "Pre-capturing overlap device graphs for decode batch sizes [1..%d] "
-            "with num_steps=1.",
+            "at verify widths %s with num_steps=1.",
             self._max_batch_size,
+            self._verify_widths,
         )
-        probe_lengths = self._kv_params.graph_capture_probe_cache_lengths(
-            self._max_cache_length_upper_bound, self._q_max_seq_len
-        )
+        probe_lengths: set[int] = set()
+        for width in self._verify_widths:
+            probe_lengths.update(
+                self._kv_params.graph_capture_probe_cache_lengths(
+                    self._max_cache_length_upper_bound, width + 1
+                )
+            )
         recorded_lengths: set[int] = set()
-        # Capture largest-first (largest batch, then largest cache length, which
-        # yields the most partitions) so peak allocations happen up front and
-        # oversized configs fail fast.
-        batch_sizes = range(self._max_batch_size, 0, -1)
-        for batch_size in tqdm(
-            batch_sizes, desc="Capturing device graph shapes"
+        # Capture largest-first so peak allocations
+        # happen up front and oversized configs fail fast.
+        probes = sorted(
+            (
+                (width, batch_size)
+                for batch_size in range(1, self._max_batch_size + 1)
+                for width in self._probe_verify_widths(batch_size)
+            ),
+            reverse=True,
+        )
+        for q_max_seq_len, batch_size in tqdm(
+            [(width + 1, batch_size) for width, batch_size in probes],
+            desc="Capturing device graph shapes",
         ):
             for cache_length in sorted(probe_lengths, reverse=True):
                 recorded_lengths.add(cache_length)
-                graph_key = self._resolve_graph_key(batch_size, cache_length)
+                graph_key = self._resolve_graph_key(
+                    batch_size, cache_length, q_max_seq_len
+                )
                 # Record every probed length so replay can bucket to any of
                 # them; many lengths share one captured graph.
                 self._records[
                     BatchCharacteristics(
                         batch_size=batch_size,
-                        max_prompt_length=self._q_max_seq_len,
+                        max_prompt_length=q_max_seq_len,
                         max_cache_valid_length=cache_length,
                     )
                 ] = graph_key
@@ -221,24 +269,42 @@ class ServeGraphCaptureRunner:
                 # used at replay (``runtime_inputs(batch_characteristics=...)``).
                 batch_characteristics = BatchCharacteristics(
                     batch_size=batch_size,
-                    max_prompt_length=self._q_max_seq_len,
+                    max_prompt_length=q_max_seq_len,
                     max_cache_valid_length=cache_length,
                 )
                 with self._warmup_model_inputs(
                     batch_size, batch_characteristics
                 ) as model_inputs:
                     input_buffers = model_inputs.buffers
-                    output_buffers = self._model.capture(
-                        _pack_model_graph_key(graph_key), *input_buffers
-                    )
-                    if not self._is_spec_decode:
-                        outputs: ModelOutputs = ModelOutputs(*output_buffers)
+                    if isinstance(self._model, CompiledModel):
+                        output_buffers = self._model.engine_model.capture(
+                            _pack_model_graph_key(graph_key),
+                            *input_buffers,
+                            *self._model.signal_buffers,
+                        )
                     else:
-                        assert len(output_buffers) == 3, "Expected 3 outputs"
+                        output_buffers = self._model.capture(
+                            _pack_model_graph_key(graph_key), *input_buffers
+                        )
+                    if not self._is_spec_decode:
+                        outputs = ModelOutputs(*output_buffers)
+                    else:
+                        if len(output_buffers) not in (3, 4):
+                            raise RuntimeError(
+                                "spec-decode graph capture returned "
+                                f"{len(output_buffers)} outputs; expected 3 "
+                                "(num_accepted_draft_tokens, next_tokens, "
+                                "next_draft_tokens) or 4 (+ "
+                                "next_draft_probs_full, under "
+                                "draft_proposal='sampled')."
+                            )
                         outputs = UnifiedEagleOutputs(
                             num_accepted_draft_tokens=output_buffers[0],
                             next_tokens=output_buffers[1],
                             next_draft_tokens=output_buffers[2],
+                            next_draft_probs_full=output_buffers[3]
+                            if len(output_buffers) == 4
+                            else None,
                         )
                     # Graph-capture warmup keeps many output handles alive. Drop
                     # Python-side ownership so later captures can reuse the same
@@ -249,6 +315,14 @@ class ServeGraphCaptureRunner:
                     self.graph_entries[graph_key] = (input_buffers, outputs)
 
         self._recorded_cache_lengths = sorted(recorded_lengths)
+        logger.info(
+            "Captured %d distinct device graphs from %d probe records at "
+            "verify widths %s (%d recorded cache lengths).",
+            len(self.graph_entries),
+            len(self._records),
+            self._verify_widths,
+            len(self._recorded_cache_lengths),
+        )
 
         if hasattr(self._model, "_await_device_graphs"):
             logger.info(
@@ -308,14 +382,15 @@ class ServeGraphCaptureRunner:
             The aligned characteristics.
 
         Raises:
-            RuntimeError: If ``q_max_seq_len`` differs from the captured value
+            RuntimeError: If ``q_max_seq_len`` matches no captured verify width
                 or the cache length exceeds the largest captured length.
         """
-        if characteristics.max_prompt_length != self._q_max_seq_len:
+        verify_width = characteristics.max_prompt_length - 1
+        if verify_width not in self._verify_widths:
             raise RuntimeError(
-                f"q_max_seq_len={characteristics.max_prompt_length} != "
-                f"{self._q_max_seq_len}; only q_max_seq_len="
-                f"{self._q_max_seq_len} graphs are captured."
+                f"q_max_seq_len={characteristics.max_prompt_length} implies "
+                f"verify width {verify_width}, which is not captured; "
+                f"captured widths are {self._verify_widths}."
             )
         aligned = replace(
             characteristics,
@@ -352,10 +427,27 @@ class ServeGraphCaptureRunner:
         packed_model_graph_key = _pack_model_graph_key(replay_graph_key)
         captured_inputs, outputs = self.graph_entries[replay_graph_key]
 
+        # Refresh captured inputs. Host-resident destinations copy inline; the
+        # rest go into one batched call, which the driver splits into one
+        # submit per destination device (cuMemcpyBatchAsync on CUDA 12.8+,
+        # sequential fallback otherwise).
+        dsts: list[Buffer] = []
+        srcs: list[Buffer] = []
         for src_value, dst_value in zip(
             input_buffers, captured_inputs, strict=True
         ):
-            dst_value.inplace_copy_from(src_value)
+            if dst_value.device.is_host:
+                dst_value.inplace_copy_from(src_value)
+                continue
+            assert src_value.device == dst_value.device, (
+                "Graph-capture replay refresh must be a same-device copy "
+                "(single-stream ordering is the correctness premise); "
+                f"got src {src_value.device} -> dst {dst_value.device}."
+            )
+            dsts.append(dst_value)
+            srcs.append(src_value)
+
+        batch_inplace_copy(dsts, srcs)
 
         if debug_verify_replay:
             verify_inputs = debug_verify_model_inputs or model_inputs
@@ -364,5 +456,12 @@ class ServeGraphCaptureRunner:
                 *verify_inputs.buffers,
             )
 
-        self._model.replay(packed_model_graph_key, *captured_inputs)
+        if isinstance(self._model, CompiledModel):
+            self._model.engine_model.replay(
+                packed_model_graph_key,
+                *captured_inputs,
+                *self._model.signal_buffers,
+            )
+        else:
+            self._model.replay(packed_model_graph_key, *captured_inputs)
         return outputs

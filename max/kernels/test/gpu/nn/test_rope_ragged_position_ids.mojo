@@ -24,7 +24,7 @@ reference (and differs from the input -- the identity-collapse signature).
 
 from std.math import cos, sin
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from layout import Coord, TileTensor, row_major
 from nn.rope import rope_ragged
 from std.testing import assert_almost_equal, assert_true
@@ -51,9 +51,9 @@ def test_rope_ragged_position_ids[
     var freqs_dev = ctx.enqueue_create_buffer[dtype](
         freqs_layout.static_product
     )
-    var ro_dev = ctx.enqueue_create_buffer[DType.uint32](2)
-    var sp_dev = ctx.enqueue_create_buffer[DType.uint32](1)
-    var pid_dev = ctx.enqueue_create_buffer[DType.uint32](seq_len)
+    var ro_dev = ctx.enqueue_create_buffer[.uint32](2)
+    var sp_dev = ctx.enqueue_create_buffer[.uint32](1)
+    var pid_dev = ctx.enqueue_create_buffer[.uint32](seq_len)
 
     # x[token, head, dim] = deterministic small values.
     with x_dev.map_to_host() as h:
@@ -92,7 +92,7 @@ def test_rope_ragged_position_ids[
     # `output_fn`.
     @always_inline
     def output_fn[
-        width: SIMDSize, alignment: Int
+        width: SIMDLength, alignment: Int
     ](idx: IndexList[3], val: SIMD[dtype, width]) {var out_t} -> None:
         out_t.store[width=width](Coord(idx), val)
 
@@ -146,5 +146,5 @@ def test_rope_ragged_position_ids[
 
 def main() raises:
     with DeviceContext() as ctx:
-        test_rope_ragged_position_ids[DType.float32](ctx)
+        test_rope_ragged_position_ids[.float32](ctx)
         print("test_rope_ragged_position_ids: PASS")

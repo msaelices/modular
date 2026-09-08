@@ -42,12 +42,13 @@ chunk-inner ordering observable. B200-only (SM100), single CTA.
 
 from std.sys import size_of, has_nvidia_gpu_accelerator
 
-from std.gpu import WARP_SIZE, barrier, thread_idx, warp_id as get_warp_id
-from std.gpu.host import DeviceBuffer, DeviceContext, FuncAttribute
-from std.gpu.memory import AddressSpace, external_memory
-from std.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
-from std.gpu.compute.arch.mma_nvidia_sm100 import mma_arrive
-from std.gpu.compute.arch.tcgen05 import (
+from max.gpu import WARP_SIZE, thread_idx, warp_id as get_warp_id
+from max.gpu.sync import barrier
+from max.gpu.host import DeviceBuffer, DeviceContext, FuncAttribute
+from max.gpu.memory import external_memory
+from max.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
+from max.gpu.compute.arch.mma_nvidia_sm100 import mma_arrive
+from max.gpu.compute.arch.tcgen05 import (
     tcgen05_alloc,
     tcgen05_dealloc,
     tcgen05_fence_after,
@@ -72,7 +73,7 @@ from nn.attention.gpu.nvidia.sm100.attention_utils import (
     elect,
 )
 
-from std.gpu.compute.arch.mma_nvidia_sm100 import UMMAKind
+from max.gpu.compute.arch.mma_nvidia_sm100 import UMMAKind
 from std.testing import assert_almost_equal
 from std.utils.index import Index, IndexList
 from std.utils.numerics import get_accum_type
@@ -99,8 +100,8 @@ def cpu_qk_naive(
             var acc: Float32 = 0.0
             for d in range(D):
                 acc += (
-                    Q.ptr.load(m * D + d).cast[DType.float32]()
-                    * K.ptr.load(n * D + d).cast[DType.float32]()
+                    Q.ptr.load(m * D + d).cast[.float32]()
+                    * K.ptr.load(n * D + d).cast[.float32]()
                 )
             O.ptr.store(m * N + n, acc.cast[O.dtype]())
 
@@ -140,16 +141,14 @@ def qk_consumer_kernel[
         ab_type, BN, BK, swizzle_mode=swizzle_mode, page_dense=use_pagedense
     ]()
 
-    q_smem = rebind[
-        UnsafePointer[
-            Scalar[ab_type],
-            address_space=AddressSpace.SHARED,
-            UntrackedOrigin[mut=True],
+    var q_smem = rebind[
+        MutPointer[
+            Scalar[ab_type], address_space=.SHARED, UntrackedOrigin[mut=True]
         ]
     ](
         external_memory[
             Scalar[ab_type],
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
             alignment=128,
             name="qk_consumer_dynamic_smem",
         ]()
@@ -158,14 +157,14 @@ def qk_consumer_kernel[
         ab_type,
         q_smem_layout,
         MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
         alignment=128,
     ]
     comptime k_smem_tile_t = LayoutTensor[
         ab_type,
         k_smem_layout,
         MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
         alignment=128,
     ]
 
@@ -181,8 +180,8 @@ def qk_consumer_kernel[
     comptime q_expected_bytes = q_size * size_of[ab_type]()
     comptime k_expected_bytes = k_size * size_of[ab_type]()
 
-    tma_mbar = (ptr_tmem_addr + 2).bitcast[SharedMemBarrier]()
-    mma_mbar = tma_mbar + 1
+    var tma_mbar = (ptr_tmem_addr + 2).bitcast[SharedMemBarrier]()
+    var mma_mbar = tma_mbar + 1
 
     var tid = thread_idx.x
     var wid = get_warp_id()
@@ -316,7 +315,7 @@ def run_qk_consumer[
     arange(k.tensor[update=False](), start=0.0, step=0.001)
 
     # A=Q k-major tile (M,K), default (chunk-outer) box.
-    q_tma_op = create_tensor_tile[Index(M, K), swizzle_mode=swizzle_mode](
+    var q_tma_op = create_tensor_tile[Index(M, K), swizzle_mode=swizzle_mode](
         ctx, q.device_tensor()
     )
     comptime smem_use = (M + N) * size_of[ab_type]() * K + 64
@@ -332,7 +331,7 @@ def run_qk_consumer[
             DeviceBuffer(
                 ctx,
                 k_dev.ptr.unsafe_mut_cast[True]().address_space_cast[
-                    AddressSpace.GENERIC
+                    .GENERIC
                 ](),
                 1,
                 owning=False,

@@ -14,7 +14,7 @@
 from std.sys import has_nvidia_gpu_accelerator
 
 from std.benchmark import Bench
-from std.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu.host import DeviceBuffer, DeviceContext
 from layout import Layout, LayoutTensor, RuntimeLayout
 from layout._fillers import random
 from matmul_kernels import (
@@ -121,7 +121,7 @@ struct test_matmul[
         ](
             m: Int,
             n: Int,
-            ptr: UnsafePointer[Scalar[Self.dtype], _],
+            ptr: Pointer[Scalar[Self.dtype], _],
             out result: LayoutTensor[Self.dtype, layout, ptr.origin],
         ):
             var dynamic_layout = type_of(result.runtime_layout)(

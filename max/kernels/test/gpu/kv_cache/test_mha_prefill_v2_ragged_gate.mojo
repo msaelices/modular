@@ -37,7 +37,7 @@ An independent gpu_naive-based correctness check is a follow-up.
 from std.math import ceildiv, rsqrt
 from std.random import seed
 from layout._utils import ManagedLayoutTensor
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from kv_cache.types import (
     ContinuousBatchingKVCacheCollection,
     KVCacheStaticParams,
@@ -50,7 +50,7 @@ from kv_cache_test_utils import (
 )
 from layout import Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE
 from layout._fillers import random
-from std.memory import unsafe_memcpy, memset_zero
+from std.memory import unsafe_memcpy, unsafe_memset_zero
 from nn.attention.gpu.mha import flash_attention
 from nn.attention.mha_mask import (
     CausalMask,
@@ -156,11 +156,11 @@ def _run_ragged_at[
         lookup_table_layout
     ].row_major(cache_lengths_shape)
 
-    var input_row_offsets = ManagedLayoutTensor[
-        DType.uint32, row_offsets_layout
-    ](row_offsets_runtime_layout, ctx)
+    var input_row_offsets = ManagedLayoutTensor[.uint32, row_offsets_layout](
+        row_offsets_runtime_layout, ctx
+    )
     var cache_lengths_managed = ManagedLayoutTensor[
-        DType.uint32, cache_lengths_layout
+        .uint32, cache_lengths_layout
     ](cache_lengths_runtime_layout, ctx)
     var q_ragged = ManagedLayoutTensor[dtype, q_ragged_layout](
         q_ragged_runtime_layout, ctx
@@ -227,10 +227,10 @@ def _run_ragged_at[
     var kv_block_paged = ManagedLayoutTensor[dtype, kv_block_6d_layout](
         kv_block_paged_runtime_layout, ctx
     )
-    var lookup_table = ManagedLayoutTensor[DType.uint32, lookup_table_layout](
+    var lookup_table = ManagedLayoutTensor[.uint32, lookup_table_layout](
         lookup_table_runtime_layout, ctx
     )
-    var paged_lut = ManagedLayoutTensor[DType.uint32, paged_lut_layout](
+    var paged_lut = ManagedLayoutTensor[.uint32, paged_lut_layout](
         paged_lut_runtime_layout, ctx
     )
 
@@ -252,7 +252,7 @@ def _run_ragged_at[
     var cache_lengths_lt = cache_lengths_managed.device_tensor()
     var lookup_table_lt = lookup_table.device_tensor()
 
-    kv_collection_continuous_device = ContinuousBatchingKVCacheCollection[
+    var kv_collection_continuous_device = ContinuousBatchingKVCacheCollection[
         dtype, kv_params
     ](
         kv_block_continuous_lt,
@@ -278,14 +278,14 @@ def _run_ragged_at[
 
     var page_pos = 0
     for bs in range(batch_size):
-        seq_len = cache_lengths[bs] + valid_lengths[bs]
-        continuous_idx = Int(lookup_table_host[bs])
+        var seq_len = cache_lengths[bs] + valid_lengths[bs]
+        var continuous_idx = Int(lookup_table_host[bs])
 
         for block_idx in range(0, ceildiv(seq_len, page_size)):
             var randval = paged_blocks[page_pos]
             page_pos += 1
             paged_lut_tensor[bs, block_idx] = UInt32(randval)
-            block_sz = min(page_size, seq_len - block_idx * page_size)
+            var block_sz = min(page_size, seq_len - block_idx * page_size)
 
             for kv_idx in range(2):
                 var paged_offset = (
@@ -333,7 +333,7 @@ def _run_ragged_at[
                     count=n_cpy,
                 )
                 if block_sz < page_size:
-                    memset_zero(
+                    unsafe_memset_zero(
                         kv_block_paged_tensor.ptr + paged_offset + n_cpy,
                         (page_size - block_sz)
                         * kv_params.num_heads
@@ -343,7 +343,7 @@ def _run_ragged_at[
     var kv_block_paged_lt = kv_block_paged.device_tensor()
     var paged_lut_lt = paged_lut.device_tensor()
 
-    kv_collection_paged_device = PagedKVCacheCollection[
+    var kv_collection_paged_device = PagedKVCacheCollection[
         dtype, kv_params, page_size
     ](
         kv_block_paged_lt,
@@ -376,7 +376,7 @@ def _run_ragged_at[
     # `kv_cache_ragged.mojo:3492-3501`).
     var input_row_offsets_dt = input_row_offsets.device_tensor()
     var kv_input_row_offsets_view = LayoutTensor[
-        DType.uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
+        .uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
     ](
         input_row_offsets_dt.ptr,
         RuntimeLayout[Layout.row_major(UNKNOWN_VALUE)].row_major(
@@ -488,10 +488,10 @@ def _run_ragged_at[
 
     var ref_out = ref_output.tensor()
     var test_out = test_output.tensor()
-    input_row_offsets_tensor = input_row_offsets.tensor()
+    var input_row_offsets_tensor = input_row_offsets.tensor()
     for bs in range(batch_size):
-        prompt_len = valid_lengths[bs]
-        ragged_offset = Int(input_row_offsets_tensor[bs])
+        var prompt_len = valid_lengths[bs]
+        var ragged_offset = Int(input_row_offsets_tensor[bs])
         for s in range(prompt_len):
             for h in range(num_q_heads):
                 for hd in range(kv_params.head_size):

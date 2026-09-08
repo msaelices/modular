@@ -19,7 +19,9 @@ from typing import Any, cast
 
 _logger = logging.getLogger("max.pipelines")
 
+from max.pipelines.audio.pipeline import AudioGenerationPipeline
 from max.pipelines.context import (
+    AudioContext,
     BaseContextType,
     PixelContext,
     TextContext,
@@ -31,10 +33,12 @@ from max.pipelines.diffusion.pipeline import (
 )
 from max.pipelines.lib import (
     EmbeddingsPipelineType,
+    MemoryPlan,
     PipelineConfig,
     TextGenerationPipeline,
 )
 from max.pipelines.modeling.types import (
+    AudioGenerationInputs,
     EmbeddingsContext,
     EmbeddingsGenerationOutput,
     Pipeline,
@@ -74,6 +78,7 @@ def load_scheduler(
     pipeline_config: PipelineConfig,
     settings: Settings,
     worker_queues: WorkerQueues[BaseContextType, PipelineOutputType],
+    memory_plan: MemoryPlan | None,
 ) -> Scheduler:
     request_queue = worker_queues.request_queue
     response_queue = worker_queues.response_queue
@@ -97,6 +102,31 @@ def load_scheduler(
             batch_constructor=batch_constructor,
             request_queue=cast(
                 MAXPullQueue[PixelContext],
+                request_queue,
+            ),
+            response_queue=cast(
+                MAXPushQueue[
+                    dict[RequestID, SchedulerResult[GenerationOutput]]
+                ],
+                response_queue,
+            ),
+            cancel_queue=cancel_queue,
+        )
+    elif pipeline.__class__.__name__ == "AudioGenerationPipeline":
+        audio_pipeline = cast(AudioGenerationPipeline[Any], pipeline)
+
+        def audio_batch_constructor(
+            context: AudioContext,
+        ) -> AudioGenerationInputs[Any]:
+            return AudioGenerationInputs(batch={context.request_id: context})
+
+        return OneShotScheduler[
+            AudioContext, AudioGenerationInputs[Any], GenerationOutput
+        ](
+            pipeline=audio_pipeline,
+            batch_constructor=audio_batch_constructor,
+            request_queue=cast(
+                MAXPullQueue[AudioContext],
                 request_queue,
             ),
             response_queue=cast(
@@ -140,6 +170,8 @@ def load_scheduler(
                 response_queue,
             ),
             cancel_queue=cancel_queue,
+            memory_plan=memory_plan,
+            max_pending_requests=settings.max_pending_requests,
         )
     elif pipeline_config.runtime.pipeline_role == "decode_only":
         text_pipeline = cast(TextGenerationPipeline[TextContext], pipeline)
@@ -155,10 +187,13 @@ def load_scheduler(
             ),
             cancel_queue=cancel_queue,
             settings=settings,
+            memory_plan=memory_plan,
         )
     elif pipeline_config.runtime.pipeline_role == "prefill_only":
         text_pipeline = cast(TextGenerationPipeline[TextContext], pipeline)
-        return load_prefill_scheduler(text_pipeline, pipeline_config, settings)
+        return load_prefill_scheduler(
+            text_pipeline, pipeline_config, settings, memory_plan
+        )
     else:
         raise ValueError(
             f"No scheduler support for pipeline_role ({pipeline_config.runtime.pipeline_role})."

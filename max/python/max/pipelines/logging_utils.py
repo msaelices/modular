@@ -24,10 +24,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from max.pipelines.lib import MemoryPlan
 from max.pipelines.lib.config.model_config import _format_config_entries
 from max.pipelines.lib.registry import PIPELINE_REGISTRY, get_pipeline_for_task
 from max.pipelines.modeling.types.task import PipelineTask
-from max.support.human_readable_formatter import to_human_readable_bytes
 
 if TYPE_CHECKING:
     from max.pipelines.lib.config.config import PipelineConfig
@@ -37,11 +37,14 @@ __all__ = ["log_basic_config", "log_pipeline_info"]
 _logger = logging.getLogger("max.pipelines")
 
 
-def log_pipeline_info(pipeline_config: PipelineConfig) -> None:
+def log_pipeline_info(
+    pipeline_config: PipelineConfig, *, memory_plan: MemoryPlan
+) -> None:
     """Logs comprehensive pipeline and KVCache configuration information.
 
     Args:
         pipeline_config: The resolved pipeline configuration to log.
+        memory_plan: The memory plan the pipeline was sized against.
 
     Raises:
         ValueError: If no architecture is found for the model. This should not
@@ -75,9 +78,7 @@ def log_pipeline_info(pipeline_config: PipelineConfig) -> None:
     pipeline_config.models.log_model_info()
     pipeline_entries: list[tuple[str, Any]] = []
     if "main" in pipeline_config.models:
-        pipeline_entries.append(
-            ("max_seq_len", pipeline_config.model.max_length)
-        )
+        pipeline_entries.append(("max_seq_len", memory_plan.planned_max_length))
     pipeline_entries.extend(
         [
             ("chunked_prefill", pipeline_config.runtime.enable_chunked_prefill),
@@ -105,24 +106,9 @@ def log_pipeline_info(pipeline_config: PipelineConfig) -> None:
         cache_entries: list[tuple[str, Any]] = [
             ("first_block_caching", cache.first_block_caching),
             ("taylorseer", cache.taylorseer),
-            (
-                "taylorseer_cache_interval",
-                cache.taylorseer_cache_interval
-                if cache.taylorseer_cache_interval is not None
-                else "model-default",
-            ),
-            (
-                "taylorseer_warmup_steps",
-                cache.taylorseer_warmup_steps
-                if cache.taylorseer_warmup_steps is not None
-                else "model-default",
-            ),
-            (
-                "taylorseer_max_order",
-                cache.taylorseer_max_order
-                if cache.taylorseer_max_order is not None
-                else "model-default",
-            ),
+            ("taylorseer_cache_interval", cache.taylorseer_cache_interval),
+            ("taylorseer_warmup_steps", cache.taylorseer_warmup_steps),
+            ("taylorseer_max_order", cache.taylorseer_max_order),
         ]
 
         _logger.info("Denoising Cache")
@@ -132,7 +118,9 @@ def log_pipeline_info(pipeline_config: PipelineConfig) -> None:
         _logger.info("")
 
 
-def log_basic_config(pipeline_config: PipelineConfig) -> None:
+def log_basic_config(
+    pipeline_config: PipelineConfig, *, memory_plan: MemoryPlan
+) -> None:
     """Logs minimal pipeline configuration information.
 
     Logs basic pipeline options including model name, pipeline task,
@@ -140,6 +128,7 @@ def log_basic_config(pipeline_config: PipelineConfig) -> None:
 
     Args:
         pipeline_config: The resolved pipeline configuration to log.
+        memory_plan: The memory plan the pipeline was sized against.
 
     Raises:
         ValueError: If no architecture is found for the model. This should not
@@ -164,59 +153,57 @@ def log_basic_config(pipeline_config: PipelineConfig) -> None:
     task = arch.task
     pipeline_class = get_pipeline_for_task(task, pipeline_config)
 
-    kv_cache_tasks = {PipelineTask.TEXT_GENERATION}
-
-    memory_str = None
-    if "main" in pipeline_config.models and task in kv_cache_tasks:
-        kv_config = pipeline_config.model.kv_cache
-        if kv_config._available_cache_memory is not None:
-            memory_str = to_human_readable_bytes(
-                kv_config._available_cache_memory
-            )
-
+    # TODO(MXF-517): Redesign this logger to report all useful resolved values
+    # (max_batch_size, cache_memory, ...) together in one place. Some now log
+    # elsewhere (the memory planner logs cache_memory) because those values are
+    # no longer mutated onto the config for this logger to read.
     config_entries: list[tuple[str, Any]] = [
         ("architecture", arch.name),
         ("pipeline", pipeline_class.__name__),
     ]
     if "main" in pipeline_config.models:
-        devices_str = ", ".join(
-            f"{d.device_type}[{d.id}]"
-            for d in pipeline_config.model.device_specs
-        )
         config_entries.extend(
             [
                 ("model", pipeline_config.model.model_path),
-                ("devices", devices_str),
-                ("max_seq_len", pipeline_config.model.max_length),
+                ("max_seq_len", memory_plan.planned_max_length),
             ]
         )
 
-    if memory_str:
-        config_entries.append(("cache_memory", memory_str))
     config_entries.append(
         ("device_graph_capture", pipeline_config.runtime.device_graph_capture)
     )
 
+    if pipeline_config.runtime.experimental_device_graph_synthesis:
+        config_entries.append(("experimental_device_graph_synthesis", True))
+
     if pipeline_config.speculative is not None:
+        spec = pipeline_config.speculative
+        config_entries.append(("speculative_method", spec.speculative_method))
         config_entries.append(
-            (
-                "speculative_method",
-                pipeline_config.speculative.speculative_method,
-            )
+            ("num_speculative_tokens", spec.num_speculative_tokens)
+        )
+        config_entries.append(("draft_proposal", spec.draft_proposal))
+        # The two fields AcceptanceSampler dispatches on, so the acceptance
+        # rule a run used is attributable after the fact.
+        config_entries.append(
+            ("synthetic_acceptance_rate", spec.synthetic_acceptance_rate)
         )
         config_entries.append(
+            ("use_greedy_acceptance", spec.use_greedy_acceptance)
+        )
+        # Nothing reads rejection_sampling_strategy. Print the request and
+        # its inertness together, so an A/B over the flag is not credited to
+        # an acceptance-rule change that never happened.
+        config_entries.append(
             (
-                "num_speculative_tokens",
-                pipeline_config.speculative.num_speculative_tokens,
+                "rejection_sampling_strategy",
+                f"{spec.rejection_sampling_strategy or 'unset'} (inert:"
+                " the architecture's AcceptanceSampler decides)",
             )
         )
-        if pipeline_config.speculative.use_relaxed_acceptance_for_thinking:
-            config_entries.append(
-                ("relaxed_topk", pipeline_config.speculative.relaxed_topk)
-            )
-            config_entries.append(
-                ("relaxed_delta", pipeline_config.speculative.relaxed_delta)
-            )
+        if spec.use_relaxed_acceptance_for_thinking:
+            config_entries.append(("relaxed_topk", spec.relaxed_topk))
+            config_entries.append(("relaxed_delta", spec.relaxed_delta))
 
     _logger.info("")
     _logger.info("=" * 60)

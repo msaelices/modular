@@ -59,20 +59,20 @@ from std.math import sqrt
 from std.memory import bitcast
 from std.sys import size_of, has_nvidia_gpu_accelerator
 
-from std.gpu import (
+from max.gpu import (
     WARP_SIZE,
-    barrier,
     lane_id,
     thread_idx,
     warp_id as get_warp_id,
 )
-from std.gpu import block_idx
-from std.gpu.primitives.cluster import block_rank_in_cluster
-from std.gpu.host import DeviceBuffer, DeviceContext, FuncAttribute
-from std.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
-from std.gpu.memory import external_memory
-from std.gpu.compute.arch.mma_nvidia_sm100 import *
-from std.gpu.compute.arch.tcgen05 import *
+from max.gpu.sync import barrier
+from max.gpu import block_idx
+from max.gpu.primitives.cluster import block_rank_in_cluster
+from max.gpu.host import DeviceBuffer, DeviceContext, FuncAttribute
+from max.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
+from max.gpu.memory import external_memory
+from max.gpu.compute.arch.mma_nvidia_sm100 import *
+from max.gpu.compute.arch.tcgen05 import *
 
 from layout import IntTuple, Layout, LayoutTensor
 from layout._fillers import arange
@@ -188,8 +188,8 @@ def cpu_qk_naive(
             var acc: Float32 = 0.0
             for d in range(D):
                 acc += (
-                    Q.ptr.load(m * D + d).cast[DType.float32]()
-                    * K.ptr.load(n * D + d).cast[DType.float32]()
+                    Q.ptr.load(m * D + d).cast[.float32]()
+                    * K.ptr.load(n * D + d).cast[.float32]()
                 )
             O.ptr.store(m * N + n, acc.cast[O.dtype]())
 
@@ -217,8 +217,10 @@ def qk_mma_kernel[
         ab_type, k_tile_rank, k_tile_shape, k_desc_shape, is_k_major=True
     ],
     c: LayoutTensor[c_type, c_layout, MutAnyOrigin],
-    num_iters: Int,
+    num_iters_dev: Int32,
 ):
+    # `Int` is not device-passable; widen the fixed-width arg.
+    var num_iters = Int(num_iters_dev)
     comptime BM = block_tile_shape[0]
     comptime BN = block_tile_shape[1]
     comptime BK = block_tile_shape[2]
@@ -239,16 +241,14 @@ def qk_mma_kernel[
         ab_type, BN, BK, swizzle_mode=swizzle_mode
     ]()
 
-    q_smem = rebind[
-        UnsafePointer[
-            Scalar[ab_type],
-            address_space=AddressSpace.SHARED,
-            UntrackedOrigin[mut=True],
+    var q_smem = rebind[
+        MutPointer[
+            Scalar[ab_type], address_space=.SHARED, UntrackedOrigin[mut=True]
         ]
     ](
         external_memory[
             Scalar[ab_type],
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
             alignment=128,
             name="qk_spike_dynamic_smem",
         ]()
@@ -257,14 +257,14 @@ def qk_mma_kernel[
         ab_type,
         q_smem_layout,
         MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
         alignment=128,
     ]
     comptime k_smem_tile_t = LayoutTensor[
         ab_type,
         k_smem_layout,
         MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
         alignment=128,
     ]
 
@@ -281,14 +281,14 @@ def qk_mma_kernel[
 
     comptime accum_type = get_accum_type[ab_type]()
     comptime c_frag_size = MMA_M * MMA_N // num_threads
-    var c_frag: InlineArray[Scalar[accum_type], c_frag_size]
+    var c_frag: Array[Scalar[accum_type], c_frag_size]
 
     comptime q_expected_bytes = q_size * size_of[ab_type]()
     comptime k_expected_bytes = k_size * size_of[ab_type]()
     comptime expected_bytes = q_expected_bytes + k_expected_bytes
 
-    tma_mbar = (ptr_tmem_addr + 2).bitcast[SharedMemBarrier]()
-    mma_mbar = tma_mbar + 1
+    var tma_mbar = (ptr_tmem_addr + 2).bitcast[SharedMemBarrier]()
+    var mma_mbar = tma_mbar + 1
 
     if thread_idx.x == 0:
         tma_mbar[0].init()
@@ -306,7 +306,7 @@ def qk_mma_kernel[
 
     barrier()
 
-    tmem_addr = ptr_tmem_addr[0]
+    var tmem_addr = ptr_tmem_addr[0]
 
     # ---- MMA operand descriptors ------------------------------------------
     # A (Q) and B (K) are both k-major. SBO/LBO derived exactly as in
@@ -328,10 +328,14 @@ def qk_mma_kernel[
     comptime kSBO = k_s01 * size_of[ab_type]()
     comptime kLBO = k_s11 * size_of[ab_type]()
 
-    qdesc = MMASmemDescriptor.create[qSBO, qLBO, swizzle_mode](q_smem_tile.ptr)
-    kdesc = MMASmemDescriptor.create[kSBO, kLBO, swizzle_mode](k_smem_tile.ptr)
+    var qdesc = MMASmemDescriptor.create[qSBO, qLBO, swizzle_mode](
+        q_smem_tile.ptr
+    )
+    var kdesc = MMASmemDescriptor.create[kSBO, kLBO, swizzle_mode](
+        k_smem_tile.ptr
+    )
 
-    idesc = UMMAInsDescriptor[UMMAKind.KIND_F16].create[
+    var idesc = UMMAInsDescriptor[UMMAKind.KIND_F16].create[
         accum_type,
         ab_type,
         ab_type,
@@ -394,14 +398,14 @@ def qk_mma_kernel[
     comptime num_warps = num_threads // WARP_SIZE
     var warp_id = get_warp_id()
 
-    ctile = c.tile[BM, BN](block_idx.y, block_idx.x)
+    var ctile = c.tile[BM, BN](block_idx.y, block_idx.x)
 
     comptime for m_mma in range(num_m_mmas):
         comptime for n_mma in range(num_n_mmas):
-            c_gmem_warp_tile = ctile.tile[MMA_M // num_warps, MMA_N](
+            var c_gmem_warp_tile = ctile.tile[MMA_M // num_warps, MMA_N](
                 4 * m_mma + warp_id, n_mma
             )
-            c_gmem_frag = c_gmem_warp_tile.vectorize[1, 2]().distribute[
+            var c_gmem_frag = c_gmem_warp_tile.vectorize[1, 2]().distribute[
                 Layout.row_major(8, 4)
             ](lane_id())
             comptime num_vecs_m = c_gmem_frag.layout.shape[0].value()
@@ -466,7 +470,7 @@ def run_qk_spike[
     arange(k.tensor[update=False](), start=0.0, step=0.001)
 
     # A=Q k-major tile (BM,BK), default box.
-    q_tma_op = create_tensor_tile[Index(BM, BK), swizzle_mode=swizzle_mode](
+    var q_tma_op = create_tensor_tile[Index(BM, BK), swizzle_mode=swizzle_mode](
         ctx, q.device_tensor()
     )
     comptime block_dim = 128
@@ -492,7 +496,7 @@ def run_qk_spike[
             DeviceBuffer(
                 ctx,
                 k_dev.ptr.unsafe_mut_cast[True]().address_space_cast[
-                    AddressSpace.GENERIC
+                    .GENERIC
                 ](),
                 1,
                 owning=False,
@@ -524,7 +528,7 @@ def run_qk_spike[
             q_tma_op,
             k_tma_op,
             o.device_tensor(),
-            K // BK,
+            Int32(K // BK),
             grid_dim=(N // BN, M // BM),
             block_dim=(block_dim),
             shared_mem_bytes=smem_use,
@@ -558,7 +562,7 @@ def run_qk_spike[
             q_tma_op,
             k_tma_op,
             o.device_tensor(),
-            K // BK,
+            Int32(K // BK),
             grid_dim=(N // BN, M // BM),
             block_dim=(block_dim),
             shared_mem_bytes=smem_use,
@@ -629,8 +633,8 @@ def _print_layouts[mn: Int, k: Int]():
     comptime base = tile_layout_k_major[
         DType.bfloat16, mn, k, swizzle_mode=sw
     ]()
-    comptime pdns = _tile_layout_k_major_pagedense[DType.bfloat16, mn, k, sw]()
-    comptime cinr = _tile_layout_k_major_chunkinner[DType.bfloat16, mn, k, sw]()
+    comptime pdns = _tile_layout_k_major_pagedense[.bfloat16, mn, k, sw]()
+    comptime cinr = _tile_layout_k_major_chunkinner[.bfloat16, mn, k, sw]()
     comptime base_can = tile_to_descriptor[
         DType.bfloat16, base, is_k_major=True
     ]()

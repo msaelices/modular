@@ -42,16 +42,17 @@ the `K % 16 == 0` interior takes a width-16 int8 K-repartition; the K-tail and
 tiles take the bounded path. See KB `kernels/apple-m5-int8-matmul`.
 """
 
-from std.gpu import WARP_SIZE, barrier, block_idx, thread_idx
-from std.gpu.compute.arch.mma_apple import _mma_apple_transposable
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace, build_edge_mask, gmem_edge_masked_load
+from max.gpu import WARP_SIZE, block_idx, thread_idx
+from max.gpu.sync import barrier
+from max.gpu.compute.arch.mma_apple import _mma_apple_transposable
+from max.gpu.host import DeviceContext
+from max.gpu.memory import build_edge_mask, gmem_edge_masked_load
 from std.collections import Optional
-from std.math import round
-from std.memory import stack_allocation
+from std.math import ceildiv, round
+from std.memory import unsafe_stack_allocation
 from std.utils import IndexList
 
-from layout import TileTensor
+from layout import TensorEngine, TileTensor
 from layout.coord import Coord
 from layout.tile_layout import TensorLayout, row_major
 
@@ -80,13 +81,17 @@ def _require_apple_m5(ctx: DeviceContext) raises:
 @fieldwise_init
 struct Int8DequantWriter[
     c_origin: MutOrigin,
-    s_origin: ImmutOrigin,
+    s_origin: ImmOrigin,
     //,
     c_type: DType,
     c_layout: TensorLayout,
     as_layout: TensorLayout,
     bs_layout: TensorLayout,
     bias_layout: TensorLayout,
+    c_engine: TensorEngine,
+    as_engine: TensorEngine,
+    bs_engine: TensorEngine,
+    bias_engine: TensorEngine,
     *,
     has_bias: Bool,
 ](ImplicitlyCopyable, Movable):
@@ -109,19 +114,49 @@ struct Int8DequantWriter[
     The `_apple_frag_layout` maps a lane's 8-element fragment to rows
     `{rb, rb+8}` x cols `{cb, cb+1, cb+2, cb+3}`: `frag[0:4]` = row `rb`,
     `frag[4:8]` = row `rb+8` (matching `MmaOpApple._store_fragment`).
+
+    Parameters:
+        c_origin: Mutable `MutOrigin` of the C output write view (inferred).
+        s_origin: Immutable `ImmOrigin` shared by the scale and bias read
+            views (inferred).
+        c_type: Output element type (`bf16` / `fp16` / `fp32`).
+        c_layout: `TensorLayout` of the C output `TileTensor`.
+        as_layout: `TensorLayout` of the per-row activation scale `TileTensor`.
+        bs_layout: `TensorLayout` of the per-column weight scale `TileTensor`.
+        bias_layout: `TensorLayout` of the per-column bias `TileTensor`.
+        c_engine: `TensorEngine` of the C output write view.
+        as_engine: `TensorEngine` of the per-row activation scale view.
+        bs_engine: `TensorEngine` of the per-column weight scale view.
+        bias_engine: `TensorEngine` of the per-column bias view.
+        has_bias: If `True`, add `bias[col]` to each output element after
+            dequant.
     """
 
-    var c: TileTensor[Self.c_type, Self.c_layout, Self.c_origin]
-    var a_scale: TileTensor[DType.float32, Self.as_layout, Self.s_origin]
-    var b_scale: TileTensor[DType.float32, Self.bs_layout, Self.s_origin]
-    var bias: TileTensor[Self.c_type, Self.bias_layout, Self.s_origin]
+    var c: TileTensor[
+        Self.c_type, Self.c_layout, Self.c_origin, Engine=Self.c_engine
+    ]
+    var a_scale: TileTensor[
+        .float32,
+        Self.as_layout,
+        Self.s_origin,
+        Engine=Self.as_engine,
+    ]
+    var b_scale: TileTensor[
+        .float32,
+        Self.bs_layout,
+        Self.s_origin,
+        Engine=Self.bs_engine,
+    ]
+    var bias: TileTensor[
+        Self.c_type, Self.bias_layout, Self.s_origin, Engine=Self.bias_engine
+    ]
     var M: Int
     var N: Int
 
     @always_inline
     def write_frag(
         self,
-        frag: SIMD[DType.int32, 8],
+        frag: SIMD[.int32, 8],
         tile_r0: Int,
         tile_c0: Int,
         rb: Int,
@@ -131,27 +166,44 @@ struct Int8DequantWriter[
 
         Bounds-guards rows `< M` and cols `< N` for the partial last tile;
         width-4 store when the 4 cols are in-bounds, scalar on the N-edge.
+
+        Args:
+            frag: This lane's 8 int32 accumulator elements from the 16x16
+                MMA fragment (`frag[0:4]` = row `rb`, `frag[4:8]` = row
+                `rb+8`).
+            tile_r0: Absolute row origin of the 16x16 accumulator tile in
+                the C output.
+            tile_c0: Absolute column origin of the 16x16 accumulator tile
+                in the C output.
+            rb: In-fragment row base offset for this lane; selects rows
+                `rb` and `rb+8` within the tile.
+            cb: In-fragment column base offset for this lane; selects the
+                4-column group `{cb, cb+1, cb+2, cb+3}` within the tile.
         """
         comptime for half in range(2):
             var r = tile_r0 + rb + half * 8
             if r < self.M:
-                var asc = self.a_scale[r]
+                var asc = self.a_scale.load[width=1](Coord(r))
                 var col0 = tile_c0 + cb
-                var fv = frag.slice[4, offset=half * 4]().cast[DType.float32]()
+                var fv = frag.slice[4, offset=half * 4]().cast[.float32]()
                 if col0 + 3 < self.N:
-                    var bs = (self.b_scale.ptr + col0).load[width=4]()
+                    var bs = self.b_scale.raw_load[width=4](col0)
                     var y4 = (fv * asc * bs).cast[Self.c_type]()
                     comptime if Self.has_bias:
-                        y4 = y4 + (self.bias.ptr + col0).load[width=4]()
+                        y4 = y4 + self.bias.raw_load[width=4](col0)
                     self.c.store[width=4](Coord(r, col0), y4)
                 else:
                     comptime for cc in range(4):
                         var col = col0 + cc
                         if col < self.N:
-                            var v = Float32(fv[cc]) * asc * self.b_scale[col]
+                            var v = (
+                                Float32(fv[cc])
+                                * asc
+                                * self.b_scale.load[width=1](Coord(col))
+                            )
                             var y = v.cast[Self.c_type]()
                             comptime if Self.has_bias:
-                                y = y + self.bias[col]
+                                y = y + self.bias.load[width=1](Coord(col))
                             self.c.store[width=1](
                                 Coord(r, col), SIMD[Self.c_type, 1](y)
                             )
@@ -159,7 +211,7 @@ struct Int8DequantWriter[
     @always_inline
     def write_frag_full(
         self,
-        frag: SIMD[DType.int32, 8],
+        frag: SIMD[.int32, 8],
         tile_r0: Int,
         tile_c0: Int,
         rb: Int,
@@ -173,18 +225,18 @@ struct Int8DequantWriter[
         """
         comptime for half in range(2):
             var r = tile_r0 + rb + half * 8
-            var asc = self.a_scale[r]
+            var asc = self.a_scale.load[width=1](Coord(r))
             var col0 = tile_c0 + cb
-            var fv = frag.slice[4, offset=half * 4]().cast[DType.float32]()
-            var bs = (self.b_scale.ptr + col0).load[width=4]()
+            var fv = frag.slice[4, offset=half * 4]().cast[.float32]()
+            var bs = self.b_scale.raw_load[width=4](col0)
             var y4 = (fv * asc * bs).cast[Self.c_type]()
             comptime if Self.has_bias:
-                y4 = y4 + (self.bias.ptr + col0).load[width=4]()
+                y4 = y4 + self.bias.raw_load[width=4](col0)
             self.c.store[width=4](Coord(r, col0), y4)
 
 
 struct AppleM5Int8MatMul[
-    c_type: DType = DType.bfloat16,
+    c_type: DType = .bfloat16,
     *,
     has_bias: Bool = False,
     BM: Int = 64,
@@ -273,12 +325,12 @@ struct AppleM5Int8MatMul[
     @staticmethod
     @always_inline
     def _load_frag_x4_int8(
-        strip: TileTensor[DType.int8, ...],
+        strip: TileTensor[.int8, ...],
         row_stride: Int32,
         base_row: Int32,
         rb: Int32,
         four_cb: Int32,
-    ) -> InlineArray[SIMD[DType.int8, 8], 4]:
+    ) -> Array[SIMD[.int8, 8], 4]:
         """Width-16 load of one 16-block's four K-block fragments from a 64-wide
         K strip. `row_stride`/`four_cb` (= `4*cb`) are hoisted by the caller so
         the per-block offset is one mul-add; the offset math is Int32 (offset from
@@ -291,9 +343,9 @@ struct AppleM5Int8MatMul[
         # (a misaligned address under align=16 is rounded down) -- see KB
         # kernels/apple-m5-int8-matmul.
         comptime align = 16
-        var lo16 = (strip.ptr + Int(lo_off)).load[width=16, alignment=align]()
-        var hi16 = (strip.ptr + Int(hi_off)).load[width=16, alignment=align]()
-        var out = InlineArray[SIMD[DType.int8, 8], 4](uninitialized=True)
+        var lo16 = strip.raw_load[width=16, alignment=align](Int(lo_off))
+        var hi16 = strip.raw_load[width=16, alignment=align](Int(hi_off))
+        var out = Array[SIMD[.int8, 8], 4](uninitialized=True)
         comptime for j in range(4):
             out[j] = lo16.slice[4, offset=4 * j]().join(
                 hi16.slice[4, offset=4 * j]()
@@ -304,8 +356,8 @@ struct AppleM5Int8MatMul[
     @always_inline
     def _mma_width16(
         mut accum: Self.Mma.AccumType,
-        a_strip: TileTensor[DType.int8, ...],
-        b_strip: TileTensor[DType.int8, ...],
+        a_strip: TileTensor[.int8, ...],
+        b_strip: TileTensor[.int8, ...],
         rb: Int,
         cb: Int,
     ):
@@ -321,10 +373,10 @@ struct AppleM5Int8MatMul[
         var rb32 = Int32(rb)
         var four_cb = Int32(4 * cb)
 
-        var a_all = InlineArray[SIMD[DType.int8, 8], Self.NUM_MMA_M * 4](
+        var a_all = Array[SIMD[.int8, 8], Self.NUM_MMA_M * 4](
             uninitialized=True
         )
-        var b_all = InlineArray[SIMD[DType.int8, 8], Self.NUM_MMA_N * 4](
+        var b_all = Array[SIMD[.int8, 8], Self.NUM_MMA_N * 4](
             uninitialized=True
         )
         comptime for mi in range(Self.NUM_MMA_M):
@@ -358,10 +410,10 @@ struct AppleM5Int8MatMul[
     @staticmethod
     @always_inline
     def _load_frag_x4_int8_abs(
-        t32: TileTensor[DType.int8, ...],
+        t32: TileTensor[.int8, ...],
         abs_row: Int,
         abs_k: Int,
-    ) -> InlineArray[SIMD[DType.int8, 8], 4]:
+    ) -> Array[SIMD[.int8, 8], 4]:
         """Int32-indexed `_load_frag_x4_int8`: `<16 x i8>` load via absolute
         `load_linear`. `align=16` keeps the vector load (needs `abs_k % 16 == 0`).
         """
@@ -372,7 +424,7 @@ struct AppleM5Int8MatMul[
         var hi16 = t32.load_linear[width=16, alignment=align](
             IndexList[2](abs_row + 8, abs_k)
         )
-        var out = InlineArray[SIMD[DType.int8, 8], 4](uninitialized=True)
+        var out = Array[SIMD[.int8, 8], 4](uninitialized=True)
         comptime for j in range(4):
             out[j] = lo16.slice[4, offset=4 * j]().join(
                 hi16.slice[4, offset=4 * j]()
@@ -383,8 +435,8 @@ struct AppleM5Int8MatMul[
     @always_inline
     def _mma_width16_abs(
         mut accum: Self.Mma.AccumType,
-        a32: TileTensor[DType.int8, ...],
-        b32: TileTensor[DType.int8, ...],
+        a32: TileTensor[.int8, ...],
+        b32: TileTensor[.int8, ...],
         sg_row: Int,
         sg_col: Int,
         ks: Int,
@@ -396,10 +448,10 @@ struct AppleM5Int8MatMul[
         var abs_k = ks * Self.BK + 4 * cb
         var a_base = sg_row * Self.SG_M + rb
         var b_base = sg_col * Self.SG_N + rb
-        var a_all = InlineArray[SIMD[DType.int8, 8], Self.NUM_MMA_M * 4](
+        var a_all = Array[SIMD[.int8, 8], Self.NUM_MMA_M * 4](
             uninitialized=True
         )
-        var b_all = InlineArray[SIMD[DType.int8, 8], Self.NUM_MMA_N * 4](
+        var b_all = Array[SIMD[.int8, 8], Self.NUM_MMA_N * 4](
             uninitialized=True
         )
         comptime for mi in range(Self.NUM_MMA_M):
@@ -435,13 +487,13 @@ struct AppleM5Int8MatMul[
     @staticmethod
     @always_inline
     def _masked_frag(
-        sub: TileTensor[DType.int8, ...],
+        sub: TileTensor[.int8, ...],
         row_stride: Int,
         rb: Int,
         cb: Int,
         valid_along_row: Int,
         kb_valid: Int,
-    ) -> SIMD[DType.int8, 8]:
+    ) -> SIMD[.int8, 8]:
         """One 16x16 fragment via two width-4 edge-masked loads (row-halves `rb`,
         `rb+8`). The K mask zeroes K-lanes past `kb_valid`; row/col validity folds
         in by forcing mask=0 when the row-half is OOB along the non-K axis (M for
@@ -461,8 +513,8 @@ struct AppleM5Int8MatMul[
     @always_inline
     def _mma_masked(
         mut accum: Self.Mma.AccumType,
-        a_strip: TileTensor[DType.int8, ...],
-        b_strip: TileTensor[DType.int8, ...],
+        a_strip: TileTensor[.int8, ...],
+        b_strip: TileTensor[.int8, ...],
         rb: Int,
         cb: Int,
         valid_rows: Int,
@@ -483,14 +535,18 @@ struct AppleM5Int8MatMul[
             var kb_valid = max(
                 0, min(Int(Self.MMA_K), k_valid - ki * Self.MMA_K)
             )
-            var b_frags = InlineArray[SIMD[DType.int8, 8], Self.NUM_MMA_N](
-                uninitialized=True
-            )
-            comptime for ni in range(Self.NUM_MMA_N):
-                var b_sub = b_strip.tile[16, 16](ni, ki)
-                b_frags[ni] = Self._masked_frag(
-                    b_sub, b_rs, rb, cb, valid_cols - ni * 16, kb_valid
+            var b_frags = Array[_, Self.NUM_MMA_N](
+                fill_with_unrolled=lambda [ni: Int]() -> SIMD[
+                    .int8, 8
+                ]: Self._masked_frag(
+                    b_strip.tile[16, 16](ni, ki),
+                    b_rs,
+                    rb,
+                    cb,
+                    valid_cols - ni * 16,
+                    kb_valid,
                 )
+            )
             comptime for mi in range(Self.NUM_MMA_M):
                 var a_sub = a_strip.tile[16, 16](mi, ki)
                 var a_frag = Self._masked_frag(
@@ -512,8 +568,8 @@ struct AppleM5Int8MatMul[
         bounded: Bool
     ](
         mut accum: Self.Mma.AccumType,
-        a: TileTensor[DType.int8, ...],
-        b: TileTensor[DType.int8, ...],
+        a: TileTensor[.int8, ...],
+        b: TileTensor[.int8, ...],
         mma_op: Self.Mma,
         sg_row: Int,
         sg_col: Int,
@@ -564,19 +620,21 @@ struct AppleM5Int8MatMul[
                     # int32-indexed A/B views; enqueue only dispatches here for
                     # shapes that fit i32, so no per-tile guard is needed.
                     var a32 = TileTensor[
-                        DType.int8,
+                        .int8,
                         type_of(a).LayoutType,
                         type_of(a).origin,
+                        Engine=type_of(a).Engine,
                         address_space=type_of(a).address_space,
-                        linear_idx_type=DType.int32,
-                    ](ptr=a.ptr, layout=a.layout)
+                        linear_idx_type=.int32,
+                    ](a._storage, a.layout)
                     var b32 = TileTensor[
-                        DType.int8,
+                        .int8,
                         type_of(b).LayoutType,
                         type_of(b).origin,
+                        Engine=type_of(b).Engine,
                         address_space=type_of(b).address_space,
-                        linear_idx_type=DType.int32,
-                    ](ptr=b.ptr, layout=b.layout)
+                        linear_idx_type=.int32,
+                    ](b._storage, b.layout)
                     for ks in range(n_full_strips):
                         Self._mma_width16_abs(
                             accum,
@@ -639,13 +697,25 @@ struct AppleM5Int8MatMul[
         as_layout: TensorLayout,
         bs_layout: TensorLayout,
         bias_layout: TensorLayout,
+        c_engine: TensorEngine,
+        a_engine: TensorEngine,
+        b_engine: TensorEngine,
+        as_engine: TensorEngine,
+        bs_engine: TensorEngine,
+        bias_engine: TensorEngine,
     ](
-        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin],
-        a: TileTensor[DType.int8, a_layout, ImmutAnyOrigin],
-        b: TileTensor[DType.int8, b_layout, ImmutAnyOrigin],
-        a_scale: TileTensor[DType.float32, as_layout, ImmutAnyOrigin],
-        b_scale: TileTensor[DType.float32, bs_layout, ImmutAnyOrigin],
-        bias: TileTensor[Self.c_type, bias_layout, ImmutAnyOrigin],
+        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Engine=c_engine],
+        a: TileTensor[.int8, a_layout, ImmutAnyOrigin, Engine=a_engine],
+        b: TileTensor[.int8, b_layout, ImmutAnyOrigin, Engine=b_engine],
+        a_scale: TileTensor[
+            .float32, as_layout, ImmutAnyOrigin, Engine=as_engine
+        ],
+        b_scale: TileTensor[
+            .float32, bs_layout, ImmutAnyOrigin, Engine=bs_engine
+        ],
+        bias: TileTensor[
+            Self.c_type, bias_layout, ImmutAnyOrigin, Engine=bias_engine
+        ],
         log2_grid_m: UInt32,
         log2_grid_n: UInt32,
     ):
@@ -653,6 +723,35 @@ struct AppleM5Int8MatMul[
         (`transpose_b`), `a_scale` `(M,)`, `b_scale` `(N,)`, `bias` `(N,)` (used
         iff `has_bias`). Grid is `(1<<log2_grid_m) * (1<<log2_grid_n)`
         threadgroups; OOB threadgroups early-return after Morton decode.
+
+        Parameters:
+            c_layout: `TensorLayout` of the C output `TileTensor`.
+            a_layout: `TensorLayout` of the int8 A `TileTensor`.
+            b_layout: `TensorLayout` of the int8 B `TileTensor`.
+            as_layout: `TensorLayout` of the per-row activation scale
+                `TileTensor`.
+            bs_layout: `TensorLayout` of the per-column weight scale
+                `TileTensor`.
+            bias_layout: `TensorLayout` of the per-column bias `TileTensor`.
+            c_engine: `TensorEngine` of `c`.
+            a_engine: `TensorEngine` of `a`.
+            b_engine: `TensorEngine` of `b`.
+            as_engine: `TensorEngine` of `a_scale`.
+            bs_engine: `TensorEngine` of `b_scale`.
+            bias_engine: `TensorEngine` of `bias`.
+
+        Args:
+            c: Output `TileTensor` of shape `(M, N)` in `c_type`.
+            a: Int8 activation `TileTensor` of shape `(M, K)`.
+            b: Int8 weight `TileTensor` of shape `(N, K)` (used transposed).
+            a_scale: Per-row fp32 activation scale, shape `(M,)`.
+            b_scale: Per-column fp32 weight scale, shape `(N,)`.
+            bias: Per-column bias in `c_type`, shape `(N,)` (used iff
+                `has_bias`).
+            log2_grid_m: Base-2 log of the power-of-two-padded M-side grid
+                extent.
+            log2_grid_n: Base-2 log of the power-of-two-padded N-side grid
+                extent.
         """
         var m = Int32(c.dim[0]())
         var n = Int32(c.dim[1]())
@@ -663,8 +762,8 @@ struct AppleM5Int8MatMul[
         comptime SG_M_i = Int32(Self.SG_M)
         comptime SG_N_i = Int32(Self.SG_N)
 
-        var grid_m = (m + BM_i - 1) // BM_i
-        var grid_n = (n + BN_i - 1) // BN_i
+        var grid_m = ceildiv(m, BM_i)
+        var grid_n = ceildiv(n, BN_i)
 
         var tile_mn = Self.morton_decode_2d_rect(
             UInt32(block_idx.x), log2_grid_m, log2_grid_n
@@ -688,9 +787,7 @@ struct AppleM5Int8MatMul[
         var sg_col = Int(col_base // SG_N_i)
 
         var mma_op = Self.Mma()
-        var accum = Self.Mma.AccumType(uninitialized=True)
-        comptime for i in range(Self.Mma.num_accum):
-            accum[i] = SIMD[DType.int32, 8](0)
+        var accum = Self.Mma.AccumType(fill=SIMD[.int32, 8](0))
 
         var is_edge = (row_base + SG_M_i > m) or (col_base + SG_N_i > n)
         var n_full_strips = k // Self.BK
@@ -745,6 +842,10 @@ struct AppleM5Int8MatMul[
             as_layout,
             bs_layout,
             bias_layout,
+            c_engine,
+            as_engine,
+            bs_engine,
+            bias_engine,
             has_bias=Self.has_bias,
         ](c, a_scale, b_scale, bias, Int(m), Int(n))
 
@@ -774,15 +875,15 @@ struct AppleM5Int8MatMul[
 
 @always_inline
 def enqueue_apple_int8_matmul[
-    c_type: DType = DType.bfloat16,
+    c_type: DType = .bfloat16,
     *,
     has_bias: Bool = False,
 ](
     c: TileTensor[mut=True, c_type, ...],
-    a: TileTensor[DType.int8, ...],
-    b: TileTensor[DType.int8, ...],
-    a_scale: TileTensor[DType.float32, ...],
-    b_scale: TileTensor[DType.float32, ...],
+    a: TileTensor[.int8, ...],
+    b: TileTensor[.int8, ...],
+    a_scale: TileTensor[.float32, ...],
+    b_scale: TileTensor[.float32, ...],
     bias: TileTensor[c_type, ...],
     ctx: DeviceContext,
     _use_i32_override: Optional[Bool] = None,
@@ -796,6 +897,20 @@ def enqueue_apple_int8_matmul[
     Parameters:
         c_type: Output element type (bf16 / fp16 / fp32).
         has_bias: If True, add `bias[col]` after dequant.
+
+    Args:
+        c: Output `TileTensor` of shape `(M, N)` in `c_type`, written
+            mutable.
+        a: Int8 activation `TileTensor` of shape `(M, K)`.
+        b: Int8 weight `TileTensor` of shape `(N, K)` (used transposed).
+        a_scale: Per-row fp32 activation scale, shape `(M,)`.
+        b_scale: Per-column fp32 weight scale, shape `(N,)`.
+        bias: Per-column bias in `c_type`, shape `(N,)` (used iff
+            `has_bias`; pass a length-1 dummy otherwise).
+        ctx: Device context used to enqueue the kernel.
+        _use_i32_override: Optional internal override forcing (`True`) or
+            disabling (`False`) the int32 accumulation path; auto-selected
+            when `None`.
 
     Raises:
         If the attached GPU is not Apple M5 (`compute_capability == 5`).
@@ -817,8 +932,8 @@ def enqueue_apple_int8_matmul[
         "Apple int8 matmul: K and N must fit in UInt16",
     )
 
-    var grid_m = (m + MM.BM - 1) // MM.BM
-    var grid_n = (n + MM.BN - 1) // MM.BN
+    var grid_m = ceildiv(m, MM.BM)
+    var grid_n = ceildiv(n, MM.BN)
 
     var side_m = 1
     var log2_m: UInt32 = 0
@@ -838,6 +953,12 @@ def enqueue_apple_int8_matmul[
         type_of(a_scale).LayoutType,
         type_of(b_scale).LayoutType,
         type_of(bias).LayoutType,
+        type_of(c).Engine,
+        type_of(a).Engine,
+        type_of(b).Engine,
+        type_of(a_scale).Engine,
+        type_of(b_scale).Engine,
+        type_of(bias).Engine,
     ]
     comptime kernel_i32 = AppleM5Int8MatMul[
         c_type, has_bias=has_bias, TTI32=True
@@ -848,6 +969,12 @@ def enqueue_apple_int8_matmul[
         type_of(a_scale).LayoutType,
         type_of(b_scale).LayoutType,
         type_of(bias).LayoutType,
+        type_of(c).Engine,
+        type_of(a).Engine,
+        type_of(b).Engine,
+        type_of(a_scale).Engine,
+        type_of(b_scale).Engine,
+        type_of(bias).Engine,
     ]
 
     # Gate on the int32-indexed extents (m*k, n*k) -- not m*n, since only A/B are
@@ -888,7 +1015,7 @@ def enqueue_apple_int8_matmul[
 # ===----------------------------------------------------------------------=== #
 
 
-struct AppleInt8ActQuant[in_type: DType = DType.bfloat16, *, THREADS: Int = 64]:
+struct AppleInt8ActQuant[in_type: DType = .bfloat16, *, THREADS: Int = 64]:
     """Per-row symmetric-absmax int8 quantization of the activation.
 
     One threadgroup per row: the `THREADS` threads cooperatively reduce
@@ -898,18 +1025,30 @@ struct AppleInt8ActQuant[in_type: DType = DType.bfloat16, *, THREADS: Int = 64]:
     no zero-point) but as a GPU row kernel. No SMEM reduction primitive is
     assumed; the absmax reduction is a two-pass strided scan (the row fits in
     L1/L2 and is re-read cheaply -- K <= 12288 for FLUX).
+
+    Parameters:
+        in_type: Element type of the input activation tensor (defaults to
+            `bfloat16`).
+        THREADS: Number of threads per threadgroup cooperating on the per-row
+            reduction (defaults to 64).
     """
 
     @__name("apple_int8_act_quant")
     @staticmethod
     def run[
-        q_layout: TensorLayout, a_layout: TensorLayout, s_layout: TensorLayout
+        q_layout: TensorLayout,
+        a_layout: TensorLayout,
+        s_layout: TensorLayout,
+        q_engine: TensorEngine,
+        a_engine: TensorEngine,
+        s_engine: TensorEngine,
     ](
-        q: TileTensor[DType.int8, q_layout, MutAnyOrigin],
-        a: TileTensor[Self.in_type, a_layout, ImmutAnyOrigin],
-        a_scale: TileTensor[DType.float32, s_layout, MutAnyOrigin],
-        K: Int,
+        q: TileTensor[.int8, q_layout, MutAnyOrigin, Engine=q_engine],
+        a: TileTensor[Self.in_type, a_layout, ImmutAnyOrigin, Engine=a_engine],
+        a_scale: TileTensor[.float32, s_layout, MutAnyOrigin, Engine=s_engine],
+        K_arg: Int32,
     ):
+        var K = Int(K_arg)
         var row = Int(block_idx.x)
         var tid = Int(thread_idx.x)
 
@@ -918,7 +1057,7 @@ struct AppleInt8ActQuant[in_type: DType = DType.bfloat16, *, THREADS: Int = 64]:
         var local_max = Float32(0)
         var j = tid
         while j < K:
-            var v = abs(Float32(a[row, j]))
+            var v = abs(a.load[width=1](Coord(row, j)).cast[DType.float32]())
             if v > local_max:
                 local_max = v
             j += Self.THREADS
@@ -928,13 +1067,15 @@ struct AppleInt8ActQuant[in_type: DType = DType.bfloat16, *, THREADS: Int = 64]:
         var scale = row_max / 127.0 if row_max != 0.0 else Float32(0)
         var mult = 127.0 / row_max if row_max != 0.0 else Float32(0)
         if tid == 0:
-            a_scale.store[width=1](Coord(row), SIMD[DType.float32, 1](scale))
+            a_scale.store[width=1](Coord(row), Float32(scale))
 
         # Pass 2: quantize.
         j = tid
         while j < K:
-            var qi = Int(round(Float32(a[row, j]) * mult))
-            q.store[width=1](Coord(row, j), SIMD[DType.int8, 1](qi))
+            var qi = Int(
+                round(a.load[width=1](Coord(row, j)).cast[.float32]() * mult)
+            )
+            q.store[width=1](Coord(row, j), Int8(qi))
             j += Self.THREADS
 
 
@@ -946,9 +1087,7 @@ def _threadgroup_max[nthreads: Int](val: Float32) -> Float32:
     broadcasts the max back through SMEM. `nthreads` is small (64) so the linear
     reduction is cheap and needs no tree.
     """
-    var s = stack_allocation[
-        nthreads, Float32, address_space=AddressSpace.SHARED
-    ]()
+    var s = unsafe_stack_allocation[nthreads, Float32, address_space=.SHARED]()
     var tid = Int(thread_idx.x)
     s[tid] = val
     barrier()
@@ -964,17 +1103,28 @@ def _threadgroup_max[nthreads: Int](val: Float32) -> Float32:
 
 @always_inline
 def enqueue_apple_int8_quantize_activation[
-    in_type: DType = DType.bfloat16,
+    in_type: DType = .bfloat16,
 ](
-    q: TileTensor[mut=True, DType.int8, ...],
+    q: TileTensor[mut=True, .int8, ...],
     a: TileTensor[in_type, ...],
-    a_scale: TileTensor[mut=True, DType.float32, ...],
+    a_scale: TileTensor[mut=True, .float32, ...],
     ctx: DeviceContext,
 ) raises:
     """Quantize `a` `(M, K)` to int8 `q` + per-row fp32 `a_scale` `(M,)`.
 
     One threadgroup per row (M threadgroups, 64 threads each). Symmetric
     absmax/127, no zero-point. Raises if the GPU is not Apple M5.
+
+    Parameters:
+        in_type: Element type of the input activation tensor (defaults to
+            `bfloat16`).
+
+    Args:
+        q: Output int8 `TileTensor` of shape `(M, K)`, written mutable.
+        a: Input activation `TileTensor` of shape `(M, K)` in `in_type`.
+        a_scale: Output per-row fp32 scale `TileTensor` of shape `(M,)`,
+            written mutable.
+        ctx: Device context used to enqueue the kernel.
     """
     _require_apple_m5(ctx)
     var m = Int(a.dim[0]())
@@ -984,12 +1134,15 @@ def enqueue_apple_int8_quantize_activation[
         type_of(q).LayoutType,
         type_of(a).LayoutType,
         type_of(a_scale).LayoutType,
+        type_of(q).Engine,
+        type_of(a).Engine,
+        type_of(a_scale).Engine,
     ]
     ctx.enqueue_function[kernel](
         q,
         a.as_immut(),
         a_scale,
-        k,
+        Int32(k),
         grid_dim=(m),
         block_dim=(QK.THREADS),
     )

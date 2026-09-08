@@ -31,19 +31,15 @@ from max.graph.weights import (
 from max.nn.transformer import ReturnLogits
 from max.pipelines.context import TextAndVisionContext
 from max.pipelines.lib import (
-    CompilationTimer,
     KVCacheConfig,
     ModelInputs,
     ModelOutputs,
+    MultiGraphPipelineModelWithKVCache,
     PipelineConfig,
-    PipelineModelWithKVCache,
 )
-from max.pipelines.lib.utils import (
-    parse_state_dict_from_weights,
-    upper_bounded_default,
-)
+from max.pipelines.lib.memory_estimation import MemoryPlan
+from max.pipelines.lib.utils import parse_state_dict_from_weights
 from max.profiler import traced
-from transformers import AutoConfig
 
 from .batch_processor import PixtralBatchProcessor
 from .model_config import PixtralConfig
@@ -71,7 +67,7 @@ class PixtralInputs(ModelInputs):
         return self.pixel_patches is not None
 
 
-class PixtralModel(PipelineModelWithKVCache[TextAndVisionContext]):
+class PixtralModel(MultiGraphPipelineModelWithKVCache[TextAndVisionContext]):
     """Pixtral pipeline model with separate vision and language graphs."""
 
     model_config_cls: ClassVar[type[Any]] = PixtralConfig
@@ -79,27 +75,7 @@ class PixtralModel(PipelineModelWithKVCache[TextAndVisionContext]):
         PixtralBatchProcessor
     )
 
-    @classmethod
-    def calculate_max_seq_len(
-        cls,
-        pipeline_config: PipelineConfig,
-        huggingface_config: AutoConfig,
-    ) -> int:
-        """Bounds ``max_length`` by ``text_config.max_position_embeddings`` (config is permissive)."""
-        upper_bound = huggingface_config.text_config.max_position_embeddings
-        try:
-            return upper_bounded_default(
-                upper_bound=upper_bound,
-                default=pipeline_config.model.max_length,
-            )
-        except ValueError as e:
-            raise ValueError(
-                f"Unable to infer max_length for {cls.__qualname__}, "
-                f"the provided max_length ({pipeline_config.model.max_length}) "
-                f"exceeds the model's max_position_embeddings ({upper_bound})."
-            ) from e
-
-    vision_model: Model
+    vision_model: Model | None
     language_model: Model
 
     def __init__(
@@ -109,6 +85,8 @@ class PixtralModel(PipelineModelWithKVCache[TextAndVisionContext]):
         devices: list[Device],
         kv_cache_config: KVCacheConfig,
         weights: Weights,
+        *,
+        memory_plan: MemoryPlan,
         adapter: WeightsAdapter | None = None,
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
         max_batch_size: int = 1,
@@ -120,11 +98,24 @@ class PixtralModel(PipelineModelWithKVCache[TextAndVisionContext]):
             devices,
             kv_cache_config,
             weights,
-            adapter,
-            return_logits,
+            adapter=adapter,
+            return_logits=return_logits,
+            memory_plan=memory_plan,
         )
 
-        self.vision_model, self.language_model = self._load_models(session)
+        if self.pipeline_config.model.enable_echo:
+            raise ValueError(
+                "Pixtral model does not currently implement enable echo."
+            )
+
+        assert self._max_batch_size, "Expected max_batch_size to be set"
+
+        if len(self.devices) > 1:
+            raise NotImplementedError(
+                "Pixtral does not support distributed inference"
+            )
+
+        self.vision_model, self.language_model = self.load_model(session)
 
     def execute(self, model_inputs: ModelInputs) -> ModelOutputs:
         assert isinstance(model_inputs, PixtralInputs)
@@ -134,6 +125,7 @@ class PixtralModel(PipelineModelWithKVCache[TextAndVisionContext]):
 
         # Process vision inputs if present.
         if model_inputs.has_vision_inputs:
+            assert self.vision_model is not None
             assert model_inputs.pixel_patches is not None
             assert model_inputs.vision_attention_mask is not None
             assert model_inputs.vision_position_ids is not None
@@ -236,9 +228,9 @@ class PixtralModel(PipelineModelWithKVCache[TextAndVisionContext]):
         self,
         config: PixtralConfig,
         state_dict: dict[str, WeightData],
-        patch_dim: int,
         module: Module | None = None,
     ) -> tuple[Graph, dict[str, DLPackArray]]:
+        patch_dim = self._patch_dim
         with Graph(
             "pixtral_vision",
             input_types=self._vision_graph_input_types(patch_dim),
@@ -299,43 +291,19 @@ class PixtralModel(PipelineModelWithKVCache[TextAndVisionContext]):
             graph.output(*outputs)
             return graph, language_nn.state_dict()
 
-    @traced
-    def _load_models(self, session: InferenceSession) -> tuple[Model, Model]:
-        if self.pipeline_config.model.enable_echo:
-            raise ValueError(
-                "Pixtral model does not currently implement enable echo."
-            )
-
-        assert self._max_batch_size, "Expected max_batch_size to be set"
-
+    def _load_state_dict(self) -> dict[str, Any]:
         if not isinstance(self.weights, SafetensorWeights):
             raise ValueError(
                 "Only safetensors weights are currently supported in Pixtral."
             )
-
-        if len(self.devices) > 1:
-            raise NotImplementedError(
-                "Pixtral does not support distributed inference"
-            )
-
-        # Split full state dict into vision and language parts.
         state_dict = parse_state_dict_from_weights(
             self.pipeline_config, self.weights, self.adapter
-        )
-
-        vision_config = self.huggingface_config.vision_config
-        patch_dim = (
-            vision_config.num_channels
-            * vision_config.patch_size
-            * vision_config.patch_size
         )
 
         vision_state_dict: dict[str, WeightData] = {}
         language_state_dict: dict[str, WeightData] = {}
         for k, v in state_dict.items():
-            if k.startswith("vision_encoder.") or k.startswith(
-                "multi_modal_projector."
-            ):
+            if k.startswith(("vision_encoder.", "multi_modal_projector.")):
                 if k.startswith("vision_encoder."):
                     new_key = k.replace("vision_encoder.", "", 1)
                     vision_state_dict[new_key] = v
@@ -344,24 +312,23 @@ class PixtralModel(PipelineModelWithKVCache[TextAndVisionContext]):
             elif k.startswith("language_model."):
                 language_state_dict[k] = v
 
-        model_config = PixtralConfig.initialize(self.pipeline_config)
+        self._vision_weights_dict = vision_state_dict
+        self._language_weights_dict = language_state_dict
+        return state_dict
+
+    def _create_model_config(
+        self, state_dict: dict[str, WeightData]
+    ) -> PixtralConfig:
+        del state_dict
+        vision_config = self.huggingface_config.vision_config
+        self._patch_dim = (
+            vision_config.num_channels
+            * vision_config.patch_size
+            * vision_config.patch_size
+        )
+
+        model_config = PixtralConfig.initialize(
+            self.pipeline_config, max_seq_len=self.max_seq_len
+        )
         model_config.return_logits = self.return_logits
-
-        # Build and compile vision + language models in parallel.
-        with CompilationTimer("vision + language model") as timer:
-            module = Module()
-            vision_graph, vision_weights = self._build_vision_graph(
-                model_config, vision_state_dict, patch_dim, module=module
-            )
-            language_graph, language_weights = self._build_language_graph(
-                model_config, language_state_dict, module=module
-            )
-            timer.mark_build_complete()
-            combined_registry = {**vision_weights, **language_weights}
-            models = session.load_all(
-                module, weights_registry=combined_registry
-            )
-            vision_model = models[vision_graph.name]
-            language_model = models[language_graph.name]
-
-        return vision_model, language_model
+        return model_config

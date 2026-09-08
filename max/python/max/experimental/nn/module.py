@@ -25,8 +25,9 @@ from typing import TYPE_CHECKING, Annotated, Any, Generic
 from max.driver import CPU, Buffer, Device, DLPackArray
 from max.engine import CompiledModel as EngineCompiledModel
 from max.engine import Model
+from max.experimental import functional as F
+from max.experimental.nn._trace_context import ModuleTraceRealizationContext
 from max.experimental.realization_context import (
-    GraphRealizationContext,
     in_graph_context,
 )
 from max.experimental.sharding import DeviceMapping, DeviceMesh
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
 # Type variables for Module's forward signature.
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+_T = TypeVar("_T")
 
 from max.experimental.nn._compilation_timer import CompilationTimer
 from max.experimental.nn._compile_utils import (
@@ -53,17 +55,17 @@ from max.experimental.nn._compile_utils import (
     _detect_signals,
     _emit_cast_summary,
     _flatten_input_types,
-    _flatten_named_buffers,
     _flatten_outputs,
     _InputSlot,
     _OutputSlot,
-    _prepare_weight_for_parameter,
-    _process_provided_weights,
     _reconstruct_outputs,
     _wrap_graph_inputs,
     engine_call_error,
+    flatten_distributed_tensors,
     flatten_input_buffers,
     lower_subgraph,
+    prepare_weight_for_parameter,
+    prepare_weights_registry,
 )
 from max.nn.comm.allreduce import Signals
 from max.profiler import Tracer
@@ -282,12 +284,13 @@ class Module(Generic[_P, _R]):
 
         from max.dtype import DType
         from max.experimental.nn import Linear
-        from max.experimental.tensor import Tensor
+        from max.experimental.tensor import Tensor, defaults
         from max.graph import TensorType
 
         model = Linear(5, 10)
+        _, device = defaults()
+        model.to(device)
 
-        # Build the input type from model.device so computation matches weights.
         input_type = TensorType(DType.float32, ["batch", 5], device=model.device)
         compiled = model.compile(input_type)
         result = compiled(Tensor.ones([3, 5], dtype=DType.float32))
@@ -301,21 +304,16 @@ class Module(Generic[_P, _R]):
 
     .. code-block:: python
 
-        from max.dtype import DType
+        from max.driver import CPU
         from max.experimental.nn import Linear
-        from max.experimental.tensor import Tensor
-        from max.graph import TensorType
 
         model = Linear(5, 10)
-        input_type = TensorType(DType.float32, ["batch", 5], device=model.device)
-        compiled = model.compile(input_type)        # runs on CPU
-        result = compiled(Tensor.ones([3, 5], dtype=DType.float32))
+        print(model.device)
 
     .. invisible-code-block: python
 
         from max.driver import CPU
 
-        assert list(result.shape) == [3, 10]
         assert isinstance(model.device, CPU)
 
     Because :attr:`device` is tracked per-module instance, sub-modules can be
@@ -363,6 +361,13 @@ class Module(Generic[_P, _R]):
          - Concrete eager tensors (e.g., staging inputs)
     """
 
+    #: Whether calls to this module lower to a shared subgraph. Set via the
+    #: :func:`subgraphable`.
+    _is_subgraphable: bool = False
+
+    #: Optional subgraph dedup key from ``subgraphable(..., name=...)``.
+    _subgraph_name: str | None = None
+
     def forward(self, *args: _P.args, **kwargs: _P.kwargs) -> _R:
         """Defines the computation performed by the module.
 
@@ -404,8 +409,11 @@ class Module(Generic[_P, _R]):
         Returns:
             The result of applying the module to the input.
         """
-        if getattr(self, "_is_subgraphable", False) and in_graph_context():
-            return subgraphable(self)(*args, **kwargs)
+        if self._is_subgraphable and in_graph_context():
+            name = self._subgraph_name or type(self).__name__
+            return lower_subgraph(
+                name, self, args, kwargs, key=self._subgraph_name
+            )
         return self.forward(*args, **kwargs)
 
     @property
@@ -453,7 +461,6 @@ class Module(Generic[_P, _R]):
                 fc2=Linear(20, 5)
             )
 
-            # Count parameters
             total_params = sum(
                 param.num_elements()
                 for name, param in model.parameters
@@ -465,10 +472,26 @@ class Module(Generic[_P, _R]):
             dot-separated qualified path of the parameter and ``parameter``
             is the :class:`~max.experimental.tensor.Tensor`.
         """
+        seen: set[str] = set()
+        for name, parameter in self._named_parameters():
+            if name in seen:
+                raise ValueError(
+                    f"duplicate parameter path {name!r}: two parameters "
+                    "resolve to the same qualified name (see _qualify_name)."
+                )
+            seen.add(name)
+            yield name, parameter
+
+    def _named_parameters(self) -> Iterable[tuple[str, Tensor]]:
+        """Yields ``(name, parameter)`` without the duplicate-path check.
+
+        Recurses into each child, qualifying the child's names with
+        :meth:`_qualify_name`.
+        """
         yield from self.local_parameters
-        for prefix, descendant in self.descendants:
-            for name, parameter in descendant.local_parameters:
-                yield f"{prefix}.{name}", parameter
+        for prefix, child in self.children:
+            for name, parameter in child._named_parameters():
+                yield child._qualify_name(prefix, name), parameter
 
     @property
     def children(self) -> Iterable[tuple[str, Module[..., Any]]]:
@@ -493,7 +516,17 @@ class Module(Generic[_P, _R]):
         for prefix, child in self.children:
             yield prefix, child
             for name, descendant in child.descendants:
-                yield f"{prefix}.{name}", descendant
+                yield child._qualify_name(prefix, name), descendant
+
+    def _qualify_name(self, prefix: str, name: str) -> str:
+        """Qualifies a descendant's ``name`` with this module's ``prefix``.
+
+        ``name`` is given relative to this module; the default prepends
+        ``prefix`` (dot-joined). This is the one place the name-to-path rule
+        lives -- override to change how (or whether) this module's name appears
+        in its descendants' paths.
+        """
+        return f"{prefix}.{name}"
 
     def apply_to_local_parameters(
         self, f: Callable[[str, Tensor], Tensor]
@@ -507,11 +540,12 @@ class Module(Generic[_P, _R]):
 
         .. code-block:: python
 
-            from max.driver import Accelerator
             from max.experimental.nn import Linear
+            from max.experimental.tensor import defaults
 
+            _, device = defaults()
             model = Linear(2, 3)
-            model.apply_to_parameters(lambda _, t: t.to(Accelerator()))
+            model.apply_to_local_parameters(lambda _, t: t.to(device))
 
         Args:
             f: The transformation to apply to each local parameter.
@@ -534,12 +568,11 @@ class Module(Generic[_P, _R]):
         and all nested sub-module parameters. The transformation receives the
         parameter's qualified name (dot-separated path) and current tensor value.
 
-        Transfer all parameters to accelerator:
+        Transfer all parameters to the best available device:
 
         .. code-block:: python
 
-            from max.driver import Accelerator
-            from max.experimental.tensor import Tensor
+            from max.experimental.tensor import Tensor, defaults
             from max.experimental.nn import Module, module_dataclass, Linear
 
             @module_dataclass
@@ -555,8 +588,8 @@ class Module(Generic[_P, _R]):
                 fc2=Linear(20, 5)
             )
 
-            # Move all parameters to accelerator
-            model.apply_to_parameters(lambda name, t: t.to(Accelerator()))
+            _, device = defaults()
+            model.apply_to_parameters(lambda name, t: t.to(device))
 
         Args:
             f: Transformation function taking ``(name, tensor)`` and returning
@@ -570,12 +603,13 @@ class Module(Generic[_P, _R]):
         """
         self.apply_to_local_parameters(f)
         for prefix, child in self.children:
-            # Bind an explicit reference to `prefix` into the closure
-            # See https://stackoverflow.com/a/54289183
             child.apply_to_parameters(
                 functools.partial(
-                    (lambda prefix, name, t: f(f"{prefix}.{name}", t)),
+                    lambda prefix, child, name, t: f(
+                        child._qualify_name(prefix, name), t
+                    ),
                     prefix,
+                    child,
                 )
             )
 
@@ -665,7 +699,6 @@ class Module(Generic[_P, _R]):
                 bias=Tensor.zeros([10])
             )
 
-            # Load weights from dictionary
             weights = {
                 "weight": Tensor.zeros([10, 5]),
                 "bias": Tensor.zeros([10]),
@@ -714,11 +747,15 @@ class Module(Generic[_P, _R]):
 
         def lookup(name: str, existing: Tensor) -> Tensor:
             loaded.add(name)
-            prepared, cast_record = _prepare_weight_for_parameter(
-                name, state[name], existing, auto_cast=auto_cast
+            prepared, cast_record, transfer_needed = (
+                prepare_weight_for_parameter(
+                    name, state[name], existing, auto_cast=auto_cast
+                )
             )
             if cast_record is not None:
                 cast_counts[cast_record] = cast_counts.get(cast_record, 0) + 1
+            if transfer_needed:
+                prepared = F.transfer_to(prepared, existing.mapping)
             return prepared
 
         self.apply_to_parameters(lookup)
@@ -740,11 +777,12 @@ class Module(Generic[_P, _R]):
 
         .. code-block:: python
 
-            from max.driver import Accelerator
             from max.experimental.nn import Linear
+            from max.experimental.tensor import defaults
 
+            _, device = defaults()
             model = Linear(2, 3)
-            model_on_gpu = model.map_parameters(lambda _, t: t.to(Accelerator()))
+            model_on_device = model.map_parameters(lambda _, t: t.to(device))
 
         Args:
             f: The transformation to apply to each parameter.
@@ -785,9 +823,9 @@ class Module(Generic[_P, _R]):
             from max.experimental.nn import Linear
 
             model = Linear(2, 3)
-            print(model.device)     # CPU()  - CPU default
-            model.to(CPU())         # use Accelerator() to move weights to a GPU
-            print(model.device)     # CPU()
+            print(model.device)
+            model.to(CPU())
+            print(model.device)
 
         .. invisible-code-block: python
 
@@ -828,17 +866,15 @@ class Module(Generic[_P, _R]):
 
         .. code-block:: python
 
-            from max.driver import Accelerator, CPU, accelerator_count
             from max.dtype import DType
             from max.experimental.nn import Linear
-            from max.experimental.tensor import Tensor
+            from max.experimental.tensor import Tensor, defaults
             from max.graph import TensorType
 
             model = Linear(2, 3)
-            device = CPU() if accelerator_count() == 0 else Accelerator()
+            _, device = defaults()
             model.to(device)
 
-            # Build the input type from model.device so computation matches:
             input_type = TensorType(DType.float32, ["batch", 2], device=model.device)
             compiled = model.compile(input_type)
             result = compiled(Tensor.ones([4, 2], dtype=DType.float32))
@@ -883,7 +919,7 @@ class Module(Generic[_P, _R]):
             primary_device = target.devices[0]
         else:
             raise TypeError(
-                f"to() expects Device, DeviceMesh, or DeviceMapping, "
+                "to() expects Device, DeviceMesh, or DeviceMapping, "
                 f"got {type(target).__name__}"
             )
 
@@ -911,6 +947,8 @@ class Module(Generic[_P, _R]):
         *,
         custom_extensions: Iterable[Path] = (),
         allow_subgraphs: bool = True,
+        weights_to_transfer: Mapping[str, Tensor] | None = None,
+        is_device_graph: bool = False,
     ) -> tuple[
         Graph,
         list[_InputSlot],
@@ -939,6 +977,7 @@ class Module(Generic[_P, _R]):
             type(self).__qualname__,
             input_types=graph_types,
             custom_extensions=custom_extensions,
+            is_device_graph=is_device_graph,
         )
 
         # Extract signal BufferValues from the graph inputs (at the end).
@@ -950,7 +989,9 @@ class Module(Generic[_P, _R]):
                 for i in range(n_sig)
             ]
 
-        ctx = GraphRealizationContext(graph, signal_buffers=sig_buf_values)
+        ctx = ModuleTraceRealizationContext(
+            graph, signal_buffers=sig_buf_values
+        )
         # Root cache for subgraph dedup (None on a subgraph inlines nested
         # calls); leaving it None also disables subgraphs entirely.
         if allow_subgraphs:
@@ -964,8 +1005,44 @@ class Module(Generic[_P, _R]):
                 list(graph.inputs[:n_tensor_inputs]), input_slots
             )
 
-            def as_weight(name: str, tensor: Tensor):  # noqa: ANN202
-                return tensor._as_constant_external(name, align=1)
+            # Either load weights as `constant_external` in the graph, or
+            # defer the creation of the `constant_external` to the subgraph.
+            # Only when subgraphs are enabled: otherwise every layer inlines and
+            # its weights must materialize normally in the parent graph (a
+            # deferred prefix would never be resolved by a ``mo.call``).
+            subgraph_weight_prefixes: list[str] = []
+            if allow_subgraphs:
+                for path, descendant in self.descendants:
+                    if getattr(descendant, "_is_subgraphable", False):
+                        _prefix = f"{path}."
+                        ctx.weight_prefixes[descendant] = _prefix
+                        subgraph_weight_prefixes.append(_prefix)
+
+            def create_external_constant(
+                lookup_name: str,
+                const_name: str,
+                tensor: Tensor,
+                is_placeholder: bool = False,
+            ) -> Tensor:
+                """Materialize weight in the current graph/subgraph."""
+                if weights_to_transfer and (
+                    (wt := weights_to_transfer.get(lookup_name)) is not None
+                ):
+                    return wt._as_constant_external(
+                        const_name, align=1, is_placeholder=is_placeholder
+                    ).to(tensor.mapping)
+                return tensor._as_constant_external(
+                    const_name, align=1, is_placeholder=is_placeholder
+                )
+
+            ctx.create_external_constant = create_external_constant
+
+            def as_weight(name: str, tensor: Tensor) -> Tensor:
+                # Check if the constant_external creation should be done in a
+                # subgraph.
+                if any(name.startswith(p) for p in subgraph_weight_prefixes):
+                    return tensor
+                return create_external_constant(name, name, tensor)
 
             # Call forward (not __call__) so a subgraphable root inlines.
             # (run_forward: Any sidesteps forward's ParamSpec under a splat.)
@@ -1009,6 +1086,7 @@ class Module(Generic[_P, _R]):
         custom_extensions: Iterable[Path] = (),
         auto_cast: bool = False,
         allow_subgraphs: bool = True,
+        is_device_graph: bool = False,
     ) -> CompiledModel[_P, _R]:
         """Compiles the module to an optimized executable through graph tracing.
 
@@ -1037,16 +1115,14 @@ class Module(Generic[_P, _R]):
         .. code-block:: python
 
             from max.dtype import DType
-            from max.driver import Accelerator, CPU, accelerator_count
             from max.experimental.nn import Linear
-            from max.experimental.tensor import Tensor
+            from max.experimental.tensor import Tensor, defaults
             from max.graph import TensorType
 
             model = Linear(5, 10)
-            device = CPU() if accelerator_count() == 0 else Accelerator()
+            _, device = defaults()
             model.to(device)
 
-            # Build the input type from model.device — computation matches:
             input_type = TensorType(DType.float32, ["batch", 5], device=model.device)
             compiled = model.compile(input_type)
             result = compiled(Tensor.ones([3, 5], dtype=DType.float32))
@@ -1076,12 +1152,10 @@ class Module(Generic[_P, _R]):
                 bias=Tensor.zeros([10])
             )
 
-            # Compile with fixed input shape
             _, device = defaults()
             input_type = TensorType(DType.float32, [3, 5], device=device)
             model = linear.compile(input_type)
 
-            # Execute compiled model
             input_data = Tensor.ones([3, 5], dtype=DType.float32)
             result = model(input_data)
             print(result)
@@ -1090,7 +1164,7 @@ class Module(Generic[_P, _R]):
 
             import numpy as np
 
-            assert np.allclose(result.to_numpy(), 0.0)  # zero weights/bias
+            assert np.allclose(result.to_numpy(), 0.0)
             assert list(result.shape) == [3, 10]
 
         Compilation with custom Mojo kernel extensions follows the same
@@ -1115,7 +1189,7 @@ class Module(Generic[_P, _R]):
             module = CustomModule()
             compiled = module.compile(
                 input_type,
-                custom_extensions=[Path("my_kernels")],  # Mojo source dir or package
+                custom_extensions=[Path("my_kernels")],
             )
 
         Args:
@@ -1145,6 +1219,8 @@ class Module(Generic[_P, _R]):
                 :func:`subgraphable` module instead of emitting shared
                 subgraphs, tracing the whole model into one flat graph. Defaults
                 to :obj:`True`.
+            is_device_graph: If :obj:`True`, the device graph based execution is
+                used for the generated :class:`~max.graph.Graph`.
 
         Returns:
             Callable[..., Any]
@@ -1164,25 +1240,30 @@ class Module(Generic[_P, _R]):
             Tracer(f"Module.compile({compile_name})"),
             CompilationTimer(compile_name) as timer,
         ):
+            with Tracer("Module.compile.weights_registry"):
+                # Compile the graph with module parameters as weights
+
+                # Build weights registry from parameters.
+                weights_to_transfer: Mapping[str, Tensor] = {}
+                if weights is None:
+                    weights_registry = flatten_distributed_tensors(
+                        self.parameters
+                    )
+                else:
+                    weights_registry, weights_to_transfer = (
+                        prepare_weights_registry(
+                            weights, self.parameters, auto_cast=auto_cast
+                        )
+                    )
+
             with Tracer("Module.compile.trace"):
                 graph, input_slots, output_slots, unary, signals = self._trace(
                     input_types,
                     custom_extensions=custom_extensions,
                     allow_subgraphs=allow_subgraphs,
+                    weights_to_transfer=weights_to_transfer,
+                    is_device_graph=is_device_graph,
                 )
-
-            with Tracer("Module.compile.weights_registry"):
-                # Compile the graph with module parameters as weights
-                session = _session()
-
-                # Build weights registry from parameters.
-                if weights is None:
-                    weights_registry = _flatten_named_buffers(self.parameters)
-                else:
-                    weights_registry = _process_provided_weights(
-                        weights, self.parameters, auto_cast=auto_cast
-                    )
-
             timer.mark_build_complete()
             with Tracer("Module.compile.session_load"):
                 # Compile and initialize as separate steps (equivalent to
@@ -1190,7 +1271,13 @@ class Module(Generic[_P, _R]):
                 # artifact is what backs `CompiledModel.export_mef`, and it
                 # remains usable even in virtual-device mode where `init`
                 # returns a mock model rather than a live one.
-                compiled_artifact = session.compile(graph)
+                #
+                # `compile_reusing_mefs` rather than `compile` so a session
+                # configured to reuse precompiled artifacts, or to record them,
+                # covers this path too -- see
+                # `max.experimental.support.set_precompiled_mefs`.
+                session = _session()
+                compiled_artifact = session.compile_reusing_mefs(graph)
                 session_model = session.init(
                     compiled_artifact, weights_registry=weights_registry
                 )
@@ -1253,15 +1340,20 @@ class Module(Generic[_P, _R]):
 # ─── Subgraphs: repeated sub-modules as one shared subgraph ────────────────
 
 
-def subgraphable(module: Any, *, name: str | None = None) -> Callable[..., Any]:
-    """Lowers a repeated :class:`Module` to one shared subgraph.
+def subgraphable(module: _T, *, name: str | None = None) -> _T:
+    """Marks a :class:`Module` to call to a subgraph.
 
-    Inside :meth:`Module.compile` / :meth:`Module.trace`, each call emits one
-    ``mo.call`` into a subgraph, and calls whose bodies trace to identical IR
-    share a single definition instead of inlining each time. A :class:`Module`
-    threads its parameters in as call operands, so identical sibling modules
-    share one body while each computes with its own (distributed) weights. Calls
-    nested inside a subgraph body inline. Calling outside a capture raises.
+    Use this to speed up graph build and compilation time.
+
+    When a name is given, all modules with that name will share the same
+    subgraph. When a name is not given, the IR of the module's traced call
+    is used to determine whether an existing subgraph can be used (this process
+    is slow, but guarantees correctness).
+
+    .. caution::
+
+        Kernel fusion cannot cross a subgraph boundary, so prefer marking larger
+        modules, like encoder/decoder blocks.
 
     Use it as a class decorator so an ordinary layer loop auto-shares a body::
 
@@ -1270,38 +1362,37 @@ def subgraphable(module: Any, *, name: str | None = None) -> Callable[..., Any]:
         class Block(Module[[Tensor], Tensor]): ...
 
         def forward(self, x):
-            for layer in self.layers:  # each call -> one shared subgraph
+            for layer in self.layers:  # each call reuses one shared subgraph
                 x = layer(x)
             return x
 
-    Or wrap a single :class:`Module` call directly: ``subgraphable(layer)(x)``.
-
-    Two calls share a body when their traced IR is identical: same ops and same
-    operand types. Tensors (weights and Tensor arguments, positional or keyword)
-    flow in as operands, so only structure matters; non-Tensor arguments bake
-    into the body. A value the body bakes in (a different op mix, a constant
-    read from a field or argument) yields a distinct body; a field or argument
-    the body never reads does not.
+    Or mark a single instance directly: ``subgraphable(layer, name="block")``.
 
     Args:
-        module: The class to mark (class-decorator form), or the
-            :class:`Module` instance to wrap (call form).
-        name: Subgraph name override. Defaults to the class name.
+        module: The :class:`Module` subclass (class-decorator form) or instance
+            to mark.
+        name: Optional subgraph key. Modules marked with the same name
+            share one subgraph definition; omit it to deduplicate subgraphs
+            based on the module's traced call instead.
 
     Returns:
-        The decorated class (class-decorator form) or a wrapper that emits the
-        ``mo.call`` on each invocation (call form).
+        The same class or instance, marked so :meth:`Module.__call__` lowers
+        each call into a shared subgraph.
+
+    Raises:
+        TypeError: If ``module`` is not a :class:`Module` subclass or instance.
     """
-    if isinstance(module, type):
-        module._is_subgraphable = True  # type: ignore[attr-defined]
+    if (isinstance(module, type) and issubclass(module, Module)) or isinstance(
+        module, Module
+    ):
+        module._is_subgraphable = True
+        module._subgraph_name = name
         return module
 
-    resolved = name if name is not None else type(module).__name__
-
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        return lower_subgraph(resolved, module, args, kwargs)
-
-    return wrapper
+    raise TypeError(
+        "subgraphable expects a Module subclass or instance, got "
+        f"{type(module).__name__}"
+    )
 
 
 def _module_dataclass_rich_repr(self: DataclassInstance):  # noqa: ANN202
@@ -1337,11 +1428,12 @@ def module_dataclass(  # noqa: ANN201
 
     .. code-block:: python
 
+        from max.driver import CPU
         from max.dtype import DType
         from max.experimental import functional as F
         from max.experimental import random
         from max.experimental.nn import Module, Linear, module_dataclass
-        from max.experimental.tensor import Tensor
+        from max.experimental.tensor import Tensor, default_device
         from max.graph import TensorType
 
         @module_dataclass
@@ -1355,26 +1447,21 @@ def module_dataclass(  # noqa: ANN201
                 x = self.fc2(x)
                 return x
 
-        # Create module with automatic parameter tracking
-        mlp = MLP(
-            fc1=Linear(128, 256),
-            fc2=Linear(256, 128)
-        )
+        with default_device(CPU()):
+            mlp = MLP(
+                fc1=Linear(128, 256),
+                fc2=Linear(256, 128)
+            )
 
-        # All parameters are automatically tracked
-        print(dict(mlp.parameters).keys())
-        # {'fc1.weight', 'fc1.bias', 'fc2.weight', 'fc2.bias'}
+            print(dict(mlp.parameters).keys())
 
-        # Run eagerly with a random input.
-        random.set_seed(0)
-        x = random.normal([4, 128], dtype=DType.float32)
-        output = mlp(x)
-        print(output.shape)  # [4, 128]
+            random.set_seed(0)
+            x = random.normal([4, 128], dtype=DType.float32)
+            output = mlp(x)
 
-        # Or compile for optimized execution.
-        input_type = TensorType(DType.float32, ["batch", 128], device=mlp.device)
-        compiled = mlp.compile(input_type)
-        compiled_output = compiled(x)
+            input_type = TensorType(DType.float32, ["batch", 128], device=mlp.device)
+            compiled = mlp.compile(input_type)
+            compiled_output = compiled(x)
 
     .. invisible-code-block: python
 

@@ -146,6 +146,75 @@ def test_throws_if_enable_log_probs() -> None:
         pipeline.execute(inputs)
 
 
+def test_forward_launched_before_sampling_processor_build() -> None:
+    """The non-spec decode path launches the forward before building the sampler.
+
+    ``_run_forward`` enqueues the decode kernels asynchronously, so building the
+    sampling processor afterwards overlaps its host-side work (SamplerInputs
+    gather + small H2D copies) with the GPU forward instead of being exposed
+    host time ahead of the launch. This pins that ordering (a regression guard
+    for the async-overlap optimization) and verifies the two calls remain
+    independent: each runs exactly once and receives the expected argument.
+    """
+    pipeline = OverlapTextGenerationPipeline.__new__(
+        OverlapTextGenerationPipeline
+    )
+    pipeline._spec_decode_state = None
+    pipeline._prev_batch = None
+    pipeline._disable_overlap = False
+    pipeline._kv_manager = MagicMock()
+
+    call_order: list[str] = []
+
+    mock_model_outputs = MagicMock(name="model_outputs")
+    mock_sampling_processor = MagicMock(name="sampling_processor")
+    mock_curr_batch = MagicMock(name="curr_batch")
+
+    def _run_forward(inputs: object) -> object:
+        call_order.append("run_forward")
+        return mock_model_outputs
+
+    def _create_sampling_processor(
+        flat_batch: object,
+    ) -> tuple[object, object]:
+        call_order.append("create_sampling_processor")
+        return mock_sampling_processor, None
+
+    def _sample_logits(
+        inputs: object, model_outputs: object, sampling_processor: object
+    ) -> object:
+        call_order.append("sample_logits")
+        return mock_curr_batch
+
+    pipeline._run_forward = MagicMock(side_effect=_run_forward)  # type: ignore[method-assign]
+    pipeline._create_sampling_processor = MagicMock(  # type: ignore[method-assign]
+        side_effect=_create_sampling_processor
+    )
+    pipeline._sample_logits = MagicMock(side_effect=_sample_logits)  # type: ignore[method-assign]
+
+    mock_ctx = MagicMock(name="ctx")
+    inputs = MagicMock(name="inputs")
+    inputs.enable_log_probs = False
+    inputs.flat_batch = [mock_ctx]
+    inputs.batches = [[mock_ctx]]
+
+    pipeline.execute(cast(TextGenerationInputs[TextContext], inputs))
+
+    # Forward must be enqueued before the sampling processor is built so that
+    # the sampler's host-side construction overlaps the GPU forward.
+    assert call_order == [
+        "run_forward",
+        "create_sampling_processor",
+        "sample_logits",
+    ]
+    pipeline._run_forward.assert_called_once_with(inputs)
+    pipeline._create_sampling_processor.assert_called_once_with(
+        inputs.flat_batch
+    )
+    # Reorder must not clear the deferred (overlapped) current batch.
+    assert pipeline._prev_batch is mock_curr_batch
+
+
 @pytest.mark.parametrize(
     ("config_max_batch_size", "expected_capture_batch_size"),
     [
@@ -175,6 +244,7 @@ def test_warmup_graph_capture_batch_size(
     pipeline._kv_manager.params = mock_kv_params
     pipeline._kv_manager.cache_params.return_value = mock_kv_params
     pipeline._kv_manager._total_num_pages = 100
+    pipeline._kv_manager.effective_max_seq_length = 100 * 128
     pipeline._spec_decode_state = None
     pipeline._kv_manager.num_caches = 1
 
@@ -223,13 +293,14 @@ def _make_effective_cache_length_pipeline(
     mock_kv_params.num_draft_tokens_per_step = num_draft_tokens_per_step
     pipeline._kv_manager.params = mock_kv_params
     pipeline._kv_manager._total_num_pages = total_num_pages
+    pipeline._kv_manager.effective_max_seq_length = total_num_pages * page_size
     return pipeline
 
 
 @pytest.mark.parametrize(
     ("num_draft_tokens", "num_draft_tokens_per_step", "expected_slack"),
     [
-        (0, 1, 0),  # speculative decoding disabled: strict no-op
+        (0, 0, 0),  # speculative decoding disabled: strict no-op
         (3, 1, 10),  # eagle/mtp autoregressive drafts: 3*3 + 0 + 1
         (4, 4, 14),  # dflash block drafts: 3*4 + 1 + 1
     ],
@@ -283,8 +354,10 @@ def test_effective_max_cache_length_covers_compute_seq_len(
     # Worst-case boundary request: committed tokens fill the context window and
     # carry the FUTURE_TOKEN placeholder, with the previous overlap batch's
     # drafts all counted as accepted.
+    tokens = TokenBuffer(np.zeros(max_seq_len + 1, dtype=np.int64))
+    tokens.skip_processing(max_seq_len)
     boundary_ctx = SimpleNamespace(
-        tokens=[0] * (max_seq_len + 1),
+        tokens=tokens,
         spec_decoding_state=SimpleNamespace(
             maybe_accepted_draft_tokens=[0] * num_draft_tokens
         ),
@@ -1050,15 +1123,17 @@ class TestBuildBitmaskCallback:
 
         callback()
 
-        mock_so.advance_fsm_and_compute_bitmasks.assert_called_once_with(
-            context_batch=[ctx],
-            accepted_draft_tokens=draft_np,
-            num_accepted=num_acc_np,
-            bonus_tokens=bonus_np,
-            next_draft_tokens=next_draft_np,
-            bitmask_out=bitmask_np,
-            output_context_batch=[ctx],
-        )
+        mock_so.advance_fsm_and_compute_bitmasks.assert_called_once()
+        kwargs = mock_so.advance_fsm_and_compute_bitmasks.call_args.kwargs
+        assert kwargs["context_batch"] == [ctx]
+        assert kwargs["output_context_batch"] == [ctx]
+        assert kwargs["accepted_draft_tokens"] is draft_np
+        assert kwargs["num_accepted"] is num_acc_np
+        assert kwargs["bonus_tokens"] is bonus_np
+        assert kwargs["next_draft_tokens"] is next_draft_np
+        assert kwargs["bitmask_out"] is bitmask_np
+        # The builder captures the snapshots itself, one per producing row.
+        assert len(kwargs["committed_span_snapshots"]) == 1
 
     def test_callback_logs_error_on_exception(self) -> None:
         """Callback catches exceptions and logs them instead of propagating."""
@@ -1193,6 +1268,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[],
+            curr_verify_width=0,
         )
 
         assert result is False
@@ -1205,6 +1281,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[],
+            curr_verify_width=0,
         )
 
         assert result is False
@@ -1219,6 +1296,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[],
+            curr_verify_width=0,
         )
 
         assert result is False
@@ -1230,7 +1308,7 @@ class TestEnqueuePrevBitmaskCallback:
         for name in (
             "persistent_bonus_tokens_pinned",
             "persistent_num_accepted_pinned",
-            "persistent_accepted_draft_tokens_pinned",
+            "accepted_token_pinned",
             "persistent_next_draft_tokens_pinned",
         ):
             setattr(mock_spec_state, name, MagicMock())
@@ -1239,6 +1317,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[],
+            curr_verify_width=0,
         )
 
         assert result is False
@@ -1250,7 +1329,7 @@ class TestEnqueuePrevBitmaskCallback:
         for name in (
             "persistent_bonus_tokens_pinned",
             "persistent_num_accepted_pinned",
-            "persistent_accepted_draft_tokens_pinned",
+            "accepted_token_pinned",
             "persistent_next_draft_tokens_pinned",
         ):
             setattr(mock_spec_state, name, MagicMock())
@@ -1261,6 +1340,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[],
+            curr_verify_width=0,
         )
 
         assert result is False
@@ -1272,7 +1352,7 @@ class TestEnqueuePrevBitmaskCallback:
         for name in (
             "persistent_bonus_tokens_pinned",
             "persistent_num_accepted_pinned",
-            "persistent_accepted_draft_tokens_pinned",
+            "accepted_token_pinned",
             "persistent_next_draft_tokens_pinned",
         ):
             setattr(mock_spec_state, name, MagicMock())
@@ -1283,6 +1363,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[],
+            curr_verify_width=0,
         )
 
         assert result is False
@@ -1300,7 +1381,7 @@ class TestEnqueuePrevBitmaskCallback:
         for name in (
             "persistent_bonus_tokens_pinned",
             "persistent_num_accepted_pinned",
-            "persistent_accepted_draft_tokens_pinned",
+            "accepted_token_pinned",
             "persistent_next_draft_tokens_pinned",
         ):
             setattr(mock_spec_state, name, MagicMock())
@@ -1319,6 +1400,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[curr_ctx],
+            curr_verify_width=0,
         )
 
         assert result is False
@@ -1352,9 +1434,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         mock_spec_state.persistent_bonus_tokens_pinned = bonus_tokens_pinned
         mock_spec_state.persistent_num_accepted_pinned = num_accepted_pinned
-        mock_spec_state.persistent_accepted_draft_tokens_pinned = (
-            accepted_draft_tokens_pinned
-        )
+        mock_spec_state.accepted_token_pinned = accepted_draft_tokens_pinned
         mock_spec_state.persistent_next_draft_tokens_pinned = (
             next_draft_tokens_pinned
         )
@@ -1401,6 +1481,7 @@ class TestEnqueuePrevBitmaskCallback:
         ):
             result = pipeline._enqueue_prev_bitmask_callback(
                 curr_context_batch=[curr_ctx],
+                curr_verify_width=num_draft,
             )
 
         assert result is True
@@ -1444,9 +1525,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         mock_spec_state.persistent_bonus_tokens_pinned = bonus_tokens_pinned
         mock_spec_state.persistent_num_accepted_pinned = num_accepted_pinned
-        mock_spec_state.persistent_accepted_draft_tokens_pinned = (
-            accepted_draft_tokens_pinned
-        )
+        mock_spec_state.accepted_token_pinned = accepted_draft_tokens_pinned
         mock_spec_state.persistent_next_draft_tokens_pinned = (
             next_draft_tokens_pinned
         )
@@ -1503,6 +1582,7 @@ class TestEnqueuePrevBitmaskCallback:
         ):
             result = pipeline._enqueue_prev_bitmask_callback(
                 curr_context_batch=[curr_ctx],
+                curr_verify_width=num_draft,
             )
 
         assert result is True
@@ -1546,9 +1626,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         mock_spec_state.persistent_bonus_tokens_pinned = bonus_tokens_pinned
         mock_spec_state.persistent_num_accepted_pinned = num_accepted_pinned
-        mock_spec_state.persistent_accepted_draft_tokens_pinned = (
-            accepted_draft_tokens_pinned
-        )
+        mock_spec_state.accepted_token_pinned = accepted_draft_tokens_pinned
         mock_spec_state.persistent_next_draft_tokens_pinned = (
             next_draft_tokens_pinned
         )
@@ -1633,6 +1711,7 @@ class TestEnqueuePrevBitmaskCallback:
 
         result = pipeline._enqueue_prev_bitmask_callback(
             curr_context_batch=[producer, transferred],
+            curr_verify_width=2,
         )
 
         assert result is False
@@ -1676,6 +1755,7 @@ class TestEnqueuePrevBitmaskCallback:
         ):
             result = pipeline._enqueue_prev_bitmask_callback(
                 curr_context_batch=[ctx_a, ctx_b],
+                curr_verify_width=2,
             )
 
         assert result is True
@@ -1709,6 +1789,7 @@ class TestEnqueuePrevBitmaskCallback:
         ):
             result = pipeline._enqueue_prev_bitmask_callback(
                 curr_context_batch=[producer, padding],
+                curr_verify_width=2,
             )
 
         assert result is True
@@ -2122,7 +2203,7 @@ class TestAssignBitmaskInputs:
 
         structured_output.compute_speculative_bitmasks.assert_not_called()
         overlap_state.prime.assert_not_called()
-        mock_device.default_stream.synchronize.assert_not_called()
+        mock_device.default_queue.synchronize.assert_not_called()
         assert spec_state.has_precomputed_bitmask is False
         # Views from get_input_views are wired to model_inputs.
         overlap_state.get_input_views.assert_called_once_with(2, self._NUM_POS)
@@ -2157,7 +2238,7 @@ class TestAssignBitmaskInputs:
             num_draft_tokens_to_verify=self._K,
         )
 
-        mock_device.default_stream.synchronize.assert_not_called()
+        mock_device.default_queue.synchronize.assert_not_called()
         structured_output.compute_speculative_bitmasks.assert_called_once()
         overlap_state.prime.assert_called_once()
         assert spec_state.has_precomputed_bitmask is False

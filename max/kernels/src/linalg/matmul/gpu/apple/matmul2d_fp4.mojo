@@ -59,14 +59,15 @@ The NVFP4 per-tensor `weight_scale_2` scalar folds in OUTSIDE the kernel (a
 post-matmul multiply by the graph lowering), identically to the committed path.
 """
 
-from std.gpu import WARP_SIZE, barrier, block_idx, lane_id, thread_idx
-from std.gpu.compute.arch.mma_apple import _mma_apple_transposable
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
-from std.memory import stack_allocation
+from max.gpu import WARP_SIZE, block_idx, lane_id, thread_idx
+from std.math import ceildiv
+from max.gpu.sync import barrier
+from max.gpu.compute.arch.mma_apple import _mma_apple_transposable
+from max.gpu.host import DeviceContext
+from std.memory import unsafe_stack_allocation
 from std.utils import IndexList
 
-from layout import TileTensor, Idx
+from layout import Idx, TensorEngine, TileTensor
 from layout.coord import Coord
 from layout.tile_layout import Layout, TensorLayout
 
@@ -115,21 +116,38 @@ def _require_apple_m5(ctx: DeviceContext) raises:
 
 @always_inline
 def frag_row_base(lane: Int) -> Int:
-    """Base MMA-tile row for `lane` (before the per-element row jump)."""
+    """Base MMA-tile row for `lane` (before the per-element row jump).
+
+    Args:
+        lane: Simdgroup lane index in `[0, 32)`; determines the lane's base
+            row in the 16x16 MMA tile.
+    """
     var qid = lane >> 2
     return (qid & 4) | ((lane >> 1) & 3)
 
 
 @always_inline
 def frag_col_base(lane: Int) -> Int:
-    """Base MMA-tile column for `lane` (before the per-element col offset)."""
+    """Base MMA-tile column for `lane` (before the per-element col offset).
+
+    Args:
+        lane: Simdgroup lane index in `[0, 32)`; determines the lane's base
+            column in the 16x16 MMA tile.
+    """
     var qid = lane >> 2
     return ((qid & 2) | (lane & 1)) * 4
 
 
 @always_inline
 def a_frag_coord(lane: Int, i: Int) -> IndexList[2]:
-    """(row, col) in the 16x16 A tile for this lane's A element `i` (0..7)."""
+    """(row, col) in the 16x16 A tile for this lane's A element `i` (0..7).
+
+    Args:
+        lane: Simdgroup lane index in `[0, 32)`; determines the lane's base
+            `(row, col)` in the 16x16 A tile.
+        i: A-fragment element index in `[0, 8)`; selects which of this lane's
+            8 held A elements to map to `(row, col)`.
+    """
     return IndexList[2](
         frag_row_base(lane) + (i >> 2) * 8, frag_col_base(lane) + (i % 4)
     )
@@ -137,7 +155,14 @@ def a_frag_coord(lane: Int, i: Int) -> IndexList[2]:
 
 @always_inline
 def bc_frag_coord(lane: Int, i: Int) -> IndexList[2]:
-    """(row, col) in the 16x32 B/C tile for this lane's element `i` (0..15)."""
+    """(row, col) in the 16x32 B/C tile for this lane's element `i` (0..15).
+
+    Args:
+        lane: Simdgroup lane index in `[0, 32)`; determines the lane's base
+            `(row, col)` in the 16x32 B/C tile.
+        i: B/C-fragment element index in `[0, 16)`; selects which of this
+            lane's 16 held B/C elements to map to `(row, col)`.
+    """
     var half = i // 8
     var sub = i % 8
     return IndexList[2](
@@ -159,6 +184,12 @@ def bt_frag_coord(lane: Int, i: Int) -> IndexList[2]:
     B gather). The C-store map is UNCHANGED (`bc_frag_coord`); transpose_right
     permutes only the right operand, not C. Matched bit-exact against a host
     oracle.
+
+    Args:
+        lane: Simdgroup lane index in `[0, 32)`; determines the lane's base
+            `(n, k)` in the 16x32 right operand.
+        i: B-fragment element index in `[0, 16)`; selects which of this lane's
+            16 held B elements to map to `(n, k)` under `transpose_right=1`.
     """
     var half = i // 8
     var sub = i % 8
@@ -170,9 +201,9 @@ def bt_frag_coord(lane: Int, i: Int) -> IndexList[2]:
 
 @always_inline
 def matmul2d_mma_regc_bt_native(
-    a_frag: SIMD[DType.bfloat16, 8],
-    b_frag: SIMD[DType.bfloat16, 16],
-    mut c_acc: SIMD[DType.float32, 16],
+    a_frag: SIMD[.bfloat16, 8],
+    b_frag: SIMD[.bfloat16, 16],
+    mut c_acc: SIMD[.float32, 16],
 ):
     """Pure-Mojo `transpose_right=1` 16x32x16 MMA (native `simdgroup_matrix`).
 
@@ -199,7 +230,7 @@ def matmul2d_mma_regc_bt_native(
             elements 0-7 = N 0..15, 8-15 = N 16..31).
         c_acc: This lane's 16-element C accumulator, updated in place.
     """
-    var d_lo = SIMD[DType.float32, 8](0)
+    var d_lo = SIMD[.float32, 8](0)
     _mma_apple_transposable(
         d_lo,
         a_frag,
@@ -208,7 +239,7 @@ def matmul2d_mma_regc_bt_native(
         False,
         True,
     )
-    var d_hi = SIMD[DType.float32, 8](0)
+    var d_hi = SIMD[.float32, 8](0)
     _mma_apple_transposable(
         d_hi,
         a_frag,
@@ -245,10 +276,17 @@ def matmul2d_mma_regc_bt_native(
 
 @fieldwise_init
 struct Fp4WeightLoader[
+    a_origin: ImmOrigin,
+    packed_origin: ImmOrigin,
+    scale_origin: ImmOrigin,
+    //,
     in_type: DType,
     a_layout: TensorLayout,
     packed_layout: TensorLayout,
     scale_layout: TensorLayout,
+    a_engine: TensorEngine,
+    packed_engine: TensorEngine,
+    scale_engine: TensorEngine,
 ](ImplicitlyCopyable, Movable):
     """Owner of the packed-FP4 weight -> dequant -> {register B | SMEM} transition.
 
@@ -256,29 +294,44 @@ struct Fp4WeightLoader[
     plus the `(M, N, K)` geometry, and exposes bounds-aware loads that do all
     addressing via TileTensor indexing (`t[i, j][0]`) and width-loads
     (`t.load[width=W](Coord(...))`) -- no raw pointer arithmetic. `in_type` is
-    the dequant target (bf16). Views are held with `AnyOrigin` (the kernel args
-    outlive the K-loop; this loader is a local, not a struct field, so the
-    field-origin restriction does not apply).
+    the dequant target (bf16). Each view's origin and engine are
+    inferred struct parameters, so the kernel args are held exactly as passed.
 
     Parameters:
+        a_origin: Origin of the activation view (inferred).
+        packed_origin: Origin of the packed weight view (inferred).
+        scale_origin: Origin of the block scales view (inferred).
         in_type: Dequant + activation dtype (bf16).
         a_layout: Layout of the activation `(M, K)` view.
         packed_layout: Layout of the packed weight `(N, K//2)` view.
         scale_layout: Layout of the block scales `(N, ceil(K/16))` view.
+        a_engine: `TensorEngine` of the activation view.
+        packed_engine: `TensorEngine` of the packed weight view.
+        scale_engine: `TensorEngine` of the block scales view.
     """
 
     comptime SF = NVFP4_SF_VECTOR_SIZE  # 16
 
-    # Held with `ImmutUntrackedOrigin`: struct fields cannot expose `AnyOrigin`
-    # (same field-origin rule as `DenseALoader` in `matmul_kernel.mojo`). The
-    # kernel args these views derive from outlive the K-loop, so the explicit-
-    # lifetime case applies. Constructed via `Fp4WeightLoader.from_kernel_args`.
-    var a: TileTensor[Self.in_type, Self.a_layout, ImmutUntrackedOrigin]
+    # The origins are struct parameters because a field may not spell an
+    # any-origin directly (same rule `Int8DequantWriter` parameterizes around).
+    # The kernel args they bind to outlive the K-loop.
+    var a: TileTensor[
+        Self.in_type,
+        Self.a_layout,
+        Self.a_origin,
+        Engine=Self.a_engine,
+    ]
     var packed: TileTensor[
-        DType.uint8, Self.packed_layout, ImmutUntrackedOrigin
+        .uint8,
+        Self.packed_layout,
+        Self.packed_origin,
+        Engine=Self.packed_engine,
     ]
     var scales: TileTensor[
-        DType.float8_e4m3fn, Self.scale_layout, ImmutUntrackedOrigin
+        .float8_e4m3fn,
+        Self.scale_layout,
+        Self.scale_origin,
+        Engine=Self.scale_engine,
     ]
     var M: Int
     var N: Int
@@ -287,10 +340,20 @@ struct Fp4WeightLoader[
     @always_inline
     @staticmethod
     def from_kernel_args(
-        a: TileTensor[Self.in_type, Self.a_layout, ImmutAnyOrigin],
-        packed: TileTensor[DType.uint8, Self.packed_layout, ImmutAnyOrigin],
+        a: TileTensor[
+            Self.in_type, Self.a_layout, Self.a_origin, Engine=Self.a_engine
+        ],
+        packed: TileTensor[
+            .uint8,
+            Self.packed_layout,
+            Self.packed_origin,
+            Engine=Self.packed_engine,
+        ],
         scales: TileTensor[
-            DType.float8_e4m3fn, Self.scale_layout, ImmutAnyOrigin
+            .float8_e4m3fn,
+            Self.scale_layout,
+            Self.scale_origin,
+            Engine=Self.scale_engine,
         ],
         M: Int,
         N: Int,
@@ -298,25 +361,21 @@ struct Fp4WeightLoader[
     ) -> Self:
         """Build the loader from the kernel's `AnyOrigin` tensor args.
 
-        Rebases each view onto `ImmutUntrackedOrigin` (the field-origin rule; the
-        args outlive the K-loop), preserving layout/shape/stride.
+        The fields carry the args' own origin and engine, so each view
+        is held as passed -- no origin cast, and any engine carries
+        through unchanged.
+
+        Args:
+            a: Bf16 activation `TileTensor` view with shape `(M, K)`.
+            packed: Packed FP4 weight `TileTensor` view with shape `(N, K//2)`
+                (uint8, lo-nibble first).
+            scales: FP8-E4M3 block-scale `TileTensor` view with shape
+                `(N, ceil(K/16))`.
+            M: Number of rows in the activation and the output.
+            N: Number of columns in the output and rows of the weight.
+            K: Reduction dimension; inner size of `a` and the weight.
         """
-        return Self(
-            TileTensor(
-                a.ptr.unsafe_origin_cast[ImmutUntrackedOrigin](), a.layout
-            ),
-            TileTensor(
-                packed.ptr.unsafe_origin_cast[ImmutUntrackedOrigin](),
-                packed.layout,
-            ),
-            TileTensor(
-                scales.ptr.unsafe_origin_cast[ImmutUntrackedOrigin](),
-                scales.layout,
-            ),
-            M,
-            N,
-            K,
-        )
+        return Self(a, packed, scales, M, N, K)
 
     @always_inline
     def load_a_frag[
@@ -325,7 +384,7 @@ struct Fp4WeightLoader[
         self,
         arow0: Int,
         k0: Int,
-        a_rc: InlineArray[IndexList[2], 8],
+        a_rc: Array[IndexList[2], 8],
     ) -> SIMD[
         Self.in_type, 8
     ]:
@@ -337,6 +396,15 @@ struct Fp4WeightLoader[
         `M` zero-fill -- the ragged-M A over-read fix (a zero A element multiplies
         into nothing, matching the dense reference). K is always in-bounds
         (callers pass K % 16 == 0 tile-aligned strips).
+
+        Parameters:
+            bounded: Whether to bounds-check rows against `M` (edge tile).
+
+        Args:
+            arow0: Absolute M-origin (row) of the 16x16 A tile.
+            k0: Absolute K-origin of the current K strip (a multiple of 16).
+            a_rc: This lane's per-element `(row, col)` coords in the A tile
+                (the `_apple_frag_layout` map, 8 entries).
         """
         var v = SIMD[Self.in_type, 8](0)
         comptime for i in range(8):
@@ -365,6 +433,15 @@ struct Fp4WeightLoader[
         FP8 block scale. All addressing is TileTensor width-loads / indexing.
         Interior fast path: callers pass tile-aligned N and K % 16 == 0, so the
         4 N-rows and the K run are always in-bounds.
+
+        Args:
+            bcol0: Absolute N-origin of the simdgroup's 16x32 B tile in the
+                packed weight.
+            k0: Absolute K-origin of the current K strip (a multiple of 16).
+            rb: This lane's base N-row offset within the B tile
+                (`frag_row_base(lane)`, range 0..7).
+            cb: This lane's base K-column offset within the 16x16 sub-fragment
+                (`frag_col_base(lane)`, a multiple of 4).
         """
         var v = SIMD[Self.in_type, 16](0)
         comptime for blk in range(4):
@@ -376,14 +453,14 @@ struct Fp4WeightLoader[
                 Coord(n_abs, k_abs0 // 2)
             )
             var pw = UInt16(two[0]) | (UInt16(two[1]) << UInt16(8))
-            var nib = SIMD[DType.uint16, 4](0)
+            var nib = SIMD[.uint16, 4](0)
             nib[0] = pw & UInt16(0xF)  # k+0 (lo)
             nib[1] = (pw >> UInt16(4)) & UInt16(0xF)  # k+1 (hi)
             nib[2] = (pw >> UInt16(8)) & UInt16(0xF)  # k+2 (lo)
             nib[3] = (pw >> UInt16(12)) & UInt16(0xF)  # k+3 (hi)
             # One block scale for all 4 K (cb+3 < 16 -> same 16-block).
             var scale_abs = abs(
-                self.scales[n_abs, k_abs0 // Self.SF][0].cast[DType.float32]()
+                self.scales[n_abs, k_abs0 // Self.SF][0].cast[.float32]()
             )
             var dec = (decode_e2m1_to_f32(nib) * scale_abs).cast[Self.in_type]()
             comptime for e in range(4):
@@ -394,6 +471,7 @@ struct Fp4WeightLoader[
     def decode_strip_to_smem[
         b_view_origin: Origin[mut=True],
         b_view_layout: TensorLayout,
+        b_view_engine: TensorEngine,
         b_view_addr: AddressSpace,
         //,
         bytes_per_thread: Int,
@@ -404,6 +482,7 @@ struct Fp4WeightLoader[
             Self.in_type,
             b_view_layout,
             b_view_origin,
+            Engine=b_view_engine,
             address_space=b_view_addr,
         ],
         n_abs: Int,
@@ -421,25 +500,47 @@ struct Fp4WeightLoader[
         single TileTensor width-load; the SMEM write is a TileTensor width-store
         into `b_view` (no raw pointer arithmetic). All-in-bounds interior strip
         (callers pass tile-aligned N, K % BK == 0).
+
+        Parameters:
+            b_view_origin: Origin of the `b_view` SMEM store target.
+            b_view_layout: Layout of the `b_view` SMEM store target.
+            b_view_engine: `TensorEngine` of the `b_view` SMEM store target.
+            b_view_addr: Address space of the `b_view` SMEM store target.
+            bytes_per_thread: Packed bytes this thread loads in one width-load
+                (each byte yields two bf16 columns).
+            cols_per_thread: Number of bf16 columns this thread decodes and
+                stores (`2 * bytes_per_thread`; must be <= 16 for one scale
+                block).
+
+        Args:
+            b_view: SMEM `TileTensor` view of the `(BN, BK)` decoded weight
+                strip to store into.
+            n_abs: Absolute N-row index in the packed weight for this thread's
+                strip (threadgroup N-origin + local row).
+            n_local: Local N-row index within the `b_view` strip (the SMEM
+                store coordinate).
+            k0: Absolute K-origin of the current strip (a multiple of `BK`).
+            col0: First bf16 column this thread decodes in its row's strip
+                (a multiple of `COLS_PER_THREAD`).
         """
         var byte0 = col0 // 2  # first packed byte in this row's strip
         var bytes = self.packed.load[width=bytes_per_thread, alignment=1](
             Coord(n_abs, (k0 // 2) + byte0)
         )
-        var nib = SIMD[DType.uint16, cols_per_thread](0)
+        var nib = SIMD[.uint16, cols_per_thread](0)
         comptime for j in range(bytes_per_thread):
             var bj = UInt16(bytes[j])
             nib[2 * j] = bj & UInt16(0xF)
             nib[2 * j + 1] = (bj >> UInt16(4)) & UInt16(0xF)
         var scale_abs = abs(
-            self.scales[n_abs, (k0 + col0) // Self.SF][0].cast[DType.float32]()
+            self.scales[n_abs, (k0 + col0) // Self.SF][0].cast[.float32]()
         )
         var dec = (decode_e2m1_to_f32(nib) * scale_abs).cast[Self.in_type]()
         b_view.store[width=cols_per_thread](Coord(n_local, col0), dec)
 
 
 struct Matmul2dFp4[
-    c_type: DType = DType.float32,
+    c_type: DType = .float32,
     elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
     num_sg_m: Int = 2,
     num_sg_n: Int = 2,
@@ -509,18 +610,50 @@ struct Matmul2dFp4[
         a_layout: TensorLayout,
         packed_layout: TensorLayout,
         scale_layout: TensorLayout,
+        c_engine: TensorEngine,
+        a_engine: TensorEngine,
+        packed_engine: TensorEngine,
+        scale_engine: TensorEngine,
     ](
-        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin],
-        a: TileTensor[Self.in_type, a_layout, ImmutAnyOrigin],
-        packed: TileTensor[DType.uint8, packed_layout, ImmutAnyOrigin],
-        scales: TileTensor[DType.float8_e4m3fn, scale_layout, ImmutAnyOrigin],
-        M: Int,
-        N: Int,
-        K: Int,
+        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Engine=c_engine],
+        a: TileTensor[Self.in_type, a_layout, ImmutAnyOrigin, Engine=a_engine],
+        packed: TileTensor[
+            .uint8, packed_layout, ImmutAnyOrigin, Engine=packed_engine
+        ],
+        scales: TileTensor[
+            .float8_e4m3fn, scale_layout, ImmutAnyOrigin, Engine=scale_engine
+        ],
+        M_arg: Int32,
+        N_arg: Int32,
+        K_arg: Int32,
     ):
         """W4A16 kernel entry. C `(M, N)`, A `(M, K)` bf16, packed `(N, K//2)`,
         scales `(N, ceil(K/16))`. Interior fast path (tile-aligned N, K%16==0).
+
+        Parameters:
+            c_layout: Layout of the output `C` `(M, N)` view.
+            a_layout: Layout of the activation `A` `(M, K)` view.
+            packed_layout: Layout of the packed FP4 weight `(N, K//2)` view.
+            scale_layout: Layout of the block scales `(N, ceil(K/16))` view.
+            c_engine: `TensorEngine` of the output `C` view.
+            a_engine: `TensorEngine` of the activation `A` view.
+            packed_engine: `TensorEngine` of the packed FP4 weight view.
+            scale_engine: `TensorEngine` of the block scales view.
+
+        Args:
+            c: Output `TileTensor` view with shape `(M, N)`.
+            a: Bf16 activation `TileTensor` view with shape `(M, K)`.
+            packed: Packed FP4 weight `TileTensor` view with shape `(N, K//2)`
+                (uint8, lo-nibble first).
+            scales: FP8-E4M3 block-scale `TileTensor` view with shape
+                `(N, ceil(K/16))`.
+            M_arg: Number of rows in the activation and the output.
+            N_arg: Number of columns in the output and rows of the weight.
+            K_arg: Reduction dimension; inner size of `a` and the weight.
         """
+        var M = Int(M_arg)
+        var N = Int(N_arg)
+        var K = Int(K_arg)
         var lane = Int(lane_id())
         var sg_id = Int(thread_idx.x) // WARP_SIZE
         var sg_m = sg_id // Self.num_sg_n
@@ -534,13 +667,17 @@ struct Matmul2dFp4[
         )
 
         # A frag: base map. B frag: transpose_right map (n, k) w/ k contiguous.
-        var a_rc = InlineArray[IndexList[2], 8](uninitialized=True)
-        comptime for i in range(8):
-            a_rc[i] = a_frag_coord(lane, i)
+        var a_rc = Array[_, 8](
+            fill_with_unrolled=lambda [i: Int]() -> IndexList[2]: a_frag_coord(
+                lane, i
+            )
+        )
         # C store: UNCHANGED base bc map (transpose_right permutes only B).
-        var c_rc = InlineArray[IndexList[2], 16](uninitialized=True)
-        comptime for i in range(16):
-            c_rc[i] = bc_frag_coord(lane, i)
+        var c_rc = Array[_, 16](
+            fill_with_unrolled=lambda [i: Int]() -> IndexList[2]: bc_frag_coord(
+                lane, i
+            )
+        )
 
         # This lane's fragment (n, k) base for the transpose_right B map. The 16
         # B-frag elements are 4 N-rows x 4 contiguous K, one 2-byte packed load +
@@ -551,21 +688,16 @@ struct Matmul2dFp4[
         # The FP4 decode / A-gather owner: all packed/scale/A addressing goes
         # through it via TileTensor indexing (no raw pointer arithmetic).
         var loader = Fp4WeightLoader[
-            Self.in_type, a_layout, packed_layout, scale_layout
+            Self.in_type,
+            a_layout,
+            packed_layout,
+            scale_layout,
+            a_engine,
+            packed_engine,
+            scale_engine,
         ].from_kernel_args(a, packed, scales, M, N, K)
 
-        var accs = InlineArray[SIMD[DType.float32, 16], Self.tm * Self.tn](
-            uninitialized=True
-        )
-        comptime for t in range(Self.tm * Self.tn):
-            accs[t] = SIMD[DType.float32, 16](0)
-
-        var a_frag = InlineArray[SIMD[DType.bfloat16, 8], Self.tm](
-            uninitialized=True
-        )
-        var b_frag = InlineArray[SIMD[DType.bfloat16, 16], Self.tn](
-            uninitialized=True
-        )
+        var accs = Array[_, Self.tm * Self.tn](fill=SIMD[.float32, 16](0))
 
         var k0 = 0
         while k0 < K:
@@ -574,14 +706,22 @@ struct Matmul2dFp4[
             # zero-fill them (the ragged-M A over-read fix) rather than reading
             # OOB. (The reg `run` is the test-only path; the deep-K production
             # path is `run_smem_decode` below.)
-            comptime for im in range(Self.tm):
-                var arow = sg_row0 + im * Self.MMA_M
-                a_frag[im] = loader.load_a_frag[bounded=True](arow, k0, a_rc)
+            var a_frag = Array[_, Self.tm](
+                fill_with_unrolled=lambda [im: Int]() -> SIMD[
+                    .bfloat16, 8
+                ]: loader.load_a_frag[bounded=True](
+                    sg_row0 + im * Self.MMA_M, k0, a_rc
+                )
+            )
 
             # B fragments: decode packed FP4 -> bf16, K-contiguous (coalesced).
-            comptime for jn in range(Self.tn):
-                var bcol0 = sg_col0 + jn * Self.MMA_N
-                b_frag[jn] = loader.decode_b_frag_regc(bcol0, k0, rb, cb)
+            var b_frag = Array[_, Self.tn](
+                fill_with_unrolled=lambda [jn: Int]() -> SIMD[
+                    .bfloat16, 16
+                ]: loader.decode_b_frag_regc(
+                    sg_col0 + jn * Self.MMA_N, k0, rb, cb
+                )
+            )
 
             comptime for im in range(Self.tm):
                 comptime for jn in range(Self.tn):
@@ -612,14 +752,22 @@ struct Matmul2dFp4[
         a_layout: TensorLayout,
         packed_layout: TensorLayout,
         scale_layout: TensorLayout,
+        c_engine: TensorEngine,
+        a_engine: TensorEngine,
+        packed_engine: TensorEngine,
+        scale_engine: TensorEngine,
     ](
-        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin],
-        a: TileTensor[Self.in_type, a_layout, ImmutAnyOrigin],
-        packed: TileTensor[DType.uint8, packed_layout, ImmutAnyOrigin],
-        scales: TileTensor[DType.float8_e4m3fn, scale_layout, ImmutAnyOrigin],
-        M: Int,
-        N: Int,
-        K: Int,
+        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Engine=c_engine],
+        a: TileTensor[Self.in_type, a_layout, ImmutAnyOrigin, Engine=a_engine],
+        packed: TileTensor[
+            .uint8, packed_layout, ImmutAnyOrigin, Engine=packed_engine
+        ],
+        scales: TileTensor[
+            .float8_e4m3fn, scale_layout, ImmutAnyOrigin, Engine=scale_engine
+        ],
+        M_arg: Int32,
+        N_arg: Int32,
+        K_arg: Int32,
     ):
         """Cooperative-decode W4A16: coalesced FP4 decode -> SMEM -> register B.
 
@@ -640,7 +788,31 @@ struct Matmul2dFp4[
         from DRAM (base map, K contiguous). Bit-exact vs `run` / the materialize
         oracle (same `decode_e2m1_to_f32 * |scale|`, same MMA), modulo the fp32
         MMA reduction order (identical to `run`, so bit-exact vs `run`).
+
+        Parameters:
+            c_layout: Layout of the output `C` `(M, N)` view.
+            a_layout: Layout of the activation `A` `(M, K)` view.
+            packed_layout: Layout of the packed FP4 weight `(N, K//2)` view.
+            scale_layout: Layout of the block scales `(N, ceil(K/16))` view.
+            c_engine: `TensorEngine` of the output `C` view.
+            a_engine: `TensorEngine` of the activation `A` view.
+            packed_engine: `TensorEngine` of the packed FP4 weight view.
+            scale_engine: `TensorEngine` of the block scales view.
+
+        Args:
+            c: Output `TileTensor` view with shape `(M, N)`.
+            a: Bf16 activation `TileTensor` view with shape `(M, K)`.
+            packed: Packed FP4 weight `TileTensor` view with shape `(N, K//2)`
+                (uint8, lo-nibble first).
+            scales: FP8-E4M3 block-scale `TileTensor` view with shape
+                `(N, ceil(K/16))`.
+            M_arg: Number of rows in the activation and the output.
+            N_arg: Number of columns in the output and rows of the weight.
+            K_arg: Reduction dimension; inner size of `a` and the weight.
         """
+        var M = Int(M_arg)
+        var N = Int(N_arg)
+        var K = Int(K_arg)
         comptime BN = Self.BN
         comptime BK = Self.BK
         comptime SF = Self.SF
@@ -668,40 +840,41 @@ struct Matmul2dFp4[
         # TileTensor view so the cooperative decode store and the per-SG B read
         # are TileTensor indexed (`b_view[n, col]`), in-bounds by construction --
         # no raw SMEM pointer arithmetic.
-        var b_sm = stack_allocation[
-            BN * BK, Scalar[Self.in_type], address_space=AddressSpace.SHARED
+        var b_sm = unsafe_stack_allocation[
+            BN * BK, Scalar[Self.in_type], address_space=.SHARED
         ]()
         var b_view = TileTensor(b_sm, Layout(Coord(BN, BK), Coord(BK, Idx[1])))
 
-        var a_rc = InlineArray[IndexList[2], 8](uninitialized=True)
-        comptime for i in range(8):
-            a_rc[i] = a_frag_coord(lane, i)
+        var a_rc = Array[_, 8](
+            fill_with_unrolled=lambda [i: Int]() -> IndexList[2]: a_frag_coord(
+                lane, i
+            )
+        )
         # B fragment (n, k) local coords under transpose_right; k contiguous.
-        var b_nk = InlineArray[IndexList[2], 16](uninitialized=True)
-        comptime for i in range(16):
-            b_nk[i] = bt_frag_coord(lane, i)
-        var c_rc = InlineArray[IndexList[2], 16](uninitialized=True)
-        comptime for i in range(16):
-            c_rc[i] = bc_frag_coord(lane, i)
+        var b_nk = Array[_, 16](
+            fill_with_unrolled=lambda [i: Int]() -> IndexList[2]: bt_frag_coord(
+                lane, i
+            )
+        )
+        var c_rc = Array[_, 16](
+            fill_with_unrolled=lambda [i: Int]() -> IndexList[2]: bc_frag_coord(
+                lane, i
+            )
+        )
 
         # The FP4 decode / A-gather owner: all packed/scale/A/SMEM addressing
         # goes through it via TileTensor indexing (no raw pointer arithmetic).
         var loader = Fp4WeightLoader[
-            Self.in_type, a_layout, packed_layout, scale_layout
+            Self.in_type,
+            a_layout,
+            packed_layout,
+            scale_layout,
+            a_engine,
+            packed_engine,
+            scale_engine,
         ].from_kernel_args(a, packed, scales, M, N, K)
 
-        var accs = InlineArray[SIMD[DType.float32, 16], Self.tm * Self.tn](
-            uninitialized=True
-        )
-        comptime for t in range(Self.tm * Self.tn):
-            accs[t] = SIMD[DType.float32, 16](0)
-
-        var a_frag = InlineArray[SIMD[DType.bfloat16, 8], Self.tm](
-            uninitialized=True
-        )
-        var b_frag = InlineArray[SIMD[DType.bfloat16, 16], Self.tn](
-            uninitialized=True
-        )
+        var accs = Array[_, Self.tm * Self.tn](fill=SIMD[.float32, 16](0))
 
         # This thread's cooperative-decode slot: N-row + contiguous byte-run.
         var dec_nrow = tid // THREADS_PER_ROW
@@ -718,7 +891,7 @@ struct Matmul2dFp4[
         var is_m_edge = tg_m_end > M
 
         @always_inline
-        @parameter
+        @__parameter
         def _kloop[bounded: Bool]():
             var k0 = 0
             while k0 < K:
@@ -731,20 +904,26 @@ struct Matmul2dFp4[
                 # ---- per-SG: read tn register B frags from SMEM, matmul2d ----
                 var ks = 0
                 while ks < BK:
-                    comptime for im in range(Self.tm):
-                        var arow = sg_row0 + im * Self.MMA_M
-                        a_frag[im] = loader.load_a_frag[bounded=bounded](
-                            arow, k0 + ks, a_rc
+                    var a_frag = Array[_, Self.tm](
+                        fill_with_unrolled=lambda [im: Int]() -> SIMD[
+                            Self.in_type, 8
+                        ]: loader.load_a_frag[bounded=bounded](
+                            sg_row0 + im * Self.MMA_M, k0 + ks, a_rc
                         )
-                    comptime for jn in range(Self.tn):
+                    )
+
+                    def b_frag_at[jn: Int]() {imm} -> SIMD[Self.in_type, 16]:
                         # SG's N-subtile within the (BN) strip.
                         var n_local0 = (sg_n * Self.tn + jn) * Self.MMA_N
-                        var v = SIMD[DType.bfloat16, 16](0)
+                        var v = SIMD[Self.in_type, 16](0)
                         comptime for i in range(16):
                             var nl = n_local0 + b_nk[i][0]  # local N in [0, BN)
                             var kl = ks + b_nk[i][1]  # local K in [0, BK)
                             v[i] = b_view[nl, kl][0]
-                        b_frag[jn] = v
+                        return v
+
+                    var b_frag = Array[_, Self.tn](fill_with_unrolled=b_frag_at)
+
                     comptime for im in range(Self.tm):
                         comptime for jn in range(Self.tn):
                             comptime t = im * Self.tn + jn
@@ -779,7 +958,7 @@ struct Matmul2dFp4[
 
 @always_inline
 def enqueue_matmul2d_fp4[
-    c_type: DType = DType.float32,
+    c_type: DType = .float32,
     elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
     num_sg_m: Int = 2,
     num_sg_n: Int = 2,
@@ -787,9 +966,9 @@ def enqueue_matmul2d_fp4[
     tn: Int = 2,
 ](
     c: TileTensor[mut=True, c_type, ...],
-    a: TileTensor[DType.bfloat16, ...],
-    packed: TileTensor[DType.uint8, ...],
-    scales: TileTensor[DType.float8_e4m3fn, ...],
+    a: TileTensor[.bfloat16, ...],
+    packed: TileTensor[.uint8, ...],
+    scales: TileTensor[.float8_e4m3fn, ...],
     ctx: DeviceContext,
 ) raises:
     """Enqueue the `matmul2d` W4A16 GEMM: `out = a @ dequant(packed, scales)^T`.
@@ -802,6 +981,26 @@ def enqueue_matmul2d_fp4[
 
     The 16x32x16 MMA is the native `matmul2d_mma_regc_bt_native` tiling (two
     `_mma_apple_transposable` calls); pure Mojo over `_mma_apple`.
+
+    Parameters:
+        c_type: Output element type; one of `fp16`, `bf16`, `fp32` (defaults
+            to `float32`). Accumulation is fp32.
+        elementwise_lambda_fn: Optional fused epilogue applying a per-element
+            transform to the output (defaults to `None`).
+        num_sg_m: Simdgroup rows per threadgroup (defaults to 2).
+        num_sg_n: Simdgroup cols per threadgroup (defaults to 2).
+        tm: Output 16x32 tiles per simdgroup along M (defaults to 2).
+        tn: Output 16x32 tiles per simdgroup along N (defaults to 2).
+            `tm*tn == 4` is the M5 register-cliff optimum.
+
+    Args:
+        c: Output `TileTensor` view with shape `(M, N)`.
+        a: Bf16 activation `TileTensor` view with shape `(M, K)`.
+        packed: Packed FP4 weight `TileTensor` view with shape `(N, K//2)`
+            (uint8, lo-nibble first).
+        scales: FP8-E4M3 block-scale `TileTensor` view with shape
+            `(N, ceil(K/16))`.
+        ctx: Device context used to enqueue the kernel.
 
     Raises:
         If the attached GPU is not Apple M5 (`compute_capability == 5`).
@@ -828,9 +1027,7 @@ def enqueue_matmul2d_fp4[
         )
 
     comptime assert (
-        c_type == DType.float16
-        or c_type == DType.bfloat16
-        or c_type == DType.float32
+        c_type == .float16 or c_type == .bfloat16 or c_type == .float32
     ), "enqueue_matmul2d_fp4: c_type must be one of {fp16, bf16, fp32}"
 
     var m = Int(c.dim[0]())
@@ -842,23 +1039,27 @@ def enqueue_matmul2d_fp4[
     debug_assert(Int(packed.dim[1]()) == k // 2, "packed must be (N, K//2)")
     debug_assert(Int(scales.dim[0]()) == n, "scales must be (N, ceil(K/16))")
 
-    var grid_m = (m + MM.TG_M - 1) // MM.TG_M
-    var grid_n = (n + MM.TG_N - 1) // MM.TG_N
+    var grid_m = ceildiv(m, MM.TG_M)
+    var grid_n = ceildiv(n, MM.TG_N)
 
     comptime kernel = MM.run[
         type_of(c).LayoutType,
         type_of(a).LayoutType,
         type_of(packed).LayoutType,
         type_of(scales).LayoutType,
+        type_of(c).Engine,
+        type_of(a).Engine,
+        type_of(packed).Engine,
+        type_of(scales).Engine,
     ]
     ctx.enqueue_function[kernel](
         c,
         a.as_immut(),
         packed.as_immut(),
         scales.as_immut(),
-        m,
-        n,
-        k,
+        Int32(m),
+        Int32(n),
+        Int32(k),
         grid_dim=(grid_n, grid_m),
         block_dim=(MM.THREADS_PER_BLOCK),
     )
@@ -866,7 +1067,7 @@ def enqueue_matmul2d_fp4[
 
 @always_inline
 def enqueue_matmul2d_fp4_smem[
-    c_type: DType = DType.float32,
+    c_type: DType = .float32,
     elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
     # Production default = the M5-Max-tuned geometry: 16 simdgroups (512 threads)
     # sharing a NARROW BN=32 decoded B tile (tm=4, tn=1) with a DEEP smem_bk=256
@@ -889,9 +1090,9 @@ def enqueue_matmul2d_fp4_smem[
     smem_bk: Int = 256,
 ](
     c: TileTensor[mut=True, c_type, ...],
-    a: TileTensor[DType.bfloat16, ...],
-    packed: TileTensor[DType.uint8, ...],
-    scales: TileTensor[DType.float8_e4m3fn, ...],
+    a: TileTensor[.bfloat16, ...],
+    packed: TileTensor[.uint8, ...],
+    scales: TileTensor[.float8_e4m3fn, ...],
     ctx: DeviceContext,
 ) raises:
     """Enqueue the cooperative-decode `matmul2d` W4A16 GEMM (`run_smem_decode`).
@@ -903,6 +1104,27 @@ def enqueue_matmul2d_fp4_smem[
 
     The 16x32x16 MMA is the native `matmul2d_mma_regc_bt_native` tiling (two
     `_mma_apple_transposable` calls); pure Mojo over `_mma_apple`.
+
+    Parameters:
+        c_type: Output element type; one of `fp16`, `bf16`, `fp32` (defaults
+            to `float32`). Accumulation is fp32.
+        elementwise_lambda_fn: Optional fused epilogue applying a per-element
+            transform to the output (defaults to `None`).
+        num_sg_m: Simdgroup rows per threadgroup (defaults to 16).
+        num_sg_n: Simdgroup cols per threadgroup (defaults to 1).
+        tm: Output 16x32 tiles per simdgroup along M (defaults to 4).
+        tn: Output 16x32 tiles per simdgroup along N (defaults to 1).
+        smem_bk: Cooperative-decode strip depth in K; one decode feeds
+            `smem_bk//16` MMA K-steps (defaults to 256).
+
+    Args:
+        c: Output `TileTensor` view with shape `(M, N)`.
+        a: Bf16 activation `TileTensor` view with shape `(M, K)`.
+        packed: Packed FP4 weight `TileTensor` view with shape `(N, K//2)`
+            (uint8, lo-nibble first).
+        scales: FP8-E4M3 block-scale `TileTensor` view with shape
+            `(N, ceil(K/16))`.
+        ctx: Device context used to enqueue the kernel.
 
     Raises:
         If the attached GPU is not Apple M5 (`compute_capability == 5`).
@@ -930,9 +1152,7 @@ def enqueue_matmul2d_fp4_smem[
         )
 
     comptime assert (
-        c_type == DType.float16
-        or c_type == DType.bfloat16
-        or c_type == DType.float32
+        c_type == .float16 or c_type == .bfloat16 or c_type == .float32
     ), "enqueue_matmul2d_fp4_smem: c_type must be one of {fp16, bf16, fp32}"
 
     var m = Int(c.dim[0]())
@@ -944,23 +1164,27 @@ def enqueue_matmul2d_fp4_smem[
     debug_assert(Int(packed.dim[1]()) == k // 2, "packed must be (N, K//2)")
     debug_assert(Int(scales.dim[0]()) == n, "scales must be (N, ceil(K/16))")
 
-    var grid_m = (m + MM.TG_M - 1) // MM.TG_M
-    var grid_n = (n + MM.TG_N - 1) // MM.TG_N
+    var grid_m = ceildiv(m, MM.TG_M)
+    var grid_n = ceildiv(n, MM.TG_N)
 
     comptime kernel = MM.run_smem_decode[
         type_of(c).LayoutType,
         type_of(a).LayoutType,
         type_of(packed).LayoutType,
         type_of(scales).LayoutType,
+        type_of(c).Engine,
+        type_of(a).Engine,
+        type_of(packed).Engine,
+        type_of(scales).Engine,
     ]
     ctx.enqueue_function[kernel](
         c,
         a.as_immut(),
         packed.as_immut(),
         scales.as_immut(),
-        m,
-        n,
-        k,
+        Int32(m),
+        Int32(n),
+        Int32(k),
         grid_dim=(grid_n, grid_m),
         block_dim=(MM.THREADS_PER_BLOCK),
     )

@@ -20,7 +20,6 @@ import io
 import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -46,6 +45,7 @@ from PIL import Image
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
+    PreTrainedTokenizerBase,
 )
 from typing_extensions import ParamSpec
 
@@ -115,79 +115,33 @@ def resolve_single_special_token(delegate: Any, token: str) -> int:
 
 logger = logging.getLogger("max.pipelines")
 
-_UINT64_MASK = (1 << 64) - 1
 
+def encode_dkv_cache_hint(hint: dict[str, Any] | None) -> bytes | None:
+    """Re-serializes a request's ``dkv_cache_hint`` to the bytes dKV parses.
 
-@dataclass(frozen=True, slots=True)
-class _HintBlock:
-    """A single block descriptor from the Orchestrator's dkv_cache_hint."""
+    The hint arrives as a decoded JSON object and the dKV connector parses it
+    in Rust, so MAX only has to hand back its wire form. Nothing here reads the
+    contents: the version gate, the instance table, and every routing decision
+    live in ``dkv-connector`` (see ``dkv/docs/cache-hint.md``), which is what
+    lets the Orchestrator adopt a new hint schema without redeploying MAX.
 
-    hash: int
-
-
-@dataclass(frozen=True, slots=True)
-class _DkvCacheHint:
-    """Typed representation of a dkv_cache_hint payload from the Orchestrator."""
-
-    instance_name: str
-    blocks: list[_HintBlock]
-    version: int = 1
-
-
-@dataclass(frozen=True, slots=True)
-class _ParsedDkvCacheHint:
-    """Parsed dkv_cache_hint, ready to attach to a TextContext.
-
-    ``external_block_metadata`` becomes ``ctx.external_block_metadata`` —
-    a set-like dict the connector iterates in lookup().
-    ``instance_name`` becomes ``ctx.dkv_hint_instance_name`` — the
-    connector compares it to its own dKV instance name to short-circuit
-    fetches when the cache source is local.
+    Returns ``None`` when the field is absent, empty, or not encodable, all of
+    which the connector serves as an unhinted load. A hint never fails a
+    request: an HTTP caller cannot reach the unencodable case, because the
+    field is typed ``dict[str, Any]`` and filled from a parsed JSON body, but
+    a caller building a request in Python can, and a cache is not worth a
+    failed request.
     """
-
-    instance_name: str
-    external_block_metadata: dict[int, Any]
-
-
-def _parse_dkv_cache_hint(
-    hint: dict[str, Any] | None,
-) -> _ParsedDkvCacheHint | None:
-    """Convert a ``dkv_cache_hint`` JSON payload into the form the DKVConnector reads.
-
-    The Orchestrator injects a ``dkv_cache_hint`` field into the request
-    body (see SERVOPT-1143). Returns ``None`` when no hint is present or
-    the hint carries no blocks.
-
-    Raises ``TypeError`` or ``KeyError`` if the hint is malformed.
-    """
-    if hint is None:
+    if not hint:
         return None
-
-    parsed = _DkvCacheHint(
-        instance_name=hint["instance_name"],
-        blocks=[_HintBlock(**b) for b in hint.get("blocks", [])],
-        version=hint.get("version", 1),
-    )
-
-    if not parsed.blocks:
-        return None
-
-    # Lazy import to avoid pulling dkv deps when dKV is not configured.
-    from max.pipelines.kv_cache.connectors.dkv.connector import (
-        DKVExternalBlockMetadata,
-    )
-
-    external_block_metadata: dict[int, DKVExternalBlockMetadata] = {}
-    for block in parsed.blocks:
-        block_hash = block.hash & _UINT64_MASK
-        external_block_metadata[block_hash] = DKVExternalBlockMetadata(
-            seq_hash=block_hash
+    try:
+        return json.dumps(hint, separators=(",", ":")).encode()
+    except (TypeError, ValueError):
+        logger.warning(
+            "Dropping an unencodable dkv_cache_hint; serving as though the "
+            "cache missed."
         )
-
-    return _ParsedDkvCacheHint(
-        instance_name=parsed.instance_name,
-        external_block_metadata=external_block_metadata,
-    )
+        return None
 
 
 TokenGeneratorContext = TypeVar("TokenGeneratorContext")
@@ -252,9 +206,9 @@ class IdentityPipelineTokenizer(
     """A pass-through tokenizer that returns prompts unchanged."""
 
     @property
-    def eos(self) -> int:
-        """Returns the end-of-sequence token ID (0 for identity)."""
-        return 0
+    def eos_token_ids(self) -> set[int]:
+        """Returns the end-of-sequence token IDs (empty for identity)."""
+        return set()
 
     @property
     def expects_content_wrapping(self) -> bool:
@@ -309,15 +263,42 @@ async def run_with_default_executor(
     return await loop.run_in_executor(None, fn, *args, **kwargs)
 
 
+def replace_unpaired_surrogates(prompt: str) -> str:
+    """Returns ``prompt`` with each unpaired UTF-16 surrogate replaced by U+FFFD.
+
+    A JSON request may legally carry lone surrogate escapes -- for example an
+    emoji whose surrogate pair was split by client-side truncation. The parsed
+    value is a valid Python :class:`str` but is not encodable as UTF-8, so
+    handing it to a HuggingFace fast (Rust) tokenizer raises an opaque
+    ``TypeError`` inside ``encode_batch``. Every surrogate code point
+    (U+D800--U+DFFF) is mapped to the Unicode replacement character (U+FFFD);
+    in JSON-decoded input these are exactly the unpaired surrogates, since the
+    parser reconstitutes a valid pair into a single non-surrogate code point.
+    Well-formed text is left unchanged. An ASCII fast path returns immediately;
+    otherwise the string is probed once with ``encode("utf-8")`` and the
+    per-character replacement runs only when that probe fails.
+    """
+    if prompt.isascii():
+        return prompt
+    try:
+        prompt.encode("utf-8")
+    except UnicodeEncodeError:
+        return "".join(
+            "\ufffd" if "\ud800" <= char <= "\udfff" else char
+            for char in prompt
+        )
+    return prompt
+
+
 async def build_eos_tracker_for_request(
-    default_eos_token_ids: set[int],
+    eos_token_ids: set[int],
     request: TextGenerationRequest,
     encode_fn: Callable[[str, bool], Awaitable[npt.NDArray[np.integer[Any]]]],
 ) -> EOSTracker:
     """Builds an :class:`~max.pipelines.modeling.types.EOSTracker` from request sampling params.
 
     Args:
-        default_eos_token_ids: Default EOS token IDs from tokenizer/model config.
+        eos_token_ids: The model's EOS token IDs from tokenizer/model config.
         request: Generation request; uses ``request.sampling_params`` for stops.
         encode_fn: Async encode callable ``(text, add_special_tokens) -> token ids``.
 
@@ -325,20 +306,20 @@ async def build_eos_tracker_for_request(
         Configured :class:`~max.pipelines.modeling.types.EOSTracker` for this request.
     """
     params = request.sampling_params
-    eos_token_ids = set(default_eos_token_ids)
+    resolved_eos_token_ids = set(eos_token_ids)
     eos_sequences: list[list[int]] = []
     if params.ignore_eos:
-        eos_token_ids = set()
+        resolved_eos_token_ids = set()
     else:
         if params.stop_token_ids:
-            eos_token_ids.update(params.stop_token_ids)
+            resolved_eos_token_ids.update(params.stop_token_ids)
         if params.stop:
             for stop_string in params.stop:
                 tokenized = (await encode_fn(stop_string, False)).tolist()
                 if tokenized:
                     eos_sequences.append(tokenized)
     return EOSTracker(
-        eos_token_ids=eos_token_ids,
+        eos_token_ids=resolved_eos_token_ids,
         eos_sequences=eos_sequences,
         eos_stop_strings=params.stop or [],
     )
@@ -399,6 +380,7 @@ class TextTokenizer(
         # Override chat template if provided
         # This will be used by the delegate's apply_chat_template method automatically
         self._custom_template_provided = chat_template is not None
+        self._chat_template = chat_template
         if chat_template is not None:
             self.delegate.chat_template = chat_template
             logger.info(
@@ -417,7 +399,10 @@ class TextTokenizer(
         ) = self._llama_whitespace_fix_dummy_token
 
         # cache tokenizer eos token ids
-        self._default_eos_token_ids = set([self.eos])
+        eos_token_id = self.delegate.eos_token_id
+        self._eos_token_ids = (
+            {eos_token_id} if eos_token_id is not None else set()
+        )
 
         if pipeline_config:
             target_eos = getattr(
@@ -429,9 +414,14 @@ class TextTokenizer(
             draft_eos = getattr(draft_hf, "eos_token_id", None)
             for eos in (target_eos, draft_eos):
                 if isinstance(eos, int):
-                    self._default_eos_token_ids.add(eos)
+                    self._eos_token_ids.add(eos)
                 elif isinstance(eos, list):
-                    self._default_eos_token_ids.update(eos)
+                    self._eos_token_ids.update(eos)
+
+    @property
+    def eos_token_ids(self) -> set[int]:
+        """The full set of token ids that end generation for this model."""
+        return set(self._eos_token_ids)
 
     @cached_property
     def tokenizer_vocab_size(self) -> int:
@@ -450,13 +440,31 @@ class TextTokenizer(
             **chat_template_options,
         }
 
+        flattened = [message.flatten_content() for message in messages]
+
         try:
-            templated_message = self.delegate.apply_chat_template(
-                [message.flatten_content() for message in messages],
-                tokenize=False,
-                tools=tools,
-                **chat_template_options,
-            )
+            if self._custom_template_provided:
+                # A ``trust_remote_code`` tokenizer may override
+                # ``apply_chat_template`` to render a format hardcoded in
+                # Python, never reading the ``chat_template`` attribute -- which
+                # silently discards an explicit ``--chat-template``. Render the
+                # requested template through the base implementation so the
+                # override is the format that actually reaches the model.
+                templated_message = PreTrainedTokenizerBase.apply_chat_template(
+                    self.delegate,
+                    flattened,
+                    chat_template=self._chat_template,
+                    tokenize=False,
+                    tools=tools,
+                    **chat_template_options,
+                )
+            else:
+                templated_message = self.delegate.apply_chat_template(
+                    flattened,
+                    tokenize=False,
+                    tools=tools,
+                    **chat_template_options,
+                )
         except Exception as e:
             if self._custom_template_provided:
                 # Provide additional context when a custom template is used
@@ -479,11 +487,6 @@ class TextTokenizer(
         return templated_message
 
     @property
-    def eos(self) -> int:
-        """Returns the end-of-sequence token ID from the delegate."""
-        return self.delegate.eos_token_id
-
-    @property
     def expects_content_wrapping(self) -> bool:
         """Returns whether this tokenizer expects content wrapping."""
         return False
@@ -499,7 +502,8 @@ class TextTokenizer(
                 prompt: str, add_special_tokens: bool
             ) -> npt.NDArray[np.integer[Any]]:
                 return self.delegate.encode(
-                    prompt, add_special_tokens=add_special_tokens
+                    replace_unpaired_surrogates(prompt),
+                    add_special_tokens=add_special_tokens,
                 )
 
             # Note: the underlying tokenizer may not be thread safe in some cases, see https://github.com/huggingface/tokenizers/issues/537
@@ -510,12 +514,12 @@ class TextTokenizer(
                 add_special_tokens,
             )
 
-            if self.max_length and len(encoded_prompt) > self.max_length:
-                raise PromptTooLongError(len(encoded_prompt), self.max_length)
-
             encoded_prompt = np.array(encoded_prompt)
         else:
             encoded_prompt = np.array(list(prompt))
+
+        if self.max_length and len(encoded_prompt) > self.max_length:
+            raise PromptTooLongError(len(encoded_prompt), self.max_length)
 
         return encoded_prompt
 
@@ -523,9 +527,10 @@ class TextTokenizer(
         self, encoded: npt.NDArray[np.integer[Any]], **kwargs
     ) -> str:
         """Transforms a provided encoded token array back into readable text."""
-        # Sometimes, encoded comes in as an int so, make it np array
-        if isinstance(encoded, int):
-            encoded = np.array(encoded)
+        # Callers pass plain ints (log-probability responses) and token lists
+        # (CLI streaming) as well as arrays; normalize them all.
+        if not isinstance(encoded, np.ndarray):
+            encoded = np.asarray(encoded)
 
         # There is an issue where Llama tokenizer strips leading spaces
         # if a single token is decoded at a time. This is a temporary
@@ -549,9 +554,7 @@ class TextTokenizer(
         tools: list[TextGenerationRequestTool] | None = None,
         **chat_template_options: Any,
     ) -> tuple[str | list[int], npt.NDArray[np.integer[Any]]]:
-        if isinstance(prompt, str):
-            return prompt, await self.encode(prompt, add_special_tokens=True)
-        elif isinstance(prompt, list):
+        if isinstance(prompt, str | list):
             return prompt, await self.encode(prompt, add_special_tokens=True)
         elif isinstance(messages, list):
             prompt = self.apply_chat_template(
@@ -579,7 +582,7 @@ class TextTokenizer(
         stop_token_ids: list[int] | None,
         stop: list[str] | None,
     ) -> tuple[set[int], list[list[int]]]:
-        eos_token_ids = set(self._default_eos_token_ids)
+        eos_token_ids = set(self._eos_token_ids)
         eos_sequences = list()
 
         if ignore_eos:
@@ -596,7 +599,7 @@ class TextTokenizer(
     ) -> EOSTracker:
         """Builds an :class:`EOSTracker` from the request sampling params and tokenizer default EOS token IDs."""
         return await build_eos_tracker_for_request(
-            self._default_eos_token_ids,
+            self._eos_token_ids,
             request,
             self.encode,
         )
@@ -613,7 +616,8 @@ class TextTokenizer(
 
         json_schema = (
             json.dumps(request.response_format.json_schema)
-            if request.response_format and request.response_format.json_schema
+            if request.response_format
+            and request.response_format.json_schema is not None
             else None
         )
 
@@ -638,7 +642,6 @@ class TextTokenizer(
             array=token_ids.astype(np.int64, copy=False),
         )
 
-        parsed_hint = _parse_dkv_cache_hint(request.dkv_cache_hint)
         context = TextContext(
             request_id=request.request_id,
             eos_tracker=await self.create_eos_tracker(request),
@@ -655,12 +658,7 @@ class TextTokenizer(
             sampling_params=request.sampling_params,
             model_name=request.model_name,
             target_endpoint=request.target_endpoint,
-            external_block_metadata=(
-                parsed_hint.external_block_metadata if parsed_hint else None
-            ),
-            dkv_hint_instance_name=(
-                parsed_hint.instance_name if parsed_hint else ""
-            ),
+            dkv_cache_hint=encode_dkv_cache_hint(request.dkv_cache_hint),
             cache_salt=request.cache_salt,
         )
 
@@ -744,14 +742,17 @@ class TextAndVisionTokenizer(
         self.processor = AutoProcessor.from_pretrained(
             model_path, revision=revision, trust_remote_code=trust_remote_code
         )
-        self._default_eos_token_ids = set([self.eos])
+        eos_token_id = self.delegate.eos_token_id
+        self._eos_token_ids = (
+            {eos_token_id} if eos_token_id is not None else set()
+        )
 
         huggingface_config = pipeline_config.model.huggingface_config
         if eos_token_id := getattr(huggingface_config, "eos_token_id", None):
             if isinstance(eos_token_id, int):
-                self._default_eos_token_ids.add(eos_token_id)
+                self._eos_token_ids.add(eos_token_id)
             elif isinstance(eos_token_id, list):
-                self._default_eos_token_ids.update(eos_token_id)
+                self._eos_token_ids.update(eos_token_id)
 
         self.enable_prefix_caching = (
             pipeline_config.model.kv_cache.enable_prefix_caching
@@ -775,6 +776,11 @@ class TextAndVisionTokenizer(
             self.processor, "image_break_token_id", None
         ):
             self.vision_token_ids.append(image_break_token_id)
+
+    @property
+    def eos_token_ids(self) -> set[int]:
+        """The full set of token ids that end generation for this model."""
+        return set(self._eos_token_ids)
 
     @cached_property
     def tokenizer_vocab_size(self) -> int:
@@ -812,11 +818,6 @@ class TextAndVisionTokenizer(
         return templated_message
 
     @property
-    def eos(self) -> int:
-        """Returns the end-of-sequence token ID from the delegate."""
-        return self.delegate.eos_token_id
-
-    @property
     def expects_content_wrapping(self) -> bool:
         """Returns whether this tokenizer expects content wrapping."""
         return True
@@ -832,7 +833,8 @@ class TextAndVisionTokenizer(
                 prompt: str, add_special_tokens: bool
             ) -> npt.NDArray[np.integer[Any]]:
                 return self.delegate.encode(
-                    prompt, add_special_tokens=add_special_tokens
+                    replace_unpaired_surrogates(prompt),
+                    add_special_tokens=add_special_tokens,
                 )
 
             # Note: the underlying tokenizer may not be thread safe in some cases, see https://github.com/huggingface/tokenizers/issues/537
@@ -872,7 +874,7 @@ class TextAndVisionTokenizer(
     ) -> EOSTracker:
         """Builds an :class:`EOSTracker` from the request sampling params and tokenizer default EOS token IDs."""
         return await build_eos_tracker_for_request(
-            self._default_eos_token_ids,
+            self._eos_token_ids,
             request,
             self.encode,
         )
@@ -908,7 +910,11 @@ class TextAndVisionTokenizer(
 
         # InternVL returns a python list
         processed_inputs = self.processor(
-            text=prompt,
+            text=(
+                replace_unpaired_surrogates(prompt)
+                if isinstance(prompt, str)
+                else prompt
+            ),
             images=images,
             add_special_tokens=add_special_tokens,
             return_tensors="np",
@@ -975,7 +981,8 @@ class TextAndVisionTokenizer(
 
         json_schema = (
             json.dumps(request.response_format.json_schema)
-            if request.response_format and request.response_format.json_schema
+            if request.response_format
+            and request.response_format.json_schema is not None
             else None
         )
 
@@ -998,7 +1005,6 @@ class TextAndVisionTokenizer(
             array=encoded_prompt.astype(np.int64, copy=False),
         )
 
-        parsed_hint = _parse_dkv_cache_hint(request.dkv_cache_hint)
         context = TextAndVisionContext(
             request_id=request.request_id,
             eos_tracker=await self.create_eos_tracker(request),
@@ -1014,12 +1020,7 @@ class TextAndVisionTokenizer(
             grammar=grammar,
             grammar_state=grammar_state,
             sampling_params=request.sampling_params,
-            external_block_metadata=(
-                parsed_hint.external_block_metadata if parsed_hint else None
-            ),
-            dkv_hint_instance_name=(
-                parsed_hint.instance_name if parsed_hint else ""
-            ),
+            dkv_cache_hint=encode_dkv_cache_hint(request.dkv_cache_hint),
             images=[
                 ImageMetadata(
                     start_idx=start_idx,
@@ -1034,6 +1035,7 @@ class TextAndVisionTokenizer(
                 )
             ],
             vision_token_ids=self.vision_token_ids,
+            cache_salt=request.cache_salt,
         )
 
         return context
@@ -1055,7 +1057,7 @@ class TextAndVisionTokenizer(
         stop_token_ids: list[int] | None,
         stop: list[str] | None,
     ) -> tuple[set[int], list[list[int]]]:
-        eos_token_ids = set(self._default_eos_token_ids)
+        eos_token_ids = set(self._eos_token_ids)
         eos_sequences = list()
 
         if ignore_eos:

@@ -30,13 +30,13 @@ from std.sys import (
 )
 from std.ffi import c_int, c_size_t
 
-from std.gpu.host import (
+from max.gpu.host import (
     DeviceContext,
     DeviceFunction,
     DeviceStream,
 )
-from std.gpu.host._nvidia_cuda import CUDA, CUDA_MODULE
-from std.gpu.host._amdgpu_hip import HIP, HIP_MODULE
+from max.gpu.host._nvidia_cuda import CUDA, CUDA_MODULE
+from max.gpu.host._amdgpu_hip import HIP, HIP_MODULE
 
 from ._rocshmem import (
     rocshmem_my_pe,
@@ -108,6 +108,7 @@ from ._nvshmem import (
 comptime shmem_team_t = c_int
 
 
+@fieldwise_init
 struct SHMEMScope(Equatable, ImplicitlyCopyable):
     """Enables following the OpenSHMEM spec by default for put/get/iput/iget
     etc. While allowing NVIDIA extensions for block and warp scopes by passing a
@@ -121,12 +122,6 @@ struct SHMEMScope(Equatable, ImplicitlyCopyable):
     """Execute RMA operation at thread block scope (NVIDIA extension)."""
     comptime warp = Self("_warp")
     """Execute RMA operation at warp scope (NVIDIA extension)."""
-
-    def __init__(out self, value: StaticString):
-        self.value = value
-
-    def __eq__(self, other: Self) -> Bool:
-        return self.value == other.value
 
 
 # ===----------------------------------------------------------------------=== #
@@ -159,10 +154,10 @@ struct SHMEMUniqueID(ImplicitlyCopyable):
     """Unique ID that must be identical across all threads and nodes to establish
     communication."""
 
-    var data: InlineArray[Byte, 128]
+    var data: Array[Byte, 128]
 
     def __init__(out self):
-        self.data = InlineArray[Byte, 128](fill=0)
+        self.data = Array[Byte, 128](fill=0)
 
     def __init__(out self, *, copy: Self):
         self.data = copy.data.copy()

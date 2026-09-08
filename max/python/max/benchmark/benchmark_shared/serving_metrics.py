@@ -19,6 +19,7 @@ import logging
 import statistics
 import warnings
 from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from itertools import pairwise
 from typing import TYPE_CHECKING, TypeGuard
 
@@ -26,6 +27,7 @@ from max.benchmark.benchmark_shared.metrics import (
     BenchmarkResult,
     PixelGenAggregates,
     RatePercentileMetrics,
+    RequestRecord,
     SpecDecodeStats,
     StandardPercentileMetrics,
     TextGenAggregates,
@@ -181,6 +183,58 @@ def _per_turn_cache_retentions(
     return retentions
 
 
+def _build_request_records(
+    outputs: Sequence[RequestFuncOutput],
+    tokenizer: PreTrainedTokenizerBase,
+    measured_ids: AbstractSet[int],
+    *,
+    record_request_text: bool,
+) -> list[RequestRecord]:
+    """One record per request, in dispatch order.
+
+    Every request gets a record — failed and cancelled included — so a
+    reader can tell a request that produced nothing from one that is
+    absent. ``measured_ids`` holds ``id()`` of the outputs the aggregates
+    were computed over, which is how a record says whether the trim or
+    steady-state window kept it; identity is the right key because the
+    measured list holds the same objects.
+    """
+    records: list[RequestRecord] = []
+    for index, o in enumerate(outputs):
+        counted = o.success and not o.cancelled
+        output_len = compute_output_len(tokenizer, o) if counted else 0
+        # Undefined below two tokens: there is no inter-token interval to
+        # average, and reporting 0.0 would pull a mean toward a value no
+        # request achieved.
+        tpot_ms = (
+            (o.latency - o.ttft) / (output_len - 1) * 1000.0
+            if counted and output_len > 1
+            else None
+        )
+        records.append(
+            RequestRecord(
+                index=index,
+                prompt_len=o.prompt_len,
+                output_len=output_len,
+                success=o.success,
+                cancelled=o.cancelled,
+                measured=id(o) in measured_ids,
+                error=o.error,
+                ttft_ms=o.ttft * 1000.0 if counted else None,
+                tpot_ms=tpot_ms,
+                latency_ms=o.latency * 1000.0 if counted else None,
+                submit_time=o.request_submit_time,
+                complete_time=o.request_complete_time,
+                session_id=o.session_id,
+                turn_index=o.turn_index,
+                generated_text=o.generated_text
+                if record_request_text
+                else None,
+            )
+        )
+    return records
+
+
 def calculate_metrics(
     outputs: Sequence[RequestFuncOutput],
     dur_s: float,
@@ -196,6 +250,8 @@ def calculate_metrics(
     metrics_by_endpoint: Mapping[str, ParsedMetrics] | None = None,
     *,
     reject_outliers: bool = False,
+    record_request_text: bool = False,
+    all_outputs: Sequence[RequestFuncOutput] | None = None,
 ) -> BenchmarkResult:
     actual_output_lens: list[int] = []
     failures = 0
@@ -294,6 +350,18 @@ def calculate_metrics(
             )
             total_server_cached_tokens += o.server_token_stats.cached_tokens
             total_server_prompt_tokens += o.server_token_stats.prompt_tokens
+
+    # Records span every request the run dispatched, not the window the
+    # aggregates were computed over: the steady-state path passes a
+    # filtered slice as ``outputs``, and indexing that would renumber the
+    # requests and destroy the key two runs pair on.
+    measured_ids = {id(pair[0]) for pair in measured}
+    request_records = _build_request_records(
+        outputs if all_outputs is None else all_outputs,
+        tokenizer,
+        measured_ids,
+        record_request_text=record_request_text,
+    )
 
     if not measured:
         total_input = 0
@@ -410,9 +478,17 @@ def calculate_metrics(
         completed=measured_count,
         failures=failures,
         request_throughput=measured_count / measured_duration,
+        excluded_successful=total_successful - measured_count,
+        # A metric is ``None`` when it has no samples (empty data list),
+        # rather than a NaN-filled placeholder: NaN serializes to JSON
+        # ``null`` (both via ``model_dump_json`` and BigQuery ingest),
+        # which strict consumers reject. ``None`` is the honest "no data"
+        # representation and renders as an empty cell downstream.
         latency_ms=StandardPercentileMetrics(
-            latencies or [float("nan")], scale_factor=1000.0, unit="ms"
-        ),
+            latencies, scale_factor=1000.0, unit="ms"
+        )
+        if latencies
+        else None,
         errors=[o.error for o in outputs],
         request_submit_times=[o.request_submit_time for o in outputs],
         request_complete_times=[o.request_complete_time for o in outputs],
@@ -421,26 +497,26 @@ def calculate_metrics(
         nonempty_response_chunks=nonempty_response_chunks,
         max_concurrent_conversations=max_concurrent_conversations,
         # Use specialized metric classes that handle percentile calculations automatically
-        input_throughput=ThroughputMetrics(
-            input_throughputs or [float("nan")], unit="tok/s"
-        ),
-        output_throughput=ThroughputMetrics(
-            output_throughputs or [float("nan")], unit="tok/s"
-        ),
-        ttft_ms=StandardPercentileMetrics(
-            ttfts or [float("nan")], scale_factor=1000.0, unit="ms"
-        ),
-        tpot_ms=StandardPercentileMetrics(
-            tpots or [float("nan")], scale_factor=1000.0, unit="ms"
-        ),
+        input_throughput=ThroughputMetrics(input_throughputs, unit="tok/s")
+        if input_throughputs
+        else None,
+        output_throughput=ThroughputMetrics(output_throughputs, unit="tok/s")
+        if output_throughputs
+        else None,
+        ttft_ms=StandardPercentileMetrics(ttfts, scale_factor=1000.0, unit="ms")
+        if ttfts
+        else None,
+        tpot_ms=StandardPercentileMetrics(tpots, scale_factor=1000.0, unit="ms")
+        if tpots
+        else None,
         step_tpot_ms=StandardPercentileMetrics(
             step_tpots, scale_factor=1000.0, unit="ms"
         )
         if step_tpots
         else None,
-        itl_ms=StandardPercentileMetrics(
-            itls or [float("nan")], scale_factor=1000.0, unit="ms"
-        ),
+        itl_ms=StandardPercentileMetrics(itls, scale_factor=1000.0, unit="ms")
+        if itls
+        else None,
         max_input=max_input,
         max_output=max_output,
         max_total=max_total,
@@ -452,6 +528,7 @@ def calculate_metrics(
         input_lens=[o.prompt_len for o in outputs],
         output_lens=actual_output_lens,
         ttfts=[o.ttft for o in outputs],
+        request_records=request_records,
         per_turn_cached_token_rates=per_turn_cached_token_rates,
         per_turn_cache_retentions=per_turn_cache_retentions,
     )
@@ -520,9 +597,12 @@ def calculate_pixel_generation_metrics(
         completed=completed,
         failures=failures,
         request_throughput=completed / measured_duration,
+        # ``None`` when no requests succeeded (see the text-gen path).
         latency_ms=StandardPercentileMetrics(
-            latencies or [float("nan")], scale_factor=1000.0, unit="ms"
-        ),
+            latencies, scale_factor=1000.0, unit="ms"
+        )
+        if latencies
+        else None,
         errors=[o.error for o in outputs],
         request_submit_times=[o.request_submit_time for o in outputs],
         request_complete_times=[o.request_complete_time for o in outputs],
@@ -601,6 +681,7 @@ def build_text_generation_result(
     metrics_by_endpoint: Mapping[str, ParsedMetrics] | None = None,
     spec_decode_stats: SpecDecodeStats | None = None,
     kv_block_size: int = 128,
+    record_request_text: bool = False,
 ) -> BenchmarkResult:
     """Compute metrics and build the result for text-generation tasks.
 
@@ -701,6 +782,8 @@ def build_text_generation_result(
             metrics_by_endpoint=metrics_by_endpoint,
             kv_block_size=kv_block_size,
             reject_outliers=True,
+            record_request_text=record_request_text,
+            all_outputs=outputs,
         )
 
         # Diagnostic: number of per-request TTFT outliers rejected in the
@@ -747,6 +830,7 @@ def build_text_generation_result(
             metrics_by_endpoint=metrics_by_endpoint,
             kv_block_size=kv_block_size,
             reject_outliers=False,
+            record_request_text=record_request_text,
         )
 
     for warn in text_metrics.confidence_warnings():

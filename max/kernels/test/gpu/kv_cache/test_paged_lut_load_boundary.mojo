@@ -25,9 +25,9 @@ Related: KERN-2861 (NaN at page_size=128 in Gemma-3/4). Complements
 memory via a poisoned-padding stress test.
 """
 
-from std.gpu import global_idx
-from std.gpu.host import DeviceContext
-from std.memory import memset_zero
+from max.gpu import global_idx
+from max.gpu.host import DeviceContext
+from std.memory import unsafe_memset_zero
 from std.sys.defines import get_defined_int
 from std.utils import IndexList
 
@@ -54,7 +54,7 @@ def _populate_kernel[
     num_pages: Int,
 ](
     kv: cache_t,
-    output_ptr: UnsafePointer[UInt32, MutAnyOrigin],
+    output_ptr: MutPointer[UInt32, MutAnyOrigin],
     base_kv_row: UInt32,
 ):
     """Single-thread kernel: write `populate[BN, base_alignment]` rows[] to
@@ -106,7 +106,7 @@ def run_one[
     comptime lut_layout = Layout.row_major[2]()
     var lut_shape = IndexList[2](1, lut_columns)
     var lut_runtime = RuntimeLayout[lut_layout].row_major(lut_shape)
-    var lut = ManagedLayoutTensor[DType.uint32, lut_layout](lut_runtime, ctx)
+    var lut = ManagedLayoutTensor[.uint32, lut_layout](lut_runtime, ctx)
     var lut_host = lut.tensor[update=False]()
     for c in range(lut_columns):
         if c < num_used:
@@ -121,7 +121,7 @@ def run_one[
     var cache_lengths_runtime = RuntimeLayout[cache_lengths_layout].row_major(
         cache_lengths_shape
     )
-    var cache_lengths = ManagedLayoutTensor[DType.uint32, cache_lengths_layout](
+    var cache_lengths = ManagedLayoutTensor[.uint32, cache_lengths_layout](
         cache_lengths_runtime, ctx
     )
     var cache_lengths_host = cache_lengths.tensor[update=False]()
@@ -141,12 +141,12 @@ def run_one[
     var blocks_runtime = RuntimeLayout[blocks_layout].row_major(blocks_shape)
     var blocks = ManagedLayoutTensor[dtype, blocks_layout](blocks_runtime, ctx)
     var blocks_host = blocks.tensor[update=False]()
-    memset_zero(blocks_host.ptr, blocks_runtime.size())
+    unsafe_memset_zero(blocks_host.ptr, blocks_runtime.size())
 
     # Output buffer: enough for the largest `num_pages` we'll ever request.
     comptime _MAX_PAGES = 16
-    var output_buf = ctx.enqueue_create_buffer[DType.uint32](_MAX_PAGES)
-    var output_init = ctx.enqueue_create_host_buffer[DType.uint32](_MAX_PAGES)
+    var output_buf = ctx.enqueue_create_buffer[.uint32](_MAX_PAGES)
+    var output_init = ctx.enqueue_create_host_buffer[.uint32](_MAX_PAGES)
     for i in range(_MAX_PAGES):
         output_init[i] = UInt32(0xCDCDCDCD)
     ctx.enqueue_copy(output_buf, output_init)
@@ -170,7 +170,7 @@ def run_one[
         block_dim=1,
     )
 
-    var output_host = ctx.enqueue_create_host_buffer[DType.uint32](_MAX_PAGES)
+    var output_host = ctx.enqueue_create_host_buffer[.uint32](_MAX_PAGES)
     ctx.enqueue_copy(output_host, output_buf)
     ctx.synchronize()
 

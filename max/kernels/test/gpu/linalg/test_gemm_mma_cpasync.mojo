@@ -15,7 +15,7 @@
 from std.math import ceildiv
 from std.random import random_float64
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import alloc
 
 from linalg.gemv import gemm_mma_cpasync
@@ -131,8 +131,8 @@ def run_gemm_mma_cpasync[
     var out_f32 = alloc[Float32](out_size)
     var ref_f32 = alloc[Float32](out_size)
     for i in range(out_size):
-        out_f32[i] = out_host[i].cast[DType.float32]()
-        ref_f32[i] = ref_host[i].cast[DType.float32]()
+        out_f32[i] = out_host[i].cast[.float32]()
+        ref_f32[i] = ref_host[i].cast[.float32]()
 
     assert_almost_equal(
         out_f32,
@@ -212,11 +212,11 @@ def run_gemm_mma_cpasync_residual[
     var c_lt = c_tensor.to_layout_tensor()
     var residual_lt = residual_tensor.to_layout_tensor()
 
-    @parameter
+    @__parameter
     @always_inline
     @__copy_capture(c_lt, residual_lt)
     def residual_epilogue[
-        dtype: DType, width: SIMDSize, *, alignment: Int = 1
+        dtype: DType, width: SIMDLength, *, alignment: Int = 1
     ](idx: IndexList[2], val: SIMD[dtype, width]):
         var res = residual_lt.load[width=width](idx).cast[dtype]()
         c_lt.store[width=width](idx, (val + res).cast[c_type]())
@@ -254,10 +254,9 @@ def run_gemm_mma_cpasync_residual[
     var out_f32 = alloc[Float32](out_size)
     var ref_f32 = alloc[Float32](out_size)
     for i in range(out_size):
-        out_f32[i] = out_host[i].cast[DType.float32]()
+        out_f32[i] = out_host[i].cast[.float32]()
         ref_f32[i] = (
-            ref_host[i].cast[DType.float32]()
-            + residual_host[i].cast[DType.float32]()
+            ref_host[i].cast[.float32]() + residual_host[i].cast[.float32]()
         )
 
     assert_almost_equal(
@@ -272,124 +271,124 @@ def run_gemm_mma_cpasync_residual[
 
 def main() raises:
     with DeviceContext() as ctx:
-        run_gemm_mma_cpasync[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=64
-        ](32, 7168, 384, ctx=ctx)
-        run_gemm_mma_cpasync[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=128
-        ](32, 7168, 384, ctx=ctx)
-        run_gemm_mma_cpasync[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=256
-        ](32, 7168, 384, ctx=ctx)
-        run_gemm_mma_cpasync[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=512
-        ](32, 7168, 384, ctx=ctx)
-        run_gemm_mma_cpasync[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=64
-        ](24, 7168, 384, ctx=ctx)
-        run_gemm_mma_cpasync[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=128
-        ](24, 7168, 384, ctx=ctx)
-        run_gemm_mma_cpasync[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=256
-        ](24, 7168, 384, ctx=ctx)
-        run_gemm_mma_cpasync[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=512
-        ](24, 7168, 384, ctx=ctx)
-        run_gemm_mma_cpasync[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=64
-        ](16, 7168, 384, ctx=ctx)
-        run_gemm_mma_cpasync[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=128
-        ](16, 7168, 384, ctx=ctx)
-        run_gemm_mma_cpasync[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=256
-        ](16, 7168, 384, ctx=ctx)
-        run_gemm_mma_cpasync[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=512
-        ](16, 7168, 384, ctx=ctx)
+        run_gemm_mma_cpasync[.bfloat16, .bfloat16, .bfloat16, tile_k=64](
+            32, 7168, 384, ctx=ctx
+        )
+        run_gemm_mma_cpasync[.bfloat16, .bfloat16, .bfloat16, tile_k=128](
+            32, 7168, 384, ctx=ctx
+        )
+        run_gemm_mma_cpasync[.bfloat16, .bfloat16, .bfloat16, tile_k=256](
+            32, 7168, 384, ctx=ctx
+        )
+        run_gemm_mma_cpasync[.bfloat16, .bfloat16, .bfloat16, tile_k=512](
+            32, 7168, 384, ctx=ctx
+        )
+        run_gemm_mma_cpasync[.bfloat16, .bfloat16, .bfloat16, tile_k=64](
+            24, 7168, 384, ctx=ctx
+        )
+        run_gemm_mma_cpasync[.bfloat16, .bfloat16, .bfloat16, tile_k=128](
+            24, 7168, 384, ctx=ctx
+        )
+        run_gemm_mma_cpasync[.bfloat16, .bfloat16, .bfloat16, tile_k=256](
+            24, 7168, 384, ctx=ctx
+        )
+        run_gemm_mma_cpasync[.bfloat16, .bfloat16, .bfloat16, tile_k=512](
+            24, 7168, 384, ctx=ctx
+        )
+        run_gemm_mma_cpasync[.bfloat16, .bfloat16, .bfloat16, tile_k=64](
+            16, 7168, 384, ctx=ctx
+        )
+        run_gemm_mma_cpasync[.bfloat16, .bfloat16, .bfloat16, tile_k=128](
+            16, 7168, 384, ctx=ctx
+        )
+        run_gemm_mma_cpasync[.bfloat16, .bfloat16, .bfloat16, tile_k=256](
+            16, 7168, 384, ctx=ctx
+        )
+        run_gemm_mma_cpasync[.bfloat16, .bfloat16, .bfloat16, tile_k=512](
+            16, 7168, 384, ctx=ctx
+        )
 
         # swapAB tests: C[M, N] = act @ weight^T must match the non-swap path
         # exactly. Kimi decode shape (N=2112, K=7168) across small M.
         run_gemm_mma_cpasync[
-            DType.bfloat16,
-            DType.bfloat16,
-            DType.bfloat16,
+            .bfloat16,
+            .bfloat16,
+            .bfloat16,
             tile_k=128,
             swapAB=True,
         ](1, 7168, 2112, ctx=ctx)
         run_gemm_mma_cpasync[
-            DType.bfloat16,
-            DType.bfloat16,
-            DType.bfloat16,
+            .bfloat16,
+            .bfloat16,
+            .bfloat16,
             tile_k=256,
             swapAB=True,
         ](2, 7168, 2112, ctx=ctx)
         run_gemm_mma_cpasync[
-            DType.bfloat16,
-            DType.bfloat16,
-            DType.bfloat16,
+            .bfloat16,
+            .bfloat16,
+            .bfloat16,
             tile_k=128,
             swapAB=True,
         ](4, 7168, 2112, ctx=ctx)
         run_gemm_mma_cpasync[
-            DType.bfloat16,
-            DType.bfloat16,
-            DType.bfloat16,
+            .bfloat16,
+            .bfloat16,
+            .bfloat16,
             tile_k=256,
             swapAB=True,
         ](7, 7168, 2112, ctx=ctx)
         run_gemm_mma_cpasync[
-            DType.bfloat16,
-            DType.bfloat16,
-            DType.bfloat16,
+            .bfloat16,
+            .bfloat16,
+            .bfloat16,
             tile_k=128,
             swapAB=True,
         ](16, 7168, 2112, ctx=ctx)
 
         # Residual epilogue tests: D = matmul(A,B) + residual.
         run_gemm_mma_cpasync_residual[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=128
+            .bfloat16, .bfloat16, .bfloat16, tile_k=128
         ](32, 7168, 384, ctx=ctx)
         run_gemm_mma_cpasync_residual[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=256
+            .bfloat16, .bfloat16, .bfloat16, tile_k=256
         ](24, 7168, 384, ctx=ctx)
         run_gemm_mma_cpasync_residual[
-            DType.bfloat16, DType.bfloat16, DType.bfloat16, tile_k=64
+            .bfloat16, .bfloat16, .bfloat16, tile_k=64
         ](16, 7168, 384, ctx=ctx)
 
         run_gemm_mma_cpasync_residual[
-            DType.bfloat16,
-            DType.bfloat16,
-            DType.bfloat16,
+            .bfloat16,
+            .bfloat16,
+            .bfloat16,
             tile_k=128,
             swapAB=True,
         ](1, 7168, 2112, ctx=ctx)
         run_gemm_mma_cpasync_residual[
-            DType.bfloat16,
-            DType.bfloat16,
-            DType.bfloat16,
+            .bfloat16,
+            .bfloat16,
+            .bfloat16,
             tile_k=256,
             swapAB=True,
         ](2, 7168, 2112, ctx=ctx)
         run_gemm_mma_cpasync_residual[
-            DType.bfloat16,
-            DType.bfloat16,
-            DType.bfloat16,
+            .bfloat16,
+            .bfloat16,
+            .bfloat16,
             tile_k=128,
             swapAB=True,
         ](4, 7168, 2112, ctx=ctx)
         run_gemm_mma_cpasync_residual[
-            DType.bfloat16,
-            DType.bfloat16,
-            DType.bfloat16,
+            .bfloat16,
+            .bfloat16,
+            .bfloat16,
             tile_k=256,
             swapAB=True,
         ](7, 7168, 2112, ctx=ctx)
         run_gemm_mma_cpasync_residual[
-            DType.bfloat16,
-            DType.bfloat16,
-            DType.bfloat16,
+            .bfloat16,
+            .bfloat16,
+            .bfloat16,
             tile_k=128,
             swapAB=True,
         ](16, 7168, 2112, ctx=ctx)

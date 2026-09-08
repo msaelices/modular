@@ -34,6 +34,16 @@
 # group >= 8 keeps a single head's poison dot from sign-cancelling).
 # Dual-arch: SM100/B200 (msa_sm100_decode) + AMD MI355 (msa_amd_decode_dispatch).
 #
+# `determinism` oracle (--rerun N): the same input and the same default launch
+# N times, into N distinct output buffers all enqueued before one synchronize
+# so the decode kernels stay queued back-to-back under concurrent load. The
+# split-K combine is a fixed sequential loop, so a correct kernel is bit-stable
+# and the compare is exact (atol=rtol=0); a divergence is a race or an
+# order-dependent atomic. This matters for the M3 decode because a per-request
+# result that moves run to run also moves between the draft's proposal and the
+# target's verify, which is exactly what a speculative acceptance test cannot
+# tolerate.
+#
 # `ref` oracle (--check 1, default): an f64 block-restricted softmax that drops
 # `k_logical > cache_length` (the tail). A kernel that attends the poison tail
 # pushes O ~5 orders of magnitude out of band -> FUZZ_NUMERIC_FAIL. A NaN/Inf
@@ -50,7 +60,7 @@ from std.sys import (
 from std.sys.defines import get_defined_int
 from std.utils import IndexList
 
-from std.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu.host import DeviceBuffer, DeviceContext
 from layout import (
     Coord,
     Layout,
@@ -67,7 +77,13 @@ from nn.attention.mha_utils import MHAConfig, StaticInt
 from msa.msa_1q import msa_sm100_decode
 from msa.amd.decode import msa_amd_decode_dispatch
 
-from _fuzz import boundary_int, collect_args, flag, flag_int
+from _fuzz import (
+    boundary_int,
+    collect_args,
+    flag,
+    flag_int,
+    numeric_check,
+)
 
 comptime dtype = DType.bfloat16
 comptime BN = 128  # block size (tokens) == page_size
@@ -119,7 +135,10 @@ def gen_specs(n: Int) -> List[CaseSpec]:
 
 
 def run_one_case(
-    ctx: DeviceContext, spec: CaseSpec, check: Bool = False
+    ctx: DeviceContext,
+    spec: CaseSpec,
+    check: Bool = False,
+    repeats: Int = 1,
 ) raises:
     comptime num_q_heads = group
     comptime kv_num_heads = 1
@@ -172,7 +191,7 @@ def run_one_case(
     # Block selection: slot 0 = prefix block 0, last slot = the partial LOCAL
     # block, interior slots = blocks in [1, local-1]. Duplicates are harmless
     # (kernel and oracle both iterate the same idx).
-    var idx_host = ctx.enqueue_create_host_buffer[DType.int32](idx_count)
+    var idx_host = ctx.enqueue_create_host_buffer[.int32](idx_count)
     ctx.synchronize()
     for b in range(batch_size):
         var lblk = local_blk[b]
@@ -251,11 +270,11 @@ def run_one_case(
                 kv_host[v_off] = vval
 
     var q_dev = ctx.enqueue_create_buffer[dtype](q_size)
-    var idx_dev = ctx.enqueue_create_buffer[DType.int32](idx_count)
+    var idx_dev = ctx.enqueue_create_buffer[.int32](idx_count)
     var o_dev = ctx.enqueue_create_buffer[dtype](q_size)
     var kv_block_dev = ctx.enqueue_create_buffer[dtype](kv_block_size)
-    var cl_host = ctx.enqueue_create_host_buffer[DType.uint32](batch_size)
-    var lut_host = ctx.enqueue_create_host_buffer[DType.uint32](
+    var cl_host = ctx.enqueue_create_host_buffer[.uint32](batch_size)
+    var lut_host = ctx.enqueue_create_host_buffer[.uint32](
         batch_size * max_pages
     )
     ctx.synchronize()
@@ -263,10 +282,8 @@ def run_one_case(
         cl_host[b] = UInt32(cache_length[b])
         for lb in range(max_pages):
             lut_host[b * max_pages + lb] = UInt32(lut[b * max_pages + lb])
-    var cl_dev = ctx.enqueue_create_buffer[DType.uint32](batch_size)
-    var lut_dev = ctx.enqueue_create_buffer[DType.uint32](
-        batch_size * max_pages
-    )
+    var cl_dev = ctx.enqueue_create_buffer[.uint32](batch_size)
+    var lut_dev = ctx.enqueue_create_buffer[.uint32](batch_size * max_pages)
 
     # Poison O so an unwritten output slot is caught too.
     var o_init = ctx.enqueue_create_host_buffer[dtype](q_size)
@@ -281,6 +298,18 @@ def run_one_case(
     ctx.enqueue_copy(cl_dev, cl_host)
     ctx.enqueue_copy(lut_dev, lut_host)
 
+    # One output buffer per launch: the reruns must not serialize on a single
+    # buffer (WAW), so every launch stays live concurrently. That is the
+    # regime an order-dependent atomic or a reused split-K scratch shows up
+    # in; a single launch-sync-launch loop would hide it. Each buffer carries
+    # the same poison fill, so an unwritten slot still fails the rerun compare.
+    var outs = List[DeviceBuffer[dtype]](capacity=repeats)
+    outs.append(o_dev)
+    for _ in range(1, repeats):
+        var extra = ctx.enqueue_create_buffer[dtype](q_size)
+        ctx.enqueue_copy(extra, o_init)
+        outs.append(extra)
+
     comptime kv_block_layout = Layout.row_major[6]()
     var kv_block_tensor = LayoutTensor[dtype, kv_block_layout](
         kv_block_dev,
@@ -291,12 +320,12 @@ def run_one_case(
         ),
     )
     comptime cl_layout = Layout(UNKNOWN_VALUE)
-    var cl_tensor = LayoutTensor[mut=False, DType.uint32, cl_layout](
+    var cl_tensor = LayoutTensor[mut=False, .uint32, cl_layout](
         cl_dev,
         RuntimeLayout[cl_layout].row_major(IndexList[1](batch_size)),
     )
     comptime lut_layout = Layout.row_major[2]()
-    var lut_tensor = LayoutTensor[mut=False, DType.uint32, lut_layout](
+    var lut_tensor = LayoutTensor[mut=False, .uint32, lut_layout](
         lut_dev,
         RuntimeLayout[lut_layout].row_major(
             IndexList[2](batch_size, max_pages)
@@ -320,84 +349,112 @@ def run_one_case(
     comptime config = MHAConfig[dtype](num_q_heads, head_dim)
 
     # Ragged Q offsets [batch+1], one decode token per batch (iro[b] = b).
-    var iro_host = ctx.enqueue_create_host_buffer[DType.uint32](batch_size + 1)
+    var iro_host = ctx.enqueue_create_host_buffer[.uint32](batch_size + 1)
     ctx.synchronize()
     for b in range(batch_size + 1):
         iro_host[b] = UInt32(b)
-    var iro_dev = ctx.enqueue_create_buffer[DType.uint32](batch_size + 1)
+    var iro_dev = ctx.enqueue_create_buffer[.uint32](batch_size + 1)
     ctx.enqueue_copy(iro_dev, iro_host)
-    var valid_length = DeviceBuffer[DType.uint32](
+    var valid_length = DeviceBuffer[.uint32](
         ctx, iro_dev.unsafe_ptr(), batch_size + 1, owning=False
     )
 
     # Production decode call (msa.mojo): ragged, no valid_key, no causal/spec,
     # mask_unselected=True.
-    comptime if has_amd_gpu_accelerator():
-        msa_amd_decode_dispatch[
-            config=config,
-            group=group,
-            ragged=True,
-            _is_cache_length_accurate=False,
-            mask_unselected=True,
-        ](
-            o_dev,
-            q_dev,
-            k_op,
-            v_op,
-            TileTensor(
-                idx_dev.unsafe_ptr(), row_major(Coord(len(idx_dev)))
-            ).as_immut(),
-            topk,  # indices_stride (blocks)
-            batch_size,  # num_rows_q (1 token/seq)
-            NullMask(),
-            valid_length,  # ragged Q offsets
-            StaticInt[1](),  # max_prompt_len (decode)
-            topk_tokens,  # max_cache_valid_length
-            scale,
-            None,  # kv_input_row_offsets
-            batch_size,
-            ctx,
-        )
-    elif has_nvidia_gpu_accelerator():
-        msa_sm100_decode[
-            config=config,
-            group=group,
-            ragged=True,
-            _is_cache_length_accurate=False,
-            mask_unselected=True,
-        ](
-            o_dev,
-            q_dev,
-            k_op,
-            v_op,
-            TileTensor(
-                idx_dev.unsafe_ptr(), row_major(Coord(len(idx_dev)))
-            ).as_immut(),
-            topk,  # indices_stride (blocks)
-            batch_size,  # num_rows_q (1 token/seq)
-            NullMask(),
-            valid_length,  # ragged Q offsets
-            StaticInt[1](),  # max_prompt_len (decode)
-            topk_tokens,  # max_cache_valid_length
-            scale,
-            None,  # kv_input_row_offsets
-            batch_size,
-            ctx,
-        )
-    else:
-        CompilationTarget.unsupported_target_error[
-            operation=__get_current_function_name()
-        ]()
+    # Every launch is enqueued before the single synchronize below, so the
+    # decode kernels stay queued back-to-back under concurrent load.
+    for rep in range(len(outs)):
+        comptime if has_amd_gpu_accelerator():
+            msa_amd_decode_dispatch[
+                config=config,
+                group=group,
+                ragged=True,
+                _is_cache_length_accurate=False,
+                mask_unselected=True,
+            ](
+                outs[rep],
+                q_dev,
+                k_op,
+                v_op,
+                TileTensor(
+                    idx_dev.unsafe_ptr(), row_major(Coord(len(idx_dev)))
+                ).as_immut(),
+                topk,  # indices_stride (blocks)
+                batch_size,  # num_rows_q (1 token/seq)
+                NullMask(),
+                valid_length,  # ragged Q offsets
+                StaticInt[1](),  # max_prompt_len (decode)
+                topk_tokens,  # max_cache_valid_length
+                scale,
+                None,  # kv_input_row_offsets
+                batch_size,
+                ctx,
+            )
+        elif has_nvidia_gpu_accelerator():
+            msa_sm100_decode[
+                config=config,
+                group=group,
+                ragged=True,
+                _is_cache_length_accurate=False,
+                mask_unselected=True,
+            ](
+                outs[rep],
+                q_dev,
+                k_op,
+                v_op,
+                TileTensor(
+                    idx_dev.unsafe_ptr(), row_major(Coord(len(idx_dev)))
+                ).as_immut(),
+                Int32(topk),  # indices_stride (blocks)
+                Int32(batch_size),  # num_rows_q (1 token/seq)
+                NullMask(),
+                valid_length,  # ragged Q offsets
+                StaticInt[1](),  # max_prompt_len (decode)
+                Int32(topk_tokens),  # max_cache_valid_length
+                scale,
+                None,  # kv_input_row_offsets
+                Int32(batch_size),
+                ctx,
+            )
+        else:
+            CompilationTarget.unsupported_target_error[
+                operation=__get_current_function_name()
+            ]()
+
+    ctx.synchronize()
+
+    # Determinism oracle (`--rerun N`): identical input, identical launch, N
+    # times. The decode's split-K combine is a fixed sequential loop, so a
+    # correct kernel is bit-stable and the compare is exact (atol=rtol=0).
+    # A divergence is a real race or an order-dependent atomic, never a
+    # legitimate reduction-order wobble. The comparison lives here rather
+    # than in the orchestrator because a subprocess may only issue one
+    # verdict, so it can never hold two cases' outputs.
+    if repeats > 1:
+        var first_h = ctx.enqueue_create_host_buffer[dtype](q_size)
+        ctx.enqueue_copy(first_h, outs[0])
+        ctx.synchronize()
+        for r in range(1, len(outs)):
+            var rep_h = ctx.enqueue_create_host_buffer[dtype](q_size)
+            ctx.enqueue_copy(rep_h, outs[r])
+            ctx.synchronize()
+            if not numeric_check(
+                rep_h.as_span(), first_h.as_span(), atol=0.0, rtol=0.0
+            ):
+                print("FUZZ_CONTRACT_FAIL kind=nondeterminism rerun=", r)
+                raise Error(
+                    "MSA decode run-to-run nondeterminism"
+                    " (determinism oracle, default launch)"
+                )
 
     if not check:
-        ctx.synchronize()
         _ = q_dev
         _ = idx_dev
-        _ = o_dev
         _ = kv_block_dev
         _ = cl_dev
         _ = lut_dev
         _ = iro_dev
+        _ = outs^
         return
 
     var o_host = ctx.enqueue_create_host_buffer[dtype](q_size)
@@ -406,13 +463,13 @@ def run_one_case(
 
     # NaN/Inf guard (an all-poison softmax can overflow).
     for i in range(q_size):
-        var x = o_host[i].cast[DType.float32]()
+        var x = o_host[i].cast[.float32]()
         if isnan(x) or isinf(x):
             print("FUZZ_NUMERIC_FAIL kind=naninf idx=", i, "val=", x)
             raise Error("MSA decode output NaN/Inf (poison tail attended?)")
 
     # f64 block-restricted softmax, masking the local tail (k_logical > cl).
-    @parameter
+    @__parameter
     def kv_off(b: Int, blk: Int, c: Int) -> Int:
         return (batch_tok_base[b] + blk * BN + c) * head_dim
 
@@ -436,8 +493,7 @@ def run_one_case(
                     var ko = kv_off(b, blk, c)
                     for d in range(head_dim):
                         dot += (
-                            q_host[q_base + d].cast[DType.float64]()
-                            * k_f64[ko + d]
+                            q_host[q_base + d].cast[.float64]() * k_f64[ko + d]
                         )
                     logits.append(dot * scale_f64)
                     slot_lin.append(k_logical)
@@ -457,7 +513,7 @@ def run_one_case(
                     var bl = slot_lin[i] // BN
                     var c = slot_lin[i] % BN
                     acc += w * v_f64[kv_off(b, bl, c) + d]
-                var got = o_host[q_base + d].cast[DType.float64]()
+                var got = o_host[q_base + d].cast[.float64]()
                 var ae = abs(got - acc)
                 max_abs = max(max_abs, ae)
                 if abs(acc) > 0.1:
@@ -474,11 +530,11 @@ def run_one_case(
 
     _ = q_dev
     _ = idx_dev
-    _ = o_dev
     _ = kv_block_dev
     _ = cl_dev
     _ = lut_dev
     _ = iro_dev
+    _ = outs^
 
 
 def main() raises:
@@ -487,6 +543,7 @@ def main() raises:
     var the_seed = flag_int(args, "--seed", fuzz_seed)
     var the_budget = flag_int(args, "--budget", budget)
     var check = flag_int(args, "--check", 0) == 1
+    var rerun = flag_int(args, "--rerun", 0)
     seed(the_seed)
 
     if mode == "list-specs":
@@ -510,7 +567,7 @@ def main() raises:
         var k = flag_int(args, "--topk", 16)
         print("FUZZ_SINGLE batch=", b, "cl_seed=", cs, "topk=", k)
         with DeviceContext() as ctx:
-            run_one_case(ctx, CaseSpec(b, cs, k), check)
+            run_one_case(ctx, CaseSpec(b, cs, k), check, max(1, rerun))
         print("FUZZ_RESULT verdict=PASS")
         return
 
@@ -529,5 +586,5 @@ def main() raises:
     with DeviceContext() as ctx:
         for i in range(len(specs)):
             print("case", i, ":", specs[i])
-            run_one_case(ctx, specs[i], check)
+            run_one_case(ctx, specs[i], check, max(1, rerun))
     print("=== done:", len(specs), "cases ===")

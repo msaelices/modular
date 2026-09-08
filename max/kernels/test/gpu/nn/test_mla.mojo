@@ -18,8 +18,8 @@ from std.sys import (
     has_nvidia_gpu_accelerator,
 )
 
-from std.gpu import *
-from std.gpu.host import DeviceContext
+from max.gpu import *
+from max.gpu.host import DeviceContext
 from layout import (
     Idx,
     Layout,
@@ -38,7 +38,7 @@ from nn.attention.gpu.nvidia.sm100.mla_decode_dispatch import (
     MLADispatchScalarArgs,
 )
 from std.testing import assert_almost_equal
-from std.gpu.host.info import _is_sm10x_gpu
+from max.gpu.host.info import _is_sm10x_gpu
 
 
 from std.utils.index import Index
@@ -173,15 +173,16 @@ def test[
     ](batch_size, num_keys, seq_len, ctx)
     var scalar_args_buf_tt = mla_args.gpu_tile_tensor()
 
-    @parameter
     @always_inline
-    @__copy_capture(
-        q_device,
-        k_device,
-        output_device,
-        scalar_args_buf_tt,
-    )
-    def kernel_launch(ctx: DeviceContext) raises:
+    def kernel_launch(
+        ctx: DeviceContext,
+    ) raises {
+        var q_device,
+        var k_device,
+        var output_device,
+        var scalar_args_buf_tt,
+        imm,
+    }:
         flare_mla_decoding[
             config=MHAConfig[qkv_type](num_heads, depth),
             decoding_warp_split_k=decoding_warp_split_k,
@@ -202,7 +203,7 @@ def test[
         # Warmup
         kernel_launch(ctx)
 
-        var nstime = Float64(ctx.execution_time[kernel_launch](nrun)) / Float64(
+        var nstime = Float64(ctx.execution_time(kernel_launch, nrun)) / Float64(
             nrun
         )
         var sectime = nstime / 1000000
@@ -236,7 +237,7 @@ def test[
             k_device.as_immut().as_unsafe_any_origin()
         )
         var null_valid_length = LayoutTensor[
-            DType.uint32, Layout.row_major(UNKNOWN_VALUE), MutAnyOrigin
+            .uint32, Layout.row_major(UNKNOWN_VALUE), MutAnyOrigin
         ](
             None,
             RuntimeLayout[Layout.row_major(UNKNOWN_VALUE)].row_major(Index(0)),
@@ -279,12 +280,12 @@ def test[
                         d
                         + depth * (h + s * num_heads)
                         + b * depth * num_heads * seq_len
-                    ].cast[DType.float64]()
+                    ].cast[.float64]()
                     var actual = flash_output_ptr[
                         d
                         + (depth - 64) * (h + s * num_heads)
                         + b * (depth - 64) * num_heads * seq_len
-                    ].cast[DType.float64]()
+                    ].cast[.float64]()
                     # if not isclose(actual, expect, atol=1e-3, rtol=rtol):
                     #     var rerr = abs((actual - expect) / expect)
                     #     print(h, s, d, actual, expect, rerr)
@@ -355,10 +356,10 @@ def test_prefill[
     randn(cache_ptr.as_span())
 
     # input row offsets and cache row offsets
-    var input_row_offsets = ctx.enqueue_create_host_buffer[DType.uint32](
+    var input_row_offsets = ctx.enqueue_create_host_buffer[.uint32](
         batch_size + 1
     )
-    var cache_row_offsets = ctx.enqueue_create_host_buffer[DType.uint32](
+    var cache_row_offsets = ctx.enqueue_create_host_buffer[.uint32](
         batch_size + 1
     )
     for i in range(batch_size):
@@ -402,10 +403,10 @@ def test_prefill[
     var v_device_ptr = ctx.enqueue_create_buffer[qkv_type](v_size)
     var cache_device_ptr = ctx.enqueue_create_buffer[k_rope_type](cache_size)
     var output_device_ptr = ctx.enqueue_create_buffer[output_type](o_size)
-    var input_row_offsets_device_ptr = ctx.enqueue_create_buffer[DType.uint32](
+    var input_row_offsets_device_ptr = ctx.enqueue_create_buffer[.uint32](
         batch_size + 1
     )
-    var cache_row_offsets_device_ptr = ctx.enqueue_create_buffer[DType.uint32](
+    var cache_row_offsets_device_ptr = ctx.enqueue_create_buffer[.uint32](
         batch_size + 1
     )
 
@@ -454,18 +455,19 @@ def test_prefill[
         row_major(batch_size + 1),
     )
 
-    @parameter
     @always_inline
-    @__copy_capture(
-        q_device,
-        k_device,
-        v_device,
-        cache_device,
-        input_row_offsets_device,
-        cache_row_offsets_device,
-        output_device,
-    )
-    def kernel_launch(ctx: DeviceContext) raises:
+    def kernel_launch(
+        ctx: DeviceContext,
+    ) raises {
+        var q_device,
+        var k_device,
+        var v_device,
+        var cache_device,
+        var input_row_offsets_device,
+        var cache_row_offsets_device,
+        var output_device,
+        imm,
+    }:
         flare_mla_prefill[rank=3](
             output_device,
             q_device,
@@ -487,7 +489,7 @@ def test_prefill[
         for _i in range(20):
             kernel_launch(ctx)
 
-        var nstime = Float64(ctx.execution_time[kernel_launch](nrun)) / Float64(
+        var nstime = Float64(ctx.execution_time(kernel_launch, nrun)) / Float64(
             nrun
         )
         var sectime = nstime / 1000000
@@ -589,7 +591,7 @@ def test_prefill[
     ctx.enqueue_copy(v_ref_device_ptr, v_ref_ptr)
 
     var null_valid_length = LayoutTensor[
-        DType.uint32, Layout.row_major(UNKNOWN_VALUE), MutAnyOrigin
+        .uint32, Layout.row_major(UNKNOWN_VALUE), MutAnyOrigin
     ](
         None,
         RuntimeLayout[Layout.row_major(UNKNOWN_VALUE)].row_major(Index(0)),
@@ -643,9 +645,9 @@ def test_prefill[
         for s in range(seq_len):
             for h in range(num_heads):
                 for d in range(kv_depth):
-                    lhs = output_rank4[b, s, h, d]
-                    rhs = output_ref[b, s, h, d]
-                    if abs((lhs - rhs)).cast[DType.float64]() > atol:
+                    var lhs = output_rank4[b, s, h, d]
+                    var rhs = output_ref[b, s, h, d]
+                    if abs((lhs - rhs)).cast[.float64]() > atol:
                         print(b, s, h, d, lhs, rhs)
                     # print(b, s, h, d, lhs, rhs)
                     assert_almost_equal(
@@ -669,7 +671,7 @@ def test_decoding[
     batch_size: Int,
     num_partitions: Optional[Int],
     split_k: Bool,
-    qkv_type: DType = DType.bfloat16,
+    qkv_type: DType = .bfloat16,
     output_type: DType = qkv_type,
 ](ctx: DeviceContext, use_index_input: Bool) raises:
     comptime if _is_sm10x_gpu(ctx.default_device_info):
@@ -884,6 +886,66 @@ def test_decoding[
         ](1, 2048, ctx, use_index_input=use_index_input)
 
 
+def test_decoding_partial_head_group[
+    batch_size: Int,
+    num_partitions: Optional[Int],
+    split_k: Bool,
+    qkv_type: DType = .bfloat16,
+    output_type: DType = qkv_type,
+](ctx: DeviceContext, use_index_input: Bool) raises:
+    """Covers head counts whose last head group is partial, with a
+    full-multiple control at the same shape so a failure is attributable to
+    the head count alone.
+    """
+    comptime for num_heads in [128, 96, 72]:
+        test[
+            qkv_type,
+            576,
+            num_heads,
+            group=num_heads,
+            against_gpu_naive=True,
+            batch_size=batch_size,
+            num_partitions=num_partitions,
+            decoding_warp_split_k=split_k,
+            output_type=output_type,
+        ](1, 1024, ctx, use_index_input=use_index_input)
+
+
+def test_decoding_k3_head_counts[
+    batch_size: Int,
+    num_partitions: Optional[Int],
+    split_k: Bool,
+](ctx: DeviceContext, seq_len: Int, num_keys: Int) raises:
+    """Kimi K3's per-device Q-head counts at TP2/TP4/TP8 -- 48, 24 and 12.
+
+    K3 serves bf16 KV, and the only K3 head count measured so far (12, in
+    `test_mla_decode_kv_fp8.mojo`) was measured under fp8 KV. These are the
+    counts `compute_mla_dispatch_scalars_runtime` has to enumerate for K3's
+    latent cache to dispatch at all, so they are measured here first.
+
+    48/24/12 are all a single head group. K3's TP1 count of 96 leaves a partial
+    tail head group, which `test_decoding_partial_head_group` covers directly,
+    so it is not repeated here. Of the three, only 12 tails the *combine* grid,
+    which blocks 8 heads per CTA at `warps_per_head=1` and so leaves 4 -- and
+    only a split-K run reaches that kernel at all.
+
+    The control comes FIRST at this exact shape and batch: an assert aborts the
+    run, so ordering a supported count ahead of an unusual one is what makes a
+    failure attributable to the head count rather than to the shape.
+    """
+    comptime for num_heads in [128, 48, 24, 12]:
+        test[
+            DType.bfloat16,
+            576,
+            num_heads,
+            group=num_heads,
+            against_gpu_naive=True,
+            batch_size=batch_size,
+            num_partitions=num_partitions,
+            decoding_warp_split_k=split_k,
+        ](seq_len, num_keys, ctx)
+
+
 def test_mla_prefill[
     batch_size: Int,
     qkv_type: DType,
@@ -1034,6 +1096,13 @@ def main() raises:
         test_decoding[128, 1, False](ctx, False)
         test_decoding[0, 1, False](ctx, False)
 
+        comptime if _is_sm10x_gpu(ctx.default_device_info):
+            test_decoding_partial_head_group[1, 1, False](ctx, False)
+            test_decoding_partial_head_group[2, 1, False](ctx, False)
+            # Under split-K a tail overrun would corrupt the next split's
+            # partials, which the combine kernel then folds into the output.
+            test_decoding_partial_head_group[1, 2, True](ctx, False)
+
         comptime if has_amd_gpu_accelerator():
             test_decoding[1, 4, False](ctx, False)
             test_decoding[27, 2, False](ctx, False)
@@ -1061,6 +1130,14 @@ def main() raises:
                 qkv_type=DType.float8_e4m3fn,
                 output_type=DType.bfloat16,
             ](ctx, False)
+
+        comptime if _is_sm10x_gpu(ctx.default_device_info):
+            test_decoding_k3_head_counts[2, 1, False](ctx, 1, 512)
+            test_decoding_k3_head_counts[1, 1, False](ctx, 1, 4096)
+            # Split-K is what launches the combine kernel, whose 8-head block
+            # these counts tail; an overrun there folds one split's partials
+            # into the next head's output.
+            test_decoding_k3_head_counts[1, 2, True](ctx, 1, 4096)
 
         # test mla prefill
         test_mla_prefill[2, DType.bfloat16, DType.bfloat16](ctx)

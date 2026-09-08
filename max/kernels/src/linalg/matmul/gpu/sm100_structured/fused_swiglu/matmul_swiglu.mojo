@@ -20,14 +20,16 @@ to half SMEM, TMA store to GMEM.
 from std.math import align_up, ceildiv
 from std.sys import size_of
 
-from std.gpu.host import DeviceContext, FuncAttribute
-from std.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.gpu.host.info import B200
-from std.gpu.primitives.grid_controls import pdl_launch_attributes, PDLLevel
+from max.gpu.host import DeviceContext, FuncAttribute
+from max.gpu.host.nvidia.tma import TensorMapSwizzle
+from max.gpu.host.info import B200
+from max.gpu.primitives.grid_controls import pdl_launch_attributes, PDLLevel
 from layout import (
     Coord,
+    DefaultEngine,
     Idx,
     RowMajorLayout,
+    TensorEngine,
     TensorLayout,
     TileTensor,
     row_major as tt_row_major,
@@ -52,13 +54,19 @@ def _blackwell_matmul_swiglu[
     config: FusedSwiGLUMatmulConfig[_, _, _, transpose_b],
     pdl_level: PDLLevel = PDLLevel(),
     BiasLayoutType: TensorLayout = RowMajorLayout[Int64],
+    BiasEngine: TensorEngine = DefaultEngine[element_width=1],
 ](
-    c_out: TileTensor,
+    c_out: TileTensor[...],
     a_device: TileTensor,
     b_device: TileTensor,
     ctx: DeviceContext,
     bias_tensor: OptionalReg[
-        TileTensor[config.c_type, BiasLayoutType, ImmutAnyOrigin]
+        TileTensor[
+            config.c_type,
+            BiasLayoutType,
+            ImmutAnyOrigin,
+            Engine=BiasEngine,
+        ]
     ] = None,
 ) raises:
     """Launch fused GEMM+SwiGLU kernel on SM100.
@@ -71,7 +79,7 @@ def _blackwell_matmul_swiglu[
                            (W pre-permuted on its N axis, gate/up adjacent)
         AB_swapped=True :  a_device = W [2H, K], b_device = X [M, K]
                            (W pre-permuted on its M axis with stride-8 row
-                            blocks — see _swiglu_epilogue_smem_tma docs)
+                             blocks: see _swiglu_epilogue_smem_tma docs)
 
     ``c_out`` is always [M, H] in user frame (H = N/2). The kernel computes
     A @ B^T in kernel frame and writes the SwiGLU-reduced output to
@@ -116,7 +124,7 @@ def _blackwell_matmul_swiglu[
 
     # Create TMA descriptors for A and B (same as default kernel)
     comptime a_tma_tile_shape = Index(1, BM // cluster_shape[1], BK)
-    a_tma_op = create_tma_tile[
+    var a_tma_op = create_tma_tile[
         KernelType.ATileLayout,
         KernelType.ADescLayout,
         a_tma_tile_shape,
@@ -126,7 +134,7 @@ def _blackwell_matmul_swiglu[
     comptime b_tma_tile_shape = Index(
         1, BN // (cluster_shape[0] // config.cta_group), BK
     )
-    b_tma_op = create_tma_tile[
+    var b_tma_op = create_tma_tile[
         KernelType.BTileLayout,
         KernelType.BDescLayout,
         b_tma_tile_shape,

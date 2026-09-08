@@ -30,7 +30,7 @@
 # The residual is applied as a TMA-epilogue load on the native path (cases 1, 4)
 # and as an elementwise (store) epilogue on every fallback.
 
-from std.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import alloc
 from internal_utils import assert_almost_equal
 from std.random import rand
@@ -71,9 +71,9 @@ def _make_epilogue[
 def _add_residual_and_assert[
     c_type: DType, //
 ](
-    c_host_ptr: UnsafePointer[Scalar[c_type], MutAnyOrigin],
-    c_ref_host_ptr: UnsafePointer[Scalar[c_type], MutAnyOrigin],
-    resid_host_ptr: UnsafePointer[Scalar[c_type], MutAnyOrigin],
+    c_host_ptr: MutPointer[Scalar[c_type], MutAnyOrigin],
+    c_ref_host_ptr: MutPointer[Scalar[c_type], MutAnyOrigin],
+    resid_host_ptr: MutPointer[Scalar[c_type], MutAnyOrigin],
     M: Int,
     N: Int,
     epilogue_is_1d: Bool,
