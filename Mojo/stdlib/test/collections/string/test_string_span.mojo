@@ -824,52 +824,52 @@ def test_lstrip() raises:
 def test_rstrip_large_strings() raises:
     # Tests exercising the SIMD path (strings longer than one register width).
     # All-whitespace strings
-    all_space_65 = " " * 65
+    var all_space_65 = " " * 65
     assert_true(StringSlice(all_space_65).rstrip() == "")
 
-    all_space_128 = "\t" * 128
+    var all_space_128 = "\t" * 128
     assert_true(StringSlice(all_space_128).rstrip() == "")
 
     # No trailing whitespace: compare length and content via owned String
-    no_trail_65 = "a" * 65
+    var no_trail_65 = "a" * 65
     assert_true(no_trail_65 == String(StringSlice(no_trail_65).rstrip()))
 
     # One whitespace byte at the very end (scalar tail)
-    trail_one = "a" * 64 + " "
+    var trail_one = "a" * 64 + " "
     assert_true(StringSlice(trail_one).rstrip() == "a" * 64)
 
     # Trailing whitespace spanning the scalar tail and a full SIMD block
-    trail_many = "a" * 64 + " " * 65
+    var trail_many = "a" * 64 + " " * 65
     assert_true(StringSlice(trail_many).rstrip() == "a" * 64)
 
     # Last non-whitespace is in the middle of a SIMD block
-    content_mid = "a" * 48 + "x" + " " * 80
+    var content_mid = "a" * 48 + "x" + " " * 80
     assert_true(StringSlice(content_mid).rstrip() == "a" * 48 + "x")
 
     # All different whitespace types in the trailing region
-    mixed_ws = "hello" + "\t\n\v\f\r\x1c\x1d\x1e " * 10
+    var mixed_ws = "hello" + "\t\n\v\f\r\x1c\x1d\x1e " * 10
     assert_true(StringSlice(mixed_ws).rstrip() == "hello")
 
 
 def test_lstrip_large_strings() raises:
     # Tests exercising the SIMD path (strings longer than one register width).
     # All-whitespace strings
-    all_space_65 = " " * 65
+    var all_space_65 = " " * 65
     assert_true(StringSlice(all_space_65).lstrip() == "")
 
-    all_space_128 = "\t" * 128
+    var all_space_128 = "\t" * 128
     assert_true(StringSlice(all_space_128).lstrip() == "")
 
     # No leading whitespace: compare via owned String
-    no_lead_65 = "a" * 65
+    var no_lead_65 = "a" * 65
     assert_true(no_lead_65 == String(StringSlice(no_lead_65).lstrip()))
 
     # One whitespace byte at the very start (within first SIMD block)
-    lead_one = " " + "a" * 64
+    var lead_one = " " + "a" * 64
     assert_true(StringSlice(lead_one).lstrip() == "a" * 64)
 
     # Leading whitespace spanning multiple SIMD blocks
-    lead_many = " " * 65 + "a" * 64
+    var lead_many = " " * 65 + "a" * 64
     assert_true(StringSlice(lead_many).lstrip() == "a" * 64)
 
     # First non-whitespace in the middle of a SIMD block
