@@ -19,9 +19,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from max.config import ConfigFileModel
+from max.config import ConfigFileModel, deep_merge_max_configs
 from max.driver import DeviceSpec
-from max.pipelines.diffusion.cache import DenoisingCacheConfig
+from max.pipelines.diffusion.config import DenoisingCacheSettings
 from max.pipelines.kv_cache.config import KVCacheConfig
 from max.pipelines.lib.config.model_config import (
     MAXModelConfig,
@@ -61,7 +61,7 @@ _FLAT_KWARG_SUBTREES: tuple[tuple[str, type[ConfigFileModel]], ...] = (
     ("lora", LoRAConfig),
     ("profiling", ProfilingConfig),
     ("runtime", PipelineRuntimeConfig),
-    ("runtime.denoising_cache", DenoisingCacheConfig),
+    ("denoising_cache", DenoisingCacheSettings),
     ("sampling", SamplingConfig),
     ("kv_cache", KVCacheConfig),
 )
@@ -69,6 +69,11 @@ _FLAT_KWARG_SUBTREES: tuple[tuple[str, type[ConfigFileModel]], ...] = (
 # Inherited from ConfigFileModel by every sub-config, so they identify no
 # subtree; both are consumed at the top level.
 _SHARED_CONFIG_FIELDS = frozenset({"config_file", "section_name"})
+
+# ``denoising_cache`` is a PipelineArgs section and a runtime field name.
+_SECTION_NAMES = frozenset(
+    path.split(".")[0] for path, _ in _FLAT_KWARG_SUBTREES
+)
 
 
 def _nest_flat_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -85,7 +90,9 @@ def _nest_flat_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
         popped = {
             field: nested.pop(field)
             for field in config_class.model_fields
-            if field in nested and field not in _SHARED_CONFIG_FIELDS
+            if field in nested
+            and field not in _SHARED_CONFIG_FIELDS
+            and field not in _SECTION_NAMES
         }
         # ``None`` means "flag not supplied", so dropping it lets the config
         # file (then the field default) win instead of a placeholder.
@@ -124,9 +131,12 @@ class PipelineArgs(ConfigFileModel):
 
     Call :meth:`PipelineConfig.from_args` to obtain a fully-constructed
     :class:`PipelineConfig` ready for architecture-driven resolution.
+
+    Instances are immutable: assigning to a field after construction raises
+    a pydantic ``ValidationError``.
     """
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     # ------------------------------------------------------------------ #
     # Top-level pipeline fields
@@ -154,6 +164,16 @@ class PipelineArgs(ConfigFileModel):
         description=(
             "When ``device_graph_capture`` is enabled, execute eager launch-trace "
             "verification before replay. Intended for debugging only."
+        ),
+    )
+
+    tokenizer_impl: str | None = Field(
+        default=None,
+        description=(
+            "Cascade only: import path of the TokenizerWorker subclass to "
+            "construct for text-generation pipelines, as "
+            "``'module.path:ClassName'``. Left unset, uses the HuggingFace "
+            "tokenizer."
         ),
     )
 
@@ -306,6 +326,16 @@ class PipelineArgs(ConfigFileModel):
         default_factory=PipelineRuntimeConfig,
         description="Runtime and scheduling configuration.",
     )
+
+    denoising_cache: DenoisingCacheSettings = Field(
+        default_factory=DenoisingCacheSettings,
+        description=(
+            "Denoising-cache settings (TaylorSeer / FBCache) for diffusion "
+            "pipelines. Unset fields resolve against the architecture's "
+            "declared defaults when the PipelineConfig is constructed."
+        ),
+    )
+    """User denoising-cache settings. Construction fills unset fields."""
 
     sampling: SamplingConfig = Field(
         default_factory=SamplingConfig,
@@ -479,7 +509,14 @@ class PipelineArgs(ConfigFileModel):
                 existing_kv = kwargs.get("kv_cache", {})
                 if isinstance(existing_kv, KVCacheConfig):
                     existing_kv = existing_kv.model_dump()
-                kwargs["kv_cache"] = {**recipe_kv, **existing_kv}
+                # Merge field-wise, recursing into nested sub-configs, so a
+                # partial CLI override of a dict-valued field (notably
+                # ``kv_connector_config``) keeps the recipe's other fields
+                # instead of resetting them to defaults -- silently dropping a
+                # recipe's connector ``type`` would disable KV offloading.
+                kwargs["kv_cache"] = deep_merge_max_configs(
+                    recipe_kv, existing_kv
+                )
             new_model_path = kwargs.get("model_path")
             recipe_model_path = model_kwarg.get("model_path")
             if (

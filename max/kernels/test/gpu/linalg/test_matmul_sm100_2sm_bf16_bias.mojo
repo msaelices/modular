@@ -127,7 +127,7 @@ def test_blackwell_matmul_with_epilogue_tensor[
         matmul_config.c_type,
         type_of(epilogue_shape),
         ImmutAnyOrigin,
-        Storage=epilogue_tile.Storage,
+        Engine=epilogue_tile.Engine,
     ]
     blackwell_matmul_tma_umma_warp_specialized[
         transpose_b=transpose_b,
@@ -217,7 +217,7 @@ def main() raises:
                     test_blackwell_matmul_with_epilogue_tensor[
                         dtype,
                         dtype,
-                        DType.bfloat16,
+                        .bfloat16,
                         block_tile_shape,
                         umma_shape,
                         cluster_shape=StaticTuple[Int32, 3](4, 4, 1),
@@ -238,7 +238,7 @@ def main() raises:
                         test_blackwell_matmul_with_epilogue_tensor[
                             dtype,
                             dtype,
-                            DType.bfloat16,
+                            .bfloat16,
                             block_tile_shape,
                             umma_shape,
                             cluster_shape=StaticTuple[Int32, 3](4, 4, 1),
@@ -256,7 +256,7 @@ def main() raises:
                         test_blackwell_matmul_with_epilogue_tensor[
                             dtype,
                             dtype,
-                            DType.bfloat16,
+                            .bfloat16,
                             block_tile_shape,
                             umma_shape,
                             cluster_shape=StaticTuple[Int32, 3](4, 4, 1),
@@ -277,7 +277,7 @@ def main() raises:
                     test_blackwell_matmul_with_epilogue_tensor[
                         dtype,
                         dtype,
-                        DType.bfloat16,
+                        .bfloat16,
                         block_tile_shape,
                         umma_shape,
                         cluster_shape=StaticTuple[Int32, 3](8, 2, 1),
@@ -294,7 +294,7 @@ def main() raises:
                     test_blackwell_matmul_with_epilogue_tensor[
                         dtype,
                         dtype,
-                        DType.bfloat16,
+                        .bfloat16,
                         block_tile_shape,
                         umma_shape,
                         cluster_shape=StaticTuple[Int32, 3](4, 4, 1),

@@ -41,7 +41,7 @@ from std.utils import Index, IndexList, StaticTuple
 from std.collections import Array
 from std.utils.numerics import get_accum_type
 
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     block_idx,
@@ -50,10 +50,10 @@ from std.gpu import (
 )
 from max.gpu.host import DeviceContext
 from max.gpu.host.info import MI355X
-from std.gpu.intrinsics import AMDBufferResource
+from max.gpu.intrinsics import AMDBufferResource
 from max.gpu.sync import schedule_barrier, s_waitcnt
 
-from layout import TensorLayout, TileTensor
+from layout import TensorLayout, TensorEngine, TileTensor
 from layout.swizzle import Swizzle
 from layout.tile_layout import row_major
 from layout.tile_tensor import stack_allocation
@@ -778,12 +778,15 @@ struct AMD4WaveMatmul[
         a_layout: TensorLayout,
         b_layout: TensorLayout,
         c_layout: TensorLayout,
+        a_engine: TensorEngine,
+        b_engine: TensorEngine,
+        c_engine: TensorEngine,
         *,
         num_splits: Int = 1,
     ](
-        a: TileTensor[Self.a_type, a_layout, ImmutAnyOrigin],
-        b: TileTensor[Self.b_type, b_layout, ImmutAnyOrigin],
-        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin],
+        a: TileTensor[Self.a_type, a_layout, ImmutAnyOrigin, Engine=a_engine],
+        b: TileTensor[Self.b_type, b_layout, ImmutAnyOrigin, Engine=b_engine],
+        c: TileTensor[Self.c_type, c_layout, MutAnyOrigin, Engine=c_engine],
     ):
         """Runs the 4-wave GEMM kernel for one workgroup tile.
 
@@ -797,6 +800,9 @@ struct AMD4WaveMatmul[
             a_layout: Logical layout of `a`.
             b_layout: Logical layout of `b`.
             c_layout: Logical layout of `c`.
+            a_engine: Engine of `a`.
+            b_engine: Engine of `b`.
+            c_engine: Engine of `c`.
             num_splits: Split-K factor (1 means no split).
 
         Args:
@@ -865,30 +871,30 @@ struct AMD4WaveMatmul[
 
         # === SMEM: 2 stages x 2 M-subtiles for A, 2 stages x 2 N-subtiles for B
         comptime a_half_layout = row_major[half_BM, BK]()
-        var a_s0_g0 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var a_s0_g0 = stack_allocation[Self.in_type, address_space=.SHARED](
             a_half_layout
         )
-        var a_s0_g1 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var a_s0_g1 = stack_allocation[Self.in_type, address_space=.SHARED](
             a_half_layout
         )
-        var a_s1_g0 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var a_s1_g0 = stack_allocation[Self.in_type, address_space=.SHARED](
             a_half_layout
         )
-        var a_s1_g1 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var a_s1_g1 = stack_allocation[Self.in_type, address_space=.SHARED](
             a_half_layout
         )
 
         comptime b_half_layout = row_major[half_BN, BK]()
-        var b_s0_h0 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var b_s0_h0 = stack_allocation[Self.in_type, address_space=.SHARED](
             b_half_layout
         )
-        var b_s0_h1 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var b_s0_h1 = stack_allocation[Self.in_type, address_space=.SHARED](
             b_half_layout
         )
-        var b_s1_h0 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var b_s1_h0 = stack_allocation[Self.in_type, address_space=.SHARED](
             b_half_layout
         )
-        var b_s1_h1 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var b_s1_h1 = stack_allocation[Self.in_type, address_space=.SHARED](
             b_half_layout
         )
 
@@ -1408,30 +1414,30 @@ struct AMD4WaveMatmul[
 
         # === SMEM: 2 stages x 2 M-subtiles for A, 2 stages x 2 N-subtiles for B
         comptime a_half_layout = row_major[half_BM, BK]()
-        var a_s0_g0 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var a_s0_g0 = stack_allocation[Self.in_type, address_space=.SHARED](
             a_half_layout
         )
-        var a_s0_g1 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var a_s0_g1 = stack_allocation[Self.in_type, address_space=.SHARED](
             a_half_layout
         )
-        var a_s1_g0 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var a_s1_g0 = stack_allocation[Self.in_type, address_space=.SHARED](
             a_half_layout
         )
-        var a_s1_g1 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var a_s1_g1 = stack_allocation[Self.in_type, address_space=.SHARED](
             a_half_layout
         )
 
         comptime b_half_layout = row_major[half_BN, BK]()
-        var b_s0_h0 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var b_s0_h0 = stack_allocation[Self.in_type, address_space=.SHARED](
             b_half_layout
         )
-        var b_s0_h1 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var b_s0_h1 = stack_allocation[Self.in_type, address_space=.SHARED](
             b_half_layout
         )
-        var b_s1_h0 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var b_s1_h0 = stack_allocation[Self.in_type, address_space=.SHARED](
             b_half_layout
         )
-        var b_s1_h1 = stack_allocation[Self.in_type, AddressSpace.SHARED](
+        var b_s1_h1 = stack_allocation[Self.in_type, address_space=.SHARED](
             b_half_layout
         )
 
@@ -1827,7 +1833,7 @@ struct AMD4WaveMatmul[
             # The `load` API likewise takes its `vector_offset` argument
             # in elements and multiplies by `size_of[dtype]()` to derive
             # the buffer byte offset — see `AMDBufferResource.load` in
-            # `std.gpu.intrinsics`. Both sides must agree: passing a
+            # `max.gpu.intrinsics`. Both sides must agree: passing a
             # byte-scaled `num_records` paired with a byte-scaled
             # `vector_offset` doubles the effective stride (the bug
             # this fix replaces), making workgroups with
@@ -1924,10 +1930,8 @@ struct AMD4WaveMatmul[
                         comptime if has_residual:
                             var skip = prefetched[
                                 m_mma * num_n_mmas + n_mma
-                            ].cast[DType.float32]()
-                            var fused_f32 = (
-                                v.cast[DType.float32]() + beta * skip
-                            )
+                            ].cast[.float32]()
+                            var fused_f32 = v.cast[.float32]() + beta * skip
                             v = fused_f32.cast[Self.c_type]()
                         c_writer.store(v, m=m_dram, n=n_global)
 
@@ -2020,9 +2024,7 @@ def structured_4wave_matmul[
     """
     comptime assert a_type == b_type, "A and B must have the same type"
     comptime assert (
-        a_type.is_float8()
-        or a_type == DType.bfloat16
-        or a_type == DType.float16
+        a_type.is_float8() or a_type == .bfloat16 or a_type == .float16
     ), "4-wave supports float8_e4m3fn, bfloat16, or float16"
 
     # MMA K-dim selection: FP8 uses MFMA 16x16x128; bf16/fp16 use MFMA
@@ -2061,12 +2063,16 @@ def structured_4wave_matmul[
             enable_swizzle,
             elementwise_lambda_fn=elementwise_lambda_fn,
         ].run[
-            a.LayoutType,
-            b.LayoutType,
-            c.LayoutType,
+            type_of(a).LayoutType,
+            type_of(b).LayoutType,
+            type_of(c).LayoutType,
+            type_of(a).Engine,
+            type_of(b).Engine,
+            type_of(c).Engine,
         ]
 
         var num_blocks_n = ceildiv(N, config.block_shape[1])
+
         var num_blocks_m = ceildiv(M, config.block_shape[0])
         comptime if dump_asm_path != "":
             ctx.enqueue_function[kernel, dump_asm=dump_asm_path](

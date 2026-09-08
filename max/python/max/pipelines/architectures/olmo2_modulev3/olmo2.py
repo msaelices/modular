@@ -25,10 +25,11 @@ from max.experimental.nn.embedding import Embedding
 from max.experimental.nn.linear import Linear
 from max.experimental.nn.sequential import ModuleList
 from max.experimental.tensor import Tensor
-from max.graph import TensorValue, ops
+from max.graph import ops
 from max.nn.kv_cache import (
     KVCacheInputs,
     KVCacheParamInterface,
+    KVCacheParams,
     PagedCacheValues,
 )
 from max.nn.transformer import ReturnLogits
@@ -87,6 +88,9 @@ class Olmo2TextModel(
             eps=config.rms_norm_eps,
         )
 
+        kv_params = config.kv_params
+        assert isinstance(kv_params, KVCacheParams)
+
         layers = []
         for i in range(config.num_hidden_layers):
             layers.append(
@@ -96,7 +100,7 @@ class Olmo2TextModel(
                         num_attention_heads=config.num_attention_heads,
                         num_key_value_heads=config.num_key_value_heads,
                         hidden_size=config.hidden_size,
-                        kv_params=config.kv_params,
+                        kv_params=kv_params,
                         layer_idx=i,
                         scale=config.attention_multiplier,
                         has_bias=config.attention_bias,
@@ -173,7 +177,7 @@ class Olmo2TextModel(
             logits = self._compute_logits(self.norm(last_tokens))
             offsets = ops.range(
                 0,
-                TensorValue(last_indices.shape[0]) + return_n_logits[0],
+                last_indices.shape[0] + return_n_logits[0],
                 return_n_logits[0],
                 out_dim="logit_offsets",
                 device=h.device,

@@ -28,7 +28,7 @@ kernel wins on 1×1), K >= 16 (below MMA_K).
 from std.math import ceildiv
 from std.math.uutils import udivmod
 from std.sys.info import has_apple_gpu_accelerator, size_of
-from std.gpu import block_dim, block_idx, global_idx, thread_idx
+from max.gpu import block_dim, block_idx, global_idx, thread_idx
 from max.gpu.host import DeviceContext
 from layout import Coord, Idx, TileTensor, row_major
 from linalg.matmul.gpu import _matmul_gpu
@@ -232,7 +232,7 @@ def dispatch_im2col_matmul_conv2d[
     comptime assert filter.flat_rank == 4, "filter must be rank 4"
     comptime assert output.flat_rank == 4, "output must be rank 4 (NHWC)"
 
-    comptime if input_type != DType.bfloat16:
+    comptime if input_type != .bfloat16:
         return False
 
     if num_groups != 1:
@@ -365,8 +365,8 @@ def dispatch_im2col_matmul_conv2d[
         var a_tt = TileTensor(im2col_ptr, row_major(Coord(m_count, K)))
         var b_tt = TileTensor(filter_nk_ptr, row_major(Coord(N, K)))
         # NHWC rows are contiguous in the flattened [M, N] layout.
-        var c_ptr = output.ptr + m_offset * N
-        var c_tt = TileTensor(c_ptr, row_major(Coord(m_count, N)))
+        var c_engine = output._offset_storage(m_offset * N)
+        var c_tt = TileTensor(c_engine, row_major(Coord(m_count, N)))
 
         comptime if maybe_epilogue_func:
             comptime epilogue_4d = maybe_epilogue_func.value()
@@ -480,7 +480,7 @@ def dispatch_fused_im2col_conv2d_apple[
     comptime assert filter.flat_rank == 4, "filter must be rank 4"
     comptime assert output.flat_rank == 4, "output must be rank 4 (NHWC)"
 
-    comptime if input_type != DType.bfloat16:
+    comptime if input_type != .bfloat16:
         return False
 
     if num_groups != 1:
@@ -574,7 +574,7 @@ def dispatch_fused_im2col_conv2d_apple[
     ](filter_nk_ptr)
     var filter_nk = TileTensor(filter_nk_in_ptr, row_major(Coord(N, K)))
     # Flat (M, N) view of the NHWC output buffer (NHWC rows are contiguous).
-    var c_tt = TileTensor(output.ptr, row_major(Coord(full_M, N)))
+    var c_tt = output.reshape(row_major(Coord(full_M, N)))
 
     var conv = ConvIm2colParams(
         H=Int32(H),
