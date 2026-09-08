@@ -2970,6 +2970,7 @@ def msa_sparse_attention_ragged(
     *,
     group: int,
     topk: int,
+    sparse_block_size: int,
     scale: float,
 ) -> TensorValue:
     """Computes MiniMax-M3 block-sparse attention over the main paged KV cache.
@@ -2997,6 +2998,9 @@ def msa_sparse_attention_ragged(
             topk]``; decode: ``[n_kv_heads, batch, topk]``. int32.
         group: Query heads per kv-head (``n_heads // n_kv_heads``).
         topk: Number of gathered KV blocks per token.
+        sparse_block_size: KV block size in tokens; the model's
+            ``sparse_attention_config.sparse_block_size``. Must equal the
+            KV cache page size and the kernel's ``BN``.
         scale: QK scale.
 
     Returns:
@@ -3029,6 +3033,7 @@ def msa_sparse_attention_ragged(
         parameters={
             "group": group,
             "topk": topk,
+            "sparse_block_size": sparse_block_size,
         },
     )[0].tensor
 
@@ -3045,6 +3050,7 @@ def msa_sparse_attention_ragged_mxfp8(
     *,
     group: int,
     topk: int,
+    sparse_block_size: int,
     scale: float,
 ) -> tuple[TensorValue, TensorValue]:
     """Computes MiniMax-M3 block-sparse attention, emitting MXFP8 + scales.
@@ -3074,6 +3080,9 @@ def msa_sparse_attention_ragged_mxfp8(
             topk]``; decode: ``[n_kv_heads, batch, topk]``. int32.
         group: Query heads per kv-head (``n_heads // n_kv_heads``).
         topk: Number of gathered KV blocks per token.
+        sparse_block_size: KV block size in tokens; the model's
+            ``sparse_attention_config.sparse_block_size``. Must equal the
+            KV cache page size and the kernel's ``BN``.
         scale: QK scale.
 
     Returns:
@@ -3121,6 +3130,7 @@ def msa_sparse_attention_ragged_mxfp8(
         parameters={
             "group": group,
             "topk": topk,
+            "sparse_block_size": sparse_block_size,
         },
     )
     return results[0].tensor, results[1].tensor

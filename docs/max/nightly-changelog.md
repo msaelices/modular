@@ -749,6 +749,13 @@ the [container](/container) page now links to the new page.
 
 ### Python API
 
+- `max.nn.kernels.msa_sparse_attention_ragged` and
+  `msa_sparse_attention_ragged_mxfp8` take a required
+  `sparse_block_size`: the KV block size in tokens from the model's
+  `sparse_attention_config`. It must equal the KV cache page size, and
+  the kernel now asserts that rather than inferring a block size from
+  the attention tile-width default.
+
 - `max.experimental.nn.Module.compile` reuses precompiled MEFs when the session
   has them, so a ModuleV3 model can be compiled where no accelerator is attached
   and initialized where one is. `max.experimental.support.set_export_mefs`
