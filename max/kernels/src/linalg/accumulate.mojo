@@ -229,15 +229,11 @@ struct _Accumulator[
             var transfer_count = min(
                 c_bound[1] - tile_n_idx, Self.num_cols * Self.simd_width
             )
-            var row_ptrs = Array[
-                UnsafePointer[Scalar[Self.dtype], AnyOrigin[mut=c_ptr.mut]],
-                Self.num_rows,
-            ](uninitialized=True)
-
-            comptime for row in range(Self.num_rows):
-                row_ptrs[row] = (
-                    c_ptr_loc + row * c_stride
-                ).as_unsafe_any_origin()
+            var row_ptrs = Array[_, Self.num_rows](
+                fill_with=lambda (row: Int) -> UnsafePointer[
+                    Scalar[Self.dtype], AnyOrigin[mut=c_ptr.mut]
+                ]: (c_ptr_loc + row * c_stride).as_unsafe_any_origin()
+            )
 
             self._transfer_loop[0, is_load](
                 transfer_count, row_ptrs.unsafe_ptr(), c_stride
@@ -571,7 +567,7 @@ struct _Accumulator[
         mut self,
         length: Int,
         a: UnsafePointer[mut=False, Scalar[a_type], ...],
-        a_base_offsets: TileTensor[mut=False, DType.int32, ...],
+        a_base_offsets: TileTensor[mut=False, .int32, ...],
         a_offset: Int,
         b: UnsafePointer[mut=False, Scalar[b_type], ...],
         b_stride: Int,
@@ -747,7 +743,7 @@ struct _Accumulator[
         mut self,
         length: Int,
         a: UnsafePointer[mut=False, Scalar[a_type], ...],
-        a_base_offsets: TileTensor[mut=False, DType.int32, ...],
+        a_base_offsets: TileTensor[mut=False, .int32, ...],
         a_offset: Int,
         b: UnsafePointer[mut=False, Scalar[b_type], ...],
         b_stride: Int,
@@ -857,9 +853,8 @@ struct _Accumulator[
         """Accumulation optimized for NEON."""
         comptime assert CompilationTarget.has_neon()
 
-        @__parameter
         @always_inline
-        def micro_kernel[num_lanes: Int](offset: Int):
+        def micro_kernel[num_lanes: Int](offset: Int) {mut self, imm}:
             var a_vecs = Array[SIMD[a_type, num_lanes], Self.num_rows](
                 uninitialized=True
             )
@@ -891,7 +886,7 @@ struct _Accumulator[
                 b_ptr = b_ptr + b_stride
 
         # Load vectors from A first. The remainder is handled one element at a time.
-        tile[micro_kernel, [Self.simd_width, 1]](0, length)
+        tile[[Self.simd_width, 1]](0, length, micro_kernel)
 
     @always_inline
     def _accumulate_neon[
@@ -904,7 +899,7 @@ struct _Accumulator[
         mut self,
         length: Int,
         a: UnsafePointer[mut=False, Scalar[a_type], ...],
-        a_base_offsets: TileTensor[mut=False, DType.int32, ...],
+        a_base_offsets: TileTensor[mut=False, .int32, ...],
         a_offset: Int,
         b: UnsafePointer[mut=False, Scalar[b_type], ...],
         b_stride: Int,
@@ -916,9 +911,8 @@ struct _Accumulator[
             a_base_offsets.flat_rank == 1
         ), "a_base_offsets must be rank 1"
 
-        @__parameter
         @always_inline
-        def micro_kernel[num_lanes: Int](offset: Int):
+        def micro_kernel[num_lanes: Int](offset: Int) {mut self, imm}:
             var a_vecs = Array[SIMD[a_type, num_lanes], Self.num_rows](
                 uninitialized=True
             )
@@ -951,7 +945,7 @@ struct _Accumulator[
                 b_ptr += b_stride
 
         # Load vectors from A first. The remainder is handled one element at a time.
-        tile[micro_kernel, [Self.simd_width, 1]](0, length)
+        tile[[Self.simd_width, 1]](0, length, micro_kernel)
 
 
 @always_inline

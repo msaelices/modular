@@ -23,7 +23,7 @@ The grid dimensions are organized as:
 - blockIdx.z: Batch index (n)
 """
 
-from std.gpu import block_idx, thread_idx, grid_dim
+from max.gpu import block_idx, thread_idx, grid_dim
 from max.gpu.host import DeviceContext
 
 from conv_utils import idx_x, idx_f, idx_y, conv_cpu, init_data, verify_results
@@ -38,9 +38,9 @@ def conv_layer_forward_kernel(
     W_dev: Int32,
     K_dev: Int32,
     W_grid_dev: Int32,
-    X: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    F: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    Y: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    X: UnsafePointer[Float32, ImmutAnyOrigin],
+    F: UnsafePointer[Float32, ImmutAnyOrigin],
+    Y: UnsafePointer[Float32, MutAnyOrigin],
 ):
     """Convolution layer forward kernel.
 
@@ -128,9 +128,9 @@ def main() raises:
     var ctx = DeviceContext()
 
     # Allocate device memory
-    var d_X = ctx.enqueue_create_buffer[DType.float32](size_X)
-    var d_F = ctx.enqueue_create_buffer[DType.float32](size_F)
-    var d_Y = ctx.enqueue_create_buffer[DType.float32](size_Y)
+    var d_X = ctx.enqueue_create_buffer[.float32](size_X)
+    var d_F = ctx.enqueue_create_buffer[.float32](size_F)
+    var d_Y = ctx.enqueue_create_buffer[.float32](size_Y)
 
     # Copy to device
     ctx.enqueue_copy(d_X, h_X)

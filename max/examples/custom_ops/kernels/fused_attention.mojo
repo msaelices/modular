@@ -55,7 +55,7 @@ leading to the final output.
 from std.math import exp
 
 from max.gpu.host import DeviceContext
-from std.gpu import block_idx
+from max.gpu import block_idx
 from max.gpu.sync import barrier
 from layout import Layout, LayoutTensor
 from layout.math import max, sum
@@ -262,7 +262,7 @@ def matmul[
             res.dtype,
             Layout.row_major(M, N),
             MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
         ].stack_allocation()
 
         comptime BK = 8

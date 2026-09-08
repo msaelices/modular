@@ -27,7 +27,7 @@ from std.sys.info import (
 from linalg.fp8_quantization import naive_blockwise_scaled_fp8_matmul
 from max.algorithm import elementwise, sync_parallelize
 from max.algorithm.functional import _get_start_indices_of_nth_subvolume
-from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, global_idx
+from max.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, global_idx
 from max.gpu.host import DeviceContext, FuncAttribute
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from max.gpu.host.info import A100, is_cpu, is_valid_target
@@ -155,7 +155,7 @@ def _reshape_tile_tensor_with_batch_to_3d(
             _shape_types_to_3d[tensor.LayoutType._shape_types](),
             _slice_types[tensor.LayoutType._stride_types, 3](),
         ],
-        dtype=tensor.dtype,
+        tensor.dtype,
         origin=tensor.origin,
         address_space=tensor.address_space,
         linear_idx_type=tensor.linear_idx_type,
@@ -226,15 +226,9 @@ def _batched_matmul_cpu[
     elementwise_epilogue_fn: Optional[elementwise_epilogue_type] = None,
     saturated_vnni: Bool = False,
 ](
-    c_tile: TileTensor[
-        mut=True, c_type, address_space=AddressSpace.GENERIC, ...
-    ],
-    a_tile: TileTensor[
-        mut=False, a_type, address_space=AddressSpace.GENERIC, ...
-    ],
-    b_tile: TileTensor[
-        mut=False, b_type, address_space=AddressSpace.GENERIC, ...
-    ],
+    c_tile: TileTensor[mut=True, c_type, address_space=.GENERIC, ...],
+    a_tile: TileTensor[mut=False, a_type, address_space=.GENERIC, ...],
+    b_tile: TileTensor[mut=False, b_type, address_space=.GENERIC, ...],
     ctx: Optional[DeviceContext] = None,
 ) raises:
     comptime assert rank < 5, "max rank for batched matmul is currently 4"
@@ -341,9 +335,19 @@ def _batched_matmul_cpu[
     var num_tasks = num_tasks_batch * num_tasks_matmul
 
     @always_inline
-    @__copy_capture(a, b, c, num_tasks_batch, num_tasks_matmul, m, n, k)
-    @__parameter
-    def task_func(task_id: Int):
+    def task_func(
+        task_id: Int,
+    ) {
+        var a,
+        var b,
+        var c,
+        var num_tasks_batch,
+        var num_tasks_matmul,
+        var m,
+        var n,
+        var k,
+        imm,
+    }:
         var a_stride_between_batches = a.num_elements() // Int(a.dim[0]())
         var b_stride_between_batches = b.num_elements() // Int(b.dim[0]())
         var c_stride_between_batches = c.num_elements() // Int(c.dim[0]())
@@ -463,7 +467,7 @@ def _batched_matmul_cpu[
                 )
             _ = batch_coords
 
-    sync_parallelize[task_func](num_tasks, ctx)
+    sync_parallelize(task_func, num_tasks, ctx)
 
 
 @__name(
@@ -658,7 +662,16 @@ def batched_matmul_kernel_gpu[
             Optional[matmul_elementwise_epilogue_type](
                 elementwise_epilogue_fn_wrapper
             ) if elementwise_lambda_fn else None,
-        ].run(c, a, b)
+        ].run[
+            type_of(c).LayoutType,
+            type_of(a).LayoutType,
+            type_of(b).LayoutType,
+            type_of(c).Engine,
+            type_of(a).Engine,
+            type_of(b).Engine,
+        ](
+            c, a, b
+        )
 
 
 @always_inline
@@ -929,9 +942,9 @@ def batched_matmul[
     saturated_vnni: Bool = False,
     target: StaticString = "cpu",
 ](
-    c_buf: TileTensor[mut=True, address_space=AddressSpace.GENERIC, ...],
-    a_buf: TileTensor[mut=False, address_space=AddressSpace.GENERIC, ...],
-    b_buf: TileTensor[mut=False, address_space=AddressSpace.GENERIC, ...],
+    c_buf: TileTensor[mut=True, address_space=.GENERIC, ...],
+    a_buf: TileTensor[mut=False, address_space=.GENERIC, ...],
+    b_buf: TileTensor[mut=False, address_space=.GENERIC, ...],
     *,
     context: Optional[DeviceContext] = None,
 ) raises:
@@ -986,9 +999,7 @@ def batched_matmul[
     )
 
     @always_inline
-    @__copy_capture(a_shape, b_shape, c_shape)
-    @__parameter
-    def description_fn() -> String:
+    def description_fn() {var a_shape, var b_shape, var c_shape, imm} -> String:
         # fmt: off
         return String(
             trace_arg("A", a_shape, a_buf.dtype),
@@ -1001,7 +1012,7 @@ def batched_matmul[
 
     with Trace[TraceLevel.OP, target=target](
         "batched_matmul",
-        Trace[TraceLevel.OP]._get_detail_str[description_fn](),
+        Trace[TraceLevel.OP]._get_detail_str(description_fn),
         task_id=get_safe_task_id(context),
     ):
         comptime assert is_valid_target[target](), "unsupported target"
@@ -1274,11 +1285,11 @@ def bmm_sm100_blockwise_scaled_fp8[
     comptime assert transpose_b, "Only support transposed B"
 
     comptime assert (
-        a_type == b_type == DType.float8_e4m3fn
+        a_type == b_type == .float8_e4m3fn
     ), "Only support float8_e4m3fn"
 
     comptime assert (
-        b_scales_type == a_scales_type == DType.float32
+        b_scales_type == a_scales_type == .float32
     ), "Only support float32 for a_scales and b_scales"
 
     comptime assert c.rank == 3, "Only support rank 3 tensors"
@@ -1483,11 +1494,11 @@ def batched_matmul_dynamic_scaled_fp8_naive[
     var b_scales_lt = b_scales_.to_layout_tensor()
 
     # naive implementation requires all tensor have AddressSpace.GENERIC
-    var c = c_lt.address_space_cast[AddressSpace.GENERIC]()
-    var a = a_lt.address_space_cast[AddressSpace.GENERIC]()
-    var b = b_lt.address_space_cast[AddressSpace.GENERIC]()
-    var a_scales = a_scales_lt.address_space_cast[AddressSpace.GENERIC]()
-    var b_scales = b_scales_lt.address_space_cast[AddressSpace.GENERIC]()
+    var c = c_lt.address_space_cast[.GENERIC]()
+    var a = a_lt.address_space_cast[.GENERIC]()
+    var b = b_lt.address_space_cast[.GENERIC]()
+    var a_scales = a_scales_lt.address_space_cast[.GENERIC]()
+    var b_scales = b_scales_lt.address_space_cast[.GENERIC]()
 
     var B = c.dim(0)
     var M = c.dim(1)
@@ -1622,10 +1633,10 @@ def batched_matmul_dynamic_scaled_fp8[
         " in (64, 128)."
     )
     comptime assert (
-        a_type == b_type == DType.float8_e4m3fn
+        a_type == b_type == .float8_e4m3fn
     ), "input A and B dtype should be float8_e4m3fn"
     comptime assert (
-        a_scales_type == b_scales_type == DType.float32
+        a_scales_type == b_scales_type == .float32
     ), "input A and B scales dtype should be float32"
 
     comptime assert (

@@ -35,6 +35,7 @@ from max.pipelines.lib import (
     ModelOutputs,
     PipelineConfig,
 )
+from max.pipelines.lib.memory_estimation import MemoryPlan
 
 from .batch_processor import GptOssBatchProcessor
 from .gpt_oss import GptOss
@@ -94,6 +95,8 @@ class GptOssModel(
         devices: list[Device],
         kv_cache_config: KVCacheConfig,
         weights: Weights,
+        *,
+        memory_plan: MemoryPlan,
         adapter: WeightsAdapter | None = None,
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
         max_batch_size: int = 1,
@@ -118,15 +121,18 @@ class GptOssModel(
             devices,
             kv_cache_config,
             weights,
-            adapter,
-            return_logits,
+            adapter=adapter,
+            return_logits=return_logits,
             max_batch_size=max_batch_size,
+            memory_plan=memory_plan,
         )
 
         self.model = self.load_model(session)
 
     def _create_model_config(self, state_dict: dict[str, Any]) -> GptOssConfig:
-        model_config = GptOssConfig.initialize(self.pipeline_config)
+        model_config = GptOssConfig.initialize(
+            self.pipeline_config, max_seq_len=self.max_seq_len
+        )
         model_config.finalize(
             huggingface_config=self.huggingface_config,
             state_dict=state_dict,
@@ -199,13 +205,16 @@ class GptOssModel(
             ]
             variadic_args = variadic_args[len(self.devices) :]
 
-            # Extract KV cache inputs
-            kv_cache = self._unflatten_kv_inputs(variadic_args)
+            # Extract KV cache inputs from the unified {sliding, global} tree.
+            kv_cache_local, kv_cache_global = (
+                self.kv_params.unflatten_basic_kv_tree(iter(variadic_args))
+            )
 
             outputs = nn_model(
                 tokens=tokens.tensor,
                 signal_buffers=signal_buffers,
-                kv_cache_inputs_per_dev=kv_cache,
+                sliding_kv_collections=kv_cache_local,
+                global_kv_collections=kv_cache_global,
                 return_n_logits=return_n_logits.tensor,
                 input_row_offsets=input_row_offsets,
             )

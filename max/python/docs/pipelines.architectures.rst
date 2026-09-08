@@ -48,6 +48,7 @@ family.
    pipelines.architectures.llama4
    pipelines.architectures.mamba
    pipelines.architectures.minimax_m2
+   pipelines.architectures.minimax_music3
    pipelines.architectures.mistral
    pipelines.architectures.mistral3
    pipelines.architectures.mpnet
@@ -75,6 +76,8 @@ family.
    pipelines.architectures.unified_mtp_deepseekV3
    pipelines.architectures.unified_mtp_gemma4
    pipelines.architectures.unified_mtp_glm5_2
+   pipelines.architectures.unified_mtp_inkling
+   pipelines.architectures.unified_mtp_qwen3_5
    pipelines.architectures.wan
 
 Text generation
@@ -133,6 +136,8 @@ Text generation
    ~max.pipelines.architectures.unified_mtp_deepseekV3
    ~max.pipelines.architectures.unified_mtp_gemma4
    ~max.pipelines.architectures.unified_mtp_glm5_2
+   ~max.pipelines.architectures.unified_mtp_inkling
+   ~max.pipelines.architectures.unified_mtp_qwen3_5
 
 Embeddings
 ----------
@@ -155,3 +160,11 @@ Image generation
    ~max.pipelines.architectures.qwen_image
    ~max.pipelines.architectures.qwen_image_edit
    ~max.pipelines.architectures.wan
+
+Audio generation
+----------------
+
+.. autosummary::
+   :nosignatures:
+
+   ~max.pipelines.architectures.minimax_music3

@@ -34,17 +34,17 @@ from std.collections import OptionalReg
 from std.math import ceildiv, exp2, log2, recip
 from std.math.constants import log2e
 from std.sys import size_of
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     thread_idx,
     warp_id,
 )
 from max.gpu.sync import barrier
-from std.gpu.globals import WARPGROUP_SIZE
+from max.gpu.globals import WARPGROUP_SIZE
 from max.gpu.primitives.grid_controls import launch_dependent_grids
-from std.gpu.primitives.warp import _vote_nvidia_helper
-from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
+from max.gpu.primitives.warp import _vote_nvidia_helper
+from max.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from max.gpu.memory import external_memory, fence_async_view_proxy
 from max.gpu.sync import named_barrier
@@ -67,6 +67,7 @@ from layout import (
     CoordLike,
     Layout,
     RowMajorLayout,
+    TensorEngine,
     TileTensor,
     row_major,
     stack_allocation as tt_stack_allocation,
@@ -92,6 +93,9 @@ from nn.attention.gpu.nvidia.sm100.mla_decode_utils import (
     MLA_SM100_Decode_Config,
     MLA_SM100_Decode_Common,
     QOTMATile,
+    ORaggedTMATile,
+    rows_owned,
+    store_row_coords,
     MLA_Decode_Pack,
     OffsetPosition,
     KVPipelineGeneric,
@@ -126,6 +130,7 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
     MaskType: MHAMask,
     config: MLA_SM100_Decode_Config,
     ValidLengthType: OptionalPointer,
+    Engine: TensorEngine,
     _is_cache_length_accurate: Bool = False,
     ragged: Bool = False,
     # Layout G handles BOTH fold (fold_q==True, q_len_fold > 1) and non-fold
@@ -159,6 +164,7 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
             stage counts, head counts, and TMEM/SMEM layout.
         ValidLengthType: `OptionalPointer` type for the per-sequence valid
             length buffer consumed under ragged batching.
+        Engine: Engine policy of the `scalar_args` tile operand.
         _is_cache_length_accurate: Whether the supplied cache length is
             exact rather than `cache_length + seq_len` (defaults to `False`).
         ragged: Whether the batch contains variable-length sequences,
@@ -355,7 +361,7 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
             Self.AccumType,
             type_of(smem_1d_layout),
             MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
         ](li_smem, smem_1d_layout)
 
         var corr_scale_tmem = tmem_addr + UInt32(Self.config.TMEM_CORR_SCALE)
@@ -420,7 +426,7 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
 
             # Load S TMEM -> registers (16 fp32/lane, lane_id == row).
             var s_row = tt_stack_allocation[
-                dtype=Self.AccumType, address_space=AddressSpace.LOCAL
+                dtype=Self.AccumType, address_space=.LOCAL
             ](row_major[half_load]())
             var s_row_val = tcgen05_ld[
                 datapaths=32,
@@ -501,7 +507,7 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
                 Self.AccumType,
                 type_of(smem_1d_layout),
                 MutAnyOrigin,
-                address_space=AddressSpace.SHARED,
+                address_space=.SHARED,
             ](max_smem + buf_offset, smem_1d_layout)
             max_buf[lane_id] = current_max
             named_barrier[Int32(WARPGROUP_SIZE)](2)
@@ -515,7 +521,13 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
             var new_max: Scalar[Self.AccumType] = max(mi, current_max)
             var diff = sub_ftz(rebind[Float32](mi), rebind[Float32](new_max))
             var scale_for_old_max: Scalar[Self.AccumType]
-            if _vote_nvidia_helper(diff < rescale_threshold) != 0:
+            # Per-lane predicate, not a warp vote: under `fold_q`, `row =
+            # lane_in_warp` packs `q_len_fold` distinct (never-committed
+            # draft included) query tokens into one warp -- ALL of Layout
+            # G's 32 rows share the same single warp (BM=32), so an OR
+            # here leaks EVERY sibling token's rescale trajectory into
+            # every other one's.
+            if diff < rescale_threshold:
                 scale_for_old_max = rebind[Scalar[Self.AccumType]](exp2(diff))
             else:
                 scale_for_old_max = 1.0
@@ -655,10 +667,10 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
         # 4 warps acquire/commit every slot to keep the 128-thread
         # producer barrier balanced; only the owning warp writes data.
         comptime assert (
-            Self.AccumType == DType.float32
+            Self.AccumType == .float32
         ), "accumulator type should be float32"
         comptime assert (
-            Self.output_type == DType.bfloat16
+            Self.output_type == .bfloat16
         ), "output type should be bfloat16"
 
         comptime DecodeOutProducerType_LG = DecodeOutProducer[
@@ -702,7 +714,7 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
                 Self.BN_PV // 2
             )
             var o_row_subtile_LG = tt_stack_allocation[
-                dtype=Self.AccumType, address_space=AddressSpace.LOCAL
+                dtype=Self.AccumType, address_space=.LOCAL
             ](row_major[per_warp_elems_LG]())
             var _o_ld_LG = tcgen05_ld[
                 datapaths=32,
@@ -756,7 +768,7 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
         out_smem: SharedMemPointer[Scalar[Self.output_type]],
         # TMA-tile BK is anchored to BN_PV/4 (the per-warp stripe width),
         # not BN_QK — Layout-G-128 has BN_QK=128 but still writes 64-col stripes.
-        o_tma: QOTMATile[
+        o_tma: ORaggedTMATile[
             dtype=Self.output_type,
             BM=Self.config.out_rows,
             BK=Self.config.BN_PV // 4,
@@ -791,6 +803,7 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
         var elect_mask = elect()
         var is_leader: Bool = elect_mask != 0
         var row: Int = offset_position.out_row_offset
+        var rows_to_store = rows_owned[Self.config](Int(block_idx.x))
 
         # col = n * BN_PV + m * (BN_PV // 2) + k * BK_PV
         comptime slot_col_stride_LG: Int = Self.BN_PV // 2
@@ -824,17 +837,18 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
                                 Self.output_type,
                                 type_of(o_tt_layout_LG),
                                 MutAnyOrigin,
-                                address_space=AddressSpace.SHARED,
+                                address_space=.SHARED,
                             ](q_stage_ptr_LG, o_tt_layout_LG)
                             if is_leader:
                                 fence_async_view_proxy()
-                                o_tma.async_store(
+                                o_tma.async_store_3d(
                                     smem_tensor_LG,
-                                    (
+                                    store_row_coords[Self.config.out_rows](
                                         col_LG,
                                         offset_position.out_row_offset_at(
                                             q_local_LG
                                         ),
+                                        rows_to_store,
                                     ),
                                 )
                     else:
@@ -842,11 +856,16 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
                             Self.output_type,
                             type_of(o_tt_layout_LG),
                             MutAnyOrigin,
-                            address_space=AddressSpace.SHARED,
+                            address_space=.SHARED,
                         ](stage_ptr_LG, o_tt_layout_LG)
                         if is_leader:
                             fence_async_view_proxy()
-                            o_tma.async_store(smem_tensor_LG, (col_LG, row))
+                            o_tma.async_store_3d(
+                                smem_tensor_LG,
+                                store_row_coords[Self.config.out_rows](
+                                    col_LG, row, rows_to_store
+                                ),
+                            )
                 out_cons.release(elect_mask)
 
         if is_leader:
@@ -960,7 +979,7 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
                     ) * UInt32(o_stride)
                     var o_row_subtile = tt_stack_allocation[
                         dtype=Self.AccumType,
-                        address_space=AddressSpace.LOCAL,
+                        address_space=.LOCAL,
                     ](row_major[per_warp_corr_elems]())
                     var _o_ld_corr = tcgen05_ld[
                         datapaths=32,
@@ -981,12 +1000,11 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
                         float2_register[j] = element * SIMD[Self.AccumType, 2](
                             scale_value
                         )
-                    var _o_st_corr = Array[
-                        Scalar[Self.AccumType], per_warp_corr_elems
-                    ](uninitialized=True)
-
-                    comptime for _i in range(per_warp_corr_elems):
-                        _o_st_corr[_i] = o_row_subtile.raw_load(_i)
+                    var _o_st_corr = Array[_, per_warp_corr_elems](
+                        fill_with_unrolled=lambda [i: Int]() -> Scalar[
+                            Self.AccumType
+                        ]: o_row_subtile.raw_load(i)
+                    )
                     tcgen05_st[
                         datapaths=32,
                         bits=32,
@@ -1027,16 +1045,16 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
         q_tma: QOTMATile[
             dtype=Self.kv_type,
             BM=Self.config.BM,
-            BK=Self.config.BK_QK,
+            BK=Self.config.input_q_depth,
             swizzle_mode=Self.config.kv_tma_swizzle_mode,  # SWIZZLE_64B
         ],
         k_tma: KVTMATile[
             dtype=Self.kv_type,
             swizzle_mode=Self.config.kv_tma_swizzle_mode,
             BN=Self.config.BN_QK,
-            BK=Self.config.BK_QK,
+            BK=Self.config.input_q_depth,
         ],
-        o_tma: QOTMATile[
+        o_tma: ORaggedTMATile[
             dtype=Self.output_type,
             BM=Self.config.out_rows,
             # Per-warp output stripe (BF16/SWIZZLE_128B clamps innermost to 64).
@@ -1050,11 +1068,12 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
             MaskType=Self.MaskType,
             SplitAccumType=Self.SplitAccumType,
         ],
-        scales_ptr: UnsafePointer[Scalar[DType.float32], origin=MutAnyOrigin],
+        scales_ptr: UnsafePointer[Float32, origin=MutAnyOrigin],
         scalar_args: TileTensor[
-            DType.int64,
+            .int64,
             RowMajorLayout[ComptimeInt[3]],
             MutAnyOrigin,
+            Engine=Self.Engine,
         ],
     ):
         comptime assert Self.config.decode_layout_g, (
@@ -1098,7 +1117,7 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
                 UnsafePointer[
                     Scalar[Self.ValidLengthType.dtype],
                     ImmutAnyOrigin,
-                    address_space=AddressSpace.GENERIC,
+                    address_space=.GENERIC,
                 ]
             ](valid_length.value()),
             q_max_seq_len,
@@ -1116,10 +1135,8 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
                             offset_position.split_idx,
                             offset_position.batch_idx,
                             offset_position.max_seq_len,
-                            offset_position.out_row_offset_at(q_local),
                             batch_size,
                             lse_accum_split_ptr,
-                            o_tma,
                             seq_idx_fold=UInt32(q_local),
                         )
                 else:
@@ -1127,10 +1144,8 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
                         offset_position.split_idx,
                         offset_position.batch_idx,
                         offset_position.max_seq_len,
-                        offset_position.out_row_offset,
                         batch_size,
                         lse_accum_split_ptr,
-                        o_tma,
                     )
                 return
 
@@ -1152,10 +1167,8 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
                             offset_position.split_idx,
                             offset_position.batch_idx,
                             offset_position.max_seq_len,
-                            offset_position.out_row_offset_at(q_local),
                             batch_size,
                             lse_accum_split_ptr,
-                            o_tma,
                             seq_idx_fold=UInt32(q_local),
                         )
                 else:
@@ -1163,10 +1176,8 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
                         offset_position.split_idx,
                         offset_position.batch_idx,
                         offset_position.max_seq_len,
-                        offset_position.out_row_offset,
                         batch_size,
                         lse_accum_split_ptr,
-                        o_tma,
                     )
                 return
 
@@ -1182,10 +1193,8 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
                                 offset_position.split_idx,
                                 offset_position.batch_idx,
                                 offset_position.max_seq_len,
-                                offset_position.out_row_offset_at(q_local),
                                 batch_size,
                                 lse_accum_split_ptr,
-                                o_tma,
                                 seq_idx_fold=UInt32(q_local),
                             )
                     else:
@@ -1193,10 +1202,8 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
                             offset_position.split_idx,
                             offset_position.batch_idx,
                             offset_position.max_seq_len,
-                            offset_position.out_row_offset,
                             batch_size,
                             lse_accum_split_ptr,
-                            o_tma,
                         )
 
                 return
@@ -1204,7 +1211,7 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
         # SMEM allocation: Q FP8, KV stages, P stages, max/li, barriers.
         var q_smem = external_memory[
             Scalar[Self.fp8_type],
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
             alignment=128,
             name="mha_dynamic_shared_memory",
         ]()
@@ -1402,7 +1409,7 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
         q_tma: QOTMATile[
             dtype=Self.kv_type,
             BM=Self.config.BM,
-            BK=Self.config.BK_QK,
+            BK=Self.config.input_q_depth,
             swizzle_mode=Self.config.kv_tma_swizzle_mode,  # SWIZZLE_64B
         ],
         # `BN=Self.config.BN_QK` (not BK_PV) so this signature is type-
@@ -1412,7 +1419,7 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
             dtype=Self.kv_type,
             swizzle_mode=Self.config.kv_tma_swizzle_mode,
             BN=Self.config.BN_QK,
-            BK=Self.config.BK_QK,
+            BK=Self.config.input_q_depth,
         ],
         kv_lut: Self.KVLUTType,
         q_smem: SharedMemPointer[Scalar[Self.fp8_type]],
@@ -1480,7 +1487,7 @@ struct MLA_SM100_Decode_QKV_FP8_Layout_G[
                 Self.kv_type,
                 type_of(q_tt_layout),
                 MutAnyOrigin,
-                address_space=AddressSpace.SHARED,
+                address_space=.SHARED,
             ](q_smem.bitcast[Scalar[Self.kv_type]](), q_tt_layout)
             q_tma.async_copy(q_smem_tensor, mbar_q[], (0, row))
 

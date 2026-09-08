@@ -24,9 +24,9 @@ from std.atomic import Atomic
 from std.sys import size_of
 
 from max.gpu.sync import NamedBarrierSemaphore
-from std.gpu.globals import WARPGROUP_SIZE
+from max.gpu.globals import WARPGROUP_SIZE
 from max.gpu.host.info import H100
-from std.gpu import block_idx, grid_dim, thread_idx
+from max.gpu import block_idx, grid_dim, thread_idx
 from layout import Layout, LayoutTensor, RuntimeLayout, TensorLayout, TileTensor
 from std.bit import log2_floor
 
@@ -473,7 +473,7 @@ struct SplitKTileScheduler[
         dyn_cluster_shape: IndexList[2],
     ) -> Int:
         comptime assert (
-            accum_type == DType.float32
+            accum_type == .float32
         ), "Only support float32 accumulator type"
 
         var num_output_tiles = Self.get_num_tiles(
@@ -713,7 +713,7 @@ struct SplitKTileScheduler[
         comptime BN = workspace_layout.shape[2].value()
 
         comptime assert (
-            accum_type == DType.float32
+            accum_type == .float32
         ), "Only support float32 accumulator type"
 
         comptime num_mma = c_reg_tile.layout.shape[0].value()
@@ -760,7 +760,7 @@ struct SplitKTileScheduler[
         comptime BN = workspace_layout.shape[2].value()
 
         comptime assert (
-            accum_type == DType.float32
+            accum_type == .float32
         ), "Only support float32 accumulator type"
 
         comptime num_mma = c_reg_tile.layout.shape[0].value()
