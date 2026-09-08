@@ -136,6 +136,10 @@ This version is still a work in progress.
 
 ## Library changes
 
+- `Counter` can now be constructed from any iterable of values, not just a
+  `List`, e.g. `Counter(["a", "a", "b"])` or `Counter(String("aaab").bytes())`.
+  This replaces the previous `Counter(items: List[V])` constructor.
+
 - `Coord` has a new `replace[at](value)` method that returns a `Coord` with
   the element at `at` swapped for `value`, keeping the other elements' types. A
   statically known element (`ComptimeInt`) has no runtime storage to assign
