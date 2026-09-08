@@ -15,12 +15,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
-from max.nn.kv_cache.cache_params import KVHashAlgo
+from max.nn.kv_cache import KVCacheGroupId
 from max.nn.kv_cache.metrics import KVCacheMetrics
 
 
@@ -33,7 +33,12 @@ class TransferDirection(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class BlockCount:
-    """A point-in-time snapshot of a block pool's occupancy."""
+    """A point-in-time snapshot of a block pool's occupancy.
+
+    Used for the device (G0) pools, whose blocks are the unit the manager
+    actually allocates in. The connector's external tiers report
+    :class:`ByteCount` instead.
+    """
 
     free: int
     total: int
@@ -55,6 +60,43 @@ class BlockCount:
     @property
     def free_pct(self) -> float:
         """Returns the percentage of blocks not currently in use, in ``[0, 100]``.
+
+        ``0`` when ``total`` is ``0``, rather than dividing by zero.
+        """
+        return 100 * self.free / self.total if self.total else 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class ByteCount:
+    """A point-in-time snapshot of an external cache tier's occupancy, in bytes.
+
+    Bytes rather than blocks because a connector's host and disk tiers are
+    byte budgets that the operator sizes in bytes (``host_offload_max_gb``,
+    ``disk_offload_max_gb``), and because their block width need not match the
+    device's -- an MLA-replicated unit is stored once on the host and broadcast
+    back on load. Bytes also rate directly against PCIe and disk bandwidth.
+    """
+
+    free: int
+    total: int
+
+    @property
+    def used(self) -> int:
+        """Returns the bytes currently in use."""
+        return self.total - self.free
+
+    @property
+    def used_pct(self) -> float:
+        """Returns the percentage of bytes currently in use, in ``[0, 100]``.
+
+        ``0`` when ``total`` is ``0`` (e.g. a tier with no configured
+        capacity), rather than dividing by zero.
+        """
+        return 100 * self.used / self.total if self.total else 0.0
+
+    @property
+    def free_pct(self) -> float:
+        """Returns the percentage of bytes not currently in use, in ``[0, 100]``.
 
         ``0`` when ``total`` is ``0``, rather than dividing by zero.
         """
@@ -96,8 +138,12 @@ class KVConnectorTransfer(Protocol):
         ...
 
     @property
-    def g0_blocks(self) -> list[int]:
-        """Device (G0) block ids this transfer pins until it completes."""
+    def g0_blocks_per_leaf(self) -> Mapping[str, Sequence[int]]:
+        """Device (G0) block ids this transfer pins until it completes, per leaf.
+
+        Each leaf should have the same number of blocks. For SWA groups, the list
+        of blocks may be null padded with block_id=0.
+        """
         ...
 
     def is_complete(self) -> bool:
@@ -115,7 +161,7 @@ class CompletedTransfer:
     Returned by synchronous / stream-ordered connectors (dKV):
     their copies ride the forward stream or are GPU-ordered ahead of it, so from
     the manager's perspective the transfer is already done -- no pinning, no
-    deferred commit, no cordoning. ``g0_blocks`` still reports the device blocks
+    deferred commit, no cordoning. ``g0_blocks_per_leaf`` still reports the device blocks
     the connector loaded (fewer than requested is allowed), which the manager
     uses to trim any surplus staging blocks.
     """
@@ -123,10 +169,14 @@ class CompletedTransfer:
     def __init__(
         self,
         direction: TransferDirection,
-        g0_blocks: list[int] | None = None,
+        leaves: Sequence[str] | None = None,
+        g0_blocks: Sequence[int] | None = None,
     ) -> None:
         self._direction: TransferDirection = direction
-        self._g0_blocks = g0_blocks if g0_blocks is not None else []
+
+        leaves = leaves or []
+        g0_blocks = g0_blocks or []
+        self._g0_blocks_per_leaf = {leaf_id: g0_blocks for leaf_id in leaves}
 
     @property
     def direction(self) -> TransferDirection:
@@ -134,9 +184,9 @@ class CompletedTransfer:
         return self._direction
 
     @property
-    def g0_blocks(self) -> list[int]:
-        """The device blocks the connector loaded/offloaded."""
-        return self._g0_blocks
+    def g0_blocks_per_leaf(self) -> Mapping[str, Sequence[int]]:
+        """The device blocks the connector loaded/offloaded, per leaf."""
+        return self._g0_blocks_per_leaf
 
     def is_complete(self) -> bool:
         """Always ``True``: this transfer is already complete."""
@@ -144,7 +194,17 @@ class CompletedTransfer:
 
     def synchronize(self) -> None:
         """No-op: this transfer is already complete."""
-        return None
+        return
+
+    @classmethod
+    def load(cls, leaves: Sequence[str] | None = None) -> CompletedTransfer:
+        """Create a completed load transfer."""
+        return cls(TransferDirection.LOAD, leaves)
+
+    @classmethod
+    def offload(cls, leaves: Sequence[str] | None = None) -> CompletedTransfer:
+        """Create a completed offload transfer."""
+        return cls(TransferDirection.OFFLOAD, leaves)
 
 
 @runtime_checkable
@@ -185,39 +245,57 @@ class KVConnector(Protocol):
     """
 
     @property
+    def leaves(self) -> Mapping[str, KVCacheGroupId]:
+        """Returns a mapping from leaf_id to group_id serviced by the connector."""
+        ...
+
+    @property
     def name(self) -> str:
         """Connector name for logging/debugging."""
         ...
 
     def load(
         self,
-        device_block_ids: list[int],
+        block_ids: Mapping[str, Sequence[int]],
         block_hashes: Sequence[bytes],
         replica_idx: int = 0,
+        hint: bytes | None = None,
     ) -> KVConnectorTransfer:
         """Load data from external cache into device blocks.
 
         Args:
-            device_block_ids: Device block IDs to load data into.
+            block_ids: Device block IDs to load data into per leaf. Each leaf
+                may have a different number of blocks depending on the group type.
+                For example, a full attn group may need 100 pages to load 100 hashes
+                while a sliding window group may only need 8 pages.
             block_hashes: Hashes to load data for, in canonical bytes form
                 (8 big-endian bytes for ahash64-family, 32 bytes for
                 SHA-256).
             replica_idx: DP replica whose device buffers receive the loaded
                 blocks. The external tier itself is replica-agnostic (keyed by
                 hash); this only selects the H2D destination.
+            hint: The request's ``dkv_cache_hint`` as raw JSON bytes, or
+                ``None`` when it carried none. Opaque to the manager: only the
+                dKV connector reads it, to route blocks to the peer that holds
+                them. It never affects correctness, since an unusable hint
+                costs a cache miss and nothing else.
 
         Returns:
-            A :class:`KVConnectorTransfer` for the H2D copy. ``g0_blocks``
-            reports the device blocks actually loaded (a prefix of
-            ``device_block_ids``; fewer than requested is allowed). Synchronous
-            connectors return a :class:`CompletedTransfer`; asynchronous ones
-            return a handle the manager polls before reading the loaded KV.
+            A :class:`KVConnectorTransfer` for the H2D copy. ``g0_blocks_per_leaf``
+            reports the device blocks actually loaded (a prefix of the requested
+            ``block_ids``; fewer than requested is allowed).
+            Synchronous connectors return a :class:`CompletedTransfer`;
+            asynchronous ones return a handle the manager polls before reading
+            the loaded KV.
+            Note that all leaves must have the same number of blocks. This number
+            should be equal to the number of loaded hashes. For sliding window
+            groups, the list of blocks may be null padded with block_id=0.
         """
         ...
 
     def offload(
         self,
-        block_ids: list[int],
+        block_ids: Mapping[str, Sequence[int]],
         block_hashes: Sequence[bytes],
         replica_idx: int = 0,
     ) -> KVConnectorTransfer:
@@ -227,7 +305,7 @@ class KVConnector(Protocol):
         purely by hash, so the order carries no parentage.
 
         Args:
-            block_ids: Device block IDs to offload, in prefix order.
+            block_ids: Device block IDs to offload per leaf.
             block_hashes: Hashes for the blocks being offloaded, in prefix
                 order. Canonical bytes form (8 big-endian bytes for
                 ahash64-family, 32 bytes for SHA-256).
@@ -235,7 +313,7 @@ class KVConnector(Protocol):
                 blocks. The external tier itself is replica-agnostic.
 
         Returns:
-            A :class:`KVConnectorTransfer` for the D2H copy; ``g0_blocks`` are
+            A :class:`KVConnectorTransfer` for the D2H copy; ``g0_blocks_per_leaf`` are
             the device source blocks the manager keeps pinned until it lands.
             Synchronous connectors return a :class:`CompletedTransfer`.
         """
@@ -272,7 +350,7 @@ class KVConnector(Protocol):
                 is replica-agnostic (keyed by hash); this only selects the
                 client.
         """
-        return None
+        return
 
     def count_cached_prefix(
         self, block_hashes: Sequence[bytes]
@@ -318,7 +396,7 @@ class KVConnector(Protocol):
         remote NIXL load it host-polls the off-stream RDMA to completion. No-op
         by default.
         """
-        return None
+        return
 
     def wait_for_offloads(self) -> None:
         """Settle offloads posted since the last call.
@@ -336,26 +414,26 @@ class KVConnector(Protocol):
         the RDMA to completion and marks the block readable inline. A block is
         never marked readable before its bytes land.
         """
-        return None
+        return
 
     def shutdown(self) -> None:
         """Clean shutdown of connector resources."""
-        ...
+        return
 
     # Optional properties with default implementations
     @property
-    def host_block_count(self) -> BlockCount:
-        """Host block occupancy. Empty (0 of 0) if not applicable."""
-        return BlockCount(free=0, total=0)
+    def host_byte_count(self) -> ByteCount:
+        """Host tier occupancy in bytes. Empty (0 of 0) if not applicable."""
+        return ByteCount(free=0, total=0)
 
     @property
-    def disk_block_count(self) -> BlockCount:
-        """Disk block occupancy. Empty (0 of 0) if not applicable."""
-        return BlockCount(free=0, total=0)
+    def disk_byte_count(self) -> ByteCount:
+        """Disk tier occupancy in bytes. Empty (0 of 0) if not applicable."""
+        return ByteCount(free=0, total=0)
 
     def reset_prefix_cache(self) -> None:
         """Reset prefix cache. No-op by default."""
-        return None
+        return
 
     @property
     def metrics(self) -> KVCacheMetrics:
@@ -364,16 +442,4 @@ class KVConnector(Protocol):
 
     def reset_metrics(self) -> None:
         """Reset per-batch transfer counters after the scheduler samples them."""
-        return None
-
-    @property
-    def supported_hash_algos(self) -> frozenset[KVHashAlgo]:
-        """Set of hash algos this connector accepts in ``load``/``offload``.
-
-        The default ``frozenset({"ahash64"})`` keeps legacy connectors
-        written before SHA-256 support landed working under the original
-        hashing algo. Connectors that accept 32-byte SHA-256 hashes must
-        override this to advertise ``frozenset({"ahash64", "sha256"})``
-        (or an SHA-256-only set).
-        """
-        return frozenset({"ahash64"})
+        return

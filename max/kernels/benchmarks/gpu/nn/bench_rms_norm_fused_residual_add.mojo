@@ -70,54 +70,48 @@ def bench_rms_norm_fused_residual_add_gpu[
     ctx.enqueue_copy(gamma1_d, gamma1_h)
     ctx.enqueue_copy(gamma2_d, gamma2_h)
 
-    # `rms_norm_fused_residual_add`'s `Input*Fn`/`Output*Fn` are
-    # unified closures (value-closure form), matching its `(width, rank)` /
-    # `(width, rank, alignment)` signatures; `Output0Fn` precedes
-    # `OutputResidualFn` (the reverse of the deleted `..._gpu` kernel's order).
+    # `Output0Fn` precedes `OutputResidualFn`, the reverse of the deleted
+    # `..._gpu` kernel's order.
     @always_inline
     def input_fn[
-        width: Int, _rank: Int
-    ](coords: IndexList[_rank]) {var data_buf} -> SIMD[dtype, width]:
-        return data_buf.load[width=width](Coord(coords))
+        width: Int
+    ](coords: Coord) {var data_buf} -> SIMD[dtype, width]:
+        return data_buf.load[width=width](coords)
 
     @always_inline
     def residual_input_fn[
-        width: Int, _rank: Int
-    ](coords: IndexList[_rank]) {var residual_buf} -> SIMD[dtype, width]:
-        return residual_buf.load[width=width](Coord(coords))
+        width: Int
+    ](coords: Coord) {var residual_buf} -> SIMD[dtype, width]:
+        return residual_buf.load[width=width](coords)
 
     @always_inline
     def output_fn[
-        width: SIMDLength, rank_: Int, alignment: Int
-    ](coords: IndexList[rank_], val: SIMD[dtype, width]) {
-        var output_buf
-    } -> None:
-        output_buf.store[alignment=alignment](Coord(coords), val)
+        width: SIMDLength, alignment: Int
+    ](coords: Coord, val: SIMD[dtype, width]) {var output_buf} -> None:
+        output_buf.store[alignment=alignment](coords, val)
 
     @always_inline
     def residual_output_fn[
-        width: SIMDLength, rank_: Int, alignment: Int
-    ](coords: IndexList[rank_], val: SIMD[dtype, width]) {
-        var residual_output_buf
-    } -> None:
-        residual_output_buf.store[alignment=alignment](Coord(coords), val)
+        width: SIMDLength, alignment: Int
+    ](coords: Coord, val: SIMD[dtype, width]) {var residual_output_buf} -> None:
+        residual_output_buf.store[alignment=alignment](coords, val)
 
     @always_inline
-    @__copy_capture(
-        shape,
-        gamma1,
-        epsilon1,
-        weight_offset1,
-        gamma2,
-        epsilon2,
-        weight_offset2,
-        input_fn,
-        residual_input_fn,
-        output_fn,
-        residual_output_fn,
-    )
-    @__parameter
-    def bench_fn(mut b: Bencher) raises:
+    def bench_fn(
+        mut b: Bencher,
+    ) raises {
+        var gamma1,
+        var epsilon1,
+        var weight_offset1,
+        var gamma2,
+        var epsilon2,
+        var weight_offset2,
+        var input_fn,
+        var residual_input_fn,
+        var output_fn,
+        var residual_output_fn,
+        imm,
+    }:
         @always_inline
         def kernel_launch(ctx: DeviceContext) raises {imm}:
             rms_norm_fused_residual_add[
@@ -131,7 +125,7 @@ def bench_rms_norm_fused_residual_add_gpu[
                 output_fn,
                 residual_output_fn,
                 Coord(shape),
-                Scalar[DType.int](cols),
+                Int(cols),
                 gamma1,
                 epsilon1.cast[dtype](),
                 weight_offset1,
@@ -143,7 +137,8 @@ def bench_rms_norm_fused_residual_add_gpu[
 
         bencher_iter_custom(b, kernel_launch, ctx)
 
-    b.bench_function[bench_fn](
+    b.bench_function(
+        bench_fn,
         BenchId(
             "rms_norm_fused_residual_add",
             input_id=String(fn_name, "/", dtype, "/", shape),
@@ -165,7 +160,7 @@ def bench_rms_norm_fused_residual_add_gpu[
 
 
 def main() raises:
-    comptime dtype = get_defined_dtype["dtype", DType.bfloat16]()
+    comptime dtype = get_defined_dtype["dtype", .bfloat16]()
     comptime shape = int_list_to_tuple[get_defined_shape["shape", "1x5376"]()]()
 
     var m = Bench(BenchConfig(num_repetitions=1))

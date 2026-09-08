@@ -35,7 +35,7 @@ from std.sys import (
 from std.sys.info import _accelerator_arch
 
 from std.bit import prev_power_of_two
-from std.gpu import WARP_SIZE, lane_id
+from max.gpu import WARP_SIZE, lane_id
 from max.gpu.host import DeviceBuffer
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from layout import Layout, LayoutTensor, RuntimeLayout, UNKNOWN_VALUE
@@ -82,9 +82,7 @@ comptime MHA_PDL_LEVEL = PDLLevel.OVERLAP_AT_END if get_defined_bool[
 def as_dynamic_row_major_1d[
     dtype: DType
 ](
-    tensor: LayoutTensor[
-        mut=False, dtype, address_space=AddressSpace.GENERIC, ...
-    ],
+    tensor: LayoutTensor[mut=False, dtype, address_space=.GENERIC, ...],
 ) -> LayoutTensor[dtype, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin]:
     """Reinterprets a generic-address `LayoutTensor` as a 1-D dynamic row-major tensor.
 
@@ -400,7 +398,7 @@ struct MHAConfig[dtype: DType](TrivialRegisterPassable, Writable):
             # BM
             self.num_queries_per_block = num_queries_per_block.or_else(
                 32 if Self.dtype
-                == DType.float32 else (128 if has_amd_gpu_accelerator() else 64)
+                == .float32 else (128 if has_amd_gpu_accelerator() else 64)
             )
             var bk_arch_factor = 2 if num_pipeline_stages <= 2 else 1
             var bk_type_factor = 1 if Self.dtype == DType.float32 else 2
@@ -410,11 +408,11 @@ struct MHAConfig[dtype: DType](TrivialRegisterPassable, Writable):
                 64 if Self.dtype.is_float8() else 32
             )
             self.WN = WN.or_else(
-                32 if Self.dtype == DType.float32 else self.num_keys_per_block
+                32 if Self.dtype == .float32 else self.num_keys_per_block
             )
         self.WM = WM.or_else(
             32 if Self.dtype
-            == DType.float32 else (32 if has_amd_gpu_accelerator() else 16)
+            == .float32 else (32 if has_amd_gpu_accelerator() else 16)
         )
 
     def write_to(self, mut writer: Some[Writer]):
@@ -433,16 +431,24 @@ struct MHAConfig[dtype: DType](TrivialRegisterPassable, Writable):
 
 
 @always_inline
-def indexer_key_bound(
-    num_keys: Int, seq_len: Int, tok_local: Int, causal: Int
-) -> Int:
-    """Keys the sparse indexer defines for token `tok_local` of a row.
+def indexer_key_bound[
+    kpool: Int = 1
+](num_keys: Int, seq_len: Int, tok_local: Int, causal: Int) -> Int:
+    """Candidate rows the sparse indexer defines for token `tok_local` of a row.
 
     `num_keys` is the row's total key count (`cache_len + seq_len`); the
     result is all of them without a causal mask, `cache_len + tok_local + 1`
     with one. Branchless multiply form: a branch in the scorer
     epilogues' unrolled token loop measured +4-9% on the non-causal path from
     codegen alone.
+
+    With `kpool > 1` the cache holds one pooled key per `kpool` consecutive
+    tokens, and the result counts *pools* instead of tokens. A pool covering
+    tokens `[kpool*p, kpool*p + kpool)` is a candidate only once its last
+    member is visible, which is exactly `visible // kpool` pools -- so the
+    pooled bound is the token bound floored by `kpool`, and no separate
+    validity rule is needed. A non-positive token bound stays non-positive,
+    which both call sites already treat as "no rows".
 
     Read side of the indexer's write/read contract: the SM100 scorers
     (`sparse_index_fp8_sm100[_prefill].mojo`) write score slots `[0, bound)`
@@ -453,7 +459,8 @@ def indexer_key_bound(
     prefill between them. If either side drifts, the top-k reads score slots
     the scorer never wrote.
     """
-    return num_keys - (seq_len - 1 - tok_local) * causal
+    comptime assert kpool >= 1, "kpool must be positive"
+    return (num_keys - (seq_len - 1 - tok_local) * causal) // kpool
 
 
 @always_inline
@@ -492,11 +499,9 @@ def _copy_frag_to_smem_nvidia[
     layout1: Layout,
 ](
     p_smem_iter: LayoutTensorIter[
-        mut=True, type0, layout0, address_space=AddressSpace.SHARED, ...
+        mut=True, type0, layout0, address_space=.SHARED, ...
     ],
-    p_reg_tile: LayoutTensor[
-        type1, layout1, _, address_space=AddressSpace.LOCAL
-    ],
+    p_reg_tile: LayoutTensor[type1, layout1, _, address_space=.LOCAL],
     warp_x: UInt32,
     warp_y: UInt32,
 ):
@@ -519,7 +524,7 @@ def _copy_frag_to_smem_nvidia[
         mut=False,
         p_smem_iter.dtype,
         Layout.row_major(BM, BN),
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
     ](p_smem_iter.ptr)
     var p_smem_warp_tile = p_smem_tile.tile[WM, WN](Int(warp_y), Int(warp_x))
     var p_reg_vecs = p_reg_tile.vectorize[1, frag_simd_width]()
@@ -589,11 +594,9 @@ def _copy_frag_to_smem_amd[
     layout1: Layout,
 ](
     p_smem_iter: LayoutTensorIter[
-        mut=True, type0, layout0, address_space=AddressSpace.SHARED, ...
+        mut=True, type0, layout0, address_space=.SHARED, ...
     ],
-    p_reg_tile: LayoutTensor[
-        type1, layout1, _, address_space=AddressSpace.LOCAL
-    ],
+    p_reg_tile: LayoutTensor[type1, layout1, _, address_space=.LOCAL],
     warp_x: UInt32,
     warp_y: UInt32,
 ):
@@ -613,7 +616,7 @@ def _copy_frag_to_smem_amd[
         mut=False,
         p_smem_iter.dtype,
         Layout.row_major(BM, BN),
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
     ](p_smem_iter.ptr)
 
     var p_smem_warp_tile = p_smem_tile.tile[WM, WN](Int(warp_y), Int(warp_x))
@@ -667,11 +670,9 @@ def _copy_frag_to_smem[
     layout1: Layout,
 ](
     p_smem_iter: LayoutTensorIter[
-        mut=True, type0, layout0, address_space=AddressSpace.SHARED, ...
+        mut=True, type0, layout0, address_space=.SHARED, ...
     ],
-    p_reg_tile: LayoutTensor[
-        type1, layout1, _, address_space=AddressSpace.LOCAL
-    ],
+    p_reg_tile: LayoutTensor[type1, layout1, _, address_space=.LOCAL],
     warp_x: UInt32,
     warp_y: UInt32,
 ):
@@ -723,17 +724,14 @@ def get_start_and_end_for_partitions[
     return (start, end)
 
 
-comptime callback_fn_type = def[mask_t: MHAMask](
-    mask: mask_t
-) raises capturing -> None
+comptime callback_fn_type = def[mask_t: MHAMask](mask: mask_t) raises -> None
 
 
 @always_inline
 def dispatch_mask[
     mask_type: String,
-    callback_fn: callback_fn_type,
     local_window_size: Int = -1,
-]() raises -> None:
+](callback_fn: Some[callback_fn_type],) raises -> None:
     """Instantiate an `MHAMask` by name and invoke a callback with it.
 
     Resolves the mask string to one of the built-in `MHAMask` implementations
@@ -745,10 +743,12 @@ def dispatch_mask[
         mask_type: Name of the mask (e.g. `"causal"`, `"null"`,
             `"sliding_window_causal"`). Must match one of the `MaskName`
             constants.
-        callback_fn: Parametric callback invoked with the resolved mask.
         local_window_size: Sliding-window or chunk size for masks that
             require it. Must be `-1` for masks that ignore it and positive
             for masks that require it.
+
+    Args:
+        callback_fn: Parametric callback invoked with the resolved mask.
 
     Raises:
         Compile-time assertion error if `mask_type` is unrecognised or if
@@ -756,8 +756,7 @@ def dispatch_mask[
     """
 
     @always_inline
-    @__parameter
-    def outer_wrapper[mask_t: MHAMask](mask: mask_t) raises:
+    def outer_wrapper[mask_t: MHAMask](mask: mask_t) raises {imm}:
         return callback_fn(mask)
 
     # TODO: attach string constants to mask types themselves.
@@ -794,13 +793,11 @@ def dispatch_materialized_mask[
     dtype: DType,
     layout: Layout,
     //,
-    callback_fn: callback_fn_type,
 ](
     mask_nd: LayoutTensor[mut=False, dtype, layout, _],
+    callback_fn: Some[callback_fn_type],
     start_pos_nd: OptionalReg[
-        LayoutTensor[
-            DType.uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
-        ]
+        LayoutTensor[.uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin]
     ] = None,
 ) raises -> None:
     """Wrap a dense mask tensor in a `MaterializedMask` and invoke a callback.
@@ -814,11 +811,11 @@ def dispatch_materialized_mask[
     Parameters:
         dtype: Element type of the mask tensor.
         layout: Layout of the mask tensor.
-        callback_fn: Parametric callback invoked with the `MaterializedMask`.
 
     Args:
         mask_nd: The mask values tensor with shape `(batch, heads, q, k)` or
             compatible broadcast shape.
+        callback_fn: Parametric callback invoked with the `MaterializedMask`.
         start_pos_nd: Optional per-sequence start positions used to offset the
             key dimension.
     """
@@ -832,16 +829,16 @@ def dispatch_relative_logits_mask[
     dtype: DType,
     layout: Layout,
     //,
-    callback_fn: callback_fn_type,
     local_window_size: Int = -1,
 ](
     bias_nd: LayoutTensor[mut=False, dtype, layout, _],
     cache_lengths: LayoutTensor[
-        DType.uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
+        .uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
     ],
     input_row_offsets: LayoutTensor[
-        DType.uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
+        .uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
     ],
+    callback_fn: Some[callback_fn_type],
 ) raises -> None:
     """Wrap `bias_nd` in a `RelativeLogitsMask` and invoke `callback_fn`.
 
@@ -964,9 +961,9 @@ trait OptionalPointer(Copyable, TrivialRegisterPassable):
         ...
 
 
-struct NonNullPointer[
-    dtype_: DType, address_space_: AddressSpace = AddressSpace.GENERIC
-](OptionalPointer):
+struct NonNullPointer[dtype_: DType, address_space_: AddressSpace = .GENERIC](
+    OptionalPointer
+):
     """A pointer with a compile-time guarantee of being non-null.
 
     Parameters:
@@ -991,7 +988,7 @@ struct NonNullPointer[
 
     @always_inline
     def __init__(out self, ptr: DeviceBuffer[Self.dtype]):
-        comptime assert Self.address_space == AddressSpace.GENERIC
+        comptime assert Self.address_space == .GENERIC
         self.ptr = rebind[Self.PtrType](ptr.unsafe_ptr())
 
     @always_inline
@@ -1003,9 +1000,9 @@ struct NonNullPointer[
         return self.ptr
 
 
-struct NullPointer[
-    dtype_: DType, address_space_: AddressSpace = AddressSpace.GENERIC
-](OptionalPointer):
+struct NullPointer[dtype_: DType, address_space_: AddressSpace = .GENERIC](
+    OptionalPointer
+):
     """A pointer known at compile time to be null, used when an optional pointer argument is absent.
 
     Parameters:

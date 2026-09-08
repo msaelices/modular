@@ -44,7 +44,7 @@ from std.memory import Pointer, UnsafePointer, bitcast
 from std.math.uutils import ufloordiv, umod
 from std.sys import align_of, size_of
 
-from std.gpu import (
+from max.gpu import (
     WARP_SIZE,
     block_id_in_cluster,
     block_idx,
@@ -63,7 +63,7 @@ from max.gpu.primitives.grid_controls import (
     launch_dependent_grids,
     wait_on_dependent_grids,
 )
-import std.gpu.primitives.warp as warp
+import max.gpu.primitives.warp as warp
 from max.gpu.primitives.cluster import (
     block_rank_in_cluster,
     cluster_sync,
@@ -82,8 +82,10 @@ from layout import (
     Coord,
     Idx,
     Layout,
+    DefaultEngine,
     RowMajorLayout,
     TensorLayout,
+    TensorEngine,
     TileTensor,
     row_major,
 )
@@ -122,6 +124,7 @@ from ..structured_kernels.config import (
     OutputPipelineConfig,
 )
 from structured_kernels.kernel_common import (
+    MbarPtr,
     WarpRole1D1D,
     compute_tma_tile_dims,
     compute_accum_barrier_counts,
@@ -703,6 +706,11 @@ struct Grouped1D1DMatmulKernel[
     # cta_group=1 layout. False (default) keeps the cooperative
     # scatter path.
     swiglu_use_inplace: Bool = False,
+    c_device_engine: TensorEngine = DefaultEngine[element_width=1],
+    offsets_engine: TensorEngine = DefaultEngine[element_width=1],
+    a_scale_offsets_engine: TensorEngine = DefaultEngine[element_width=1],
+    expert_ids_engine: TensorEngine = DefaultEngine[element_width=1],
+    expert_scales_engine: TensorEngine = DefaultEngine[element_width=1],
 ]:
     """Grouped 1D-1D block-scaled matmul kernel.
 
@@ -757,6 +765,14 @@ struct Grouped1D1DMatmulKernel[
             register path that skips the `bfloat16` SMEM scratchpad via
             cross-lane shuffles; `False` (default) keeps the cooperative
             scatter path.
+        c_device_engine: Engine of the C `TileTensor`.
+        offsets_engine: Engine of the per-expert offsets
+            `TileTensor`.
+        a_scale_offsets_engine: Engine of the per-expert A-scale
+            offsets `TileTensor`.
+        expert_ids_engine: Engine of the expert-IDs `TileTensor`.
+        expert_scales_engine: Engine of the expert-scales
+            `TileTensor`.
     """
 
     # ========== Derived Constants ==========
@@ -960,6 +976,9 @@ struct Grouped1D1DMatmulKernel[
         cluster=Self.config.cluster_shape,
         cta_group=Self.cta_group,
         AB_swapped=Self.config.AB_swapped,
+        OffsetsEngine=Self.offsets_engine,
+        ExpertIdsEngine=Self.expert_ids_engine,
+        ExpertScalesEngine=Self.expert_scales_engine,
     ]
 
     # ========== TMA Load Size Constants ==========
@@ -1089,18 +1108,28 @@ struct Grouped1D1DMatmulKernel[
     ]
 
     # 1D data TileTensor types (offsets, expert IDs, scales)
-    comptime OffsetsTile = TileTensor[DType.uint32, GMEMLayout1D, MutAnyOrigin]
-    comptime AScaleOffsetsTile = TileTensor[
-        DType.uint32, GMEMLayout1D, MutAnyOrigin
+    comptime OffsetsTile = TileTensor[
+        .uint32, GMEMLayout1D, MutAnyOrigin, Engine=Self.offsets_engine
     ]
-    comptime ExpertIdsTile = TileTensor[DType.int32, GMEMLayout1D, MutAnyOrigin]
+    comptime AScaleOffsetsTile = TileTensor[
+        .uint32,
+        GMEMLayout1D,
+        MutAnyOrigin,
+        Engine=Self.a_scale_offsets_engine,
+    ]
+    comptime ExpertIdsTile = TileTensor[
+        .int32, GMEMLayout1D, MutAnyOrigin, Engine=Self.expert_ids_engine
+    ]
     comptime ExpertScalesTile = TileTensor[
-        DType.float32, GMEMLayout1D, MutAnyOrigin
+        .float32, GMEMLayout1D, MutAnyOrigin, Engine=Self.expert_scales_engine
     ]
 
     # C device tensor type (for bounds-checked stores)
     comptime CDeviceTile = TileTensor[
-        Self.c_type, Self.c_device_layout, MutAnyOrigin
+        Self.c_type,
+        Self.c_device_layout,
+        MutAnyOrigin,
+        Engine=Self.c_device_engine,
     ]
 
     # TMA load size constants (from desc layout dimensions)
@@ -1343,7 +1372,7 @@ struct Grouped1D1DMatmulKernel[
         if use_group_cache:
             si = sched_group_offsets[Int(grp)]
         else:
-            si = a_offsets[Int(grp)]
+            si = a_offsets[Int(grp)][0]
 
         var found = False
         var s_m: UInt32 = 0
@@ -1361,8 +1390,8 @@ struct Grouped1D1DMatmulKernel[
                 ei = sched_group_offsets[Int(grp + 1)]
                 eid = sched_expert_ids[Int(grp)]
             else:
-                ei = a_offsets[Int(grp + 1)]
-                eid = expert_ids[Int(grp)]
+                ei = a_offsets[Int(grp + 1)][0]
+                eid = expert_ids[Int(grp)][0]
             var gs = ei - si
             if eid < 0 or gs <= 0:
                 grp += 1
@@ -1382,7 +1411,7 @@ struct Grouped1D1DMatmulKernel[
                 if use_group_cache:
                     s_scale = sched_expert_scales[Int(grp)]
                 else:
-                    s_scale = expert_scales[Int(eid)]
+                    s_scale = expert_scales[Int(eid)][0]
                 found = True
                 break
             grp += 1
@@ -1526,8 +1555,8 @@ struct Grouped1D1DMatmulKernel[
 
         # ===== Shared Memory Setup =====
         ref smem = external_memory[
-            Scalar[DType.uint8],
-            address_space=AddressSpace.SHARED,
+            UInt8,
+            address_space=.SHARED,
             alignment=128,
         ]().bitcast[Self.SmemType]()[]
 
@@ -2183,7 +2212,9 @@ struct Grouped1D1DMatmulKernel[
                     # Hoist loop-invariant SF coords outside k_tile loop.
                     # sfb_n_coord must be visible to ALL lanes (cp.async
                     # needs it per-lane), so compute outside elect_one_sync.
-                    var a_scale_offset = a_scale_offsets[Int(ctx.group_idx())]
+                    var a_scale_offset = a_scale_offsets[Int(ctx.group_idx())][
+                        0
+                    ]
                     var _sfa_coord: Int
                     var sfb_n_coord: Int
                     _sfa_coord, sfb_n_coord = Self._get_sf_coords(
@@ -2282,15 +2313,11 @@ struct Grouped1D1DMatmulKernel[
                                         ](
                                             (
                                                 sfb_global_ptr + global_offset
-                                            ).address_space_cast[
-                                                AddressSpace.GLOBAL
-                                            ](),
+                                            ).address_space_cast[.GLOBAL](),
                                             (
                                                 sfb_smem_tile._storage
                                                 + smem_offset
-                                            ).address_space_cast[
-                                                AddressSpace.SHARED
-                                            ](),
+                                            ).address_space_cast[.SHARED](),
                                             src_size=Int32(
                                                 copy_size
                                             ) if is_valid else Int32(0),
@@ -2354,13 +2381,13 @@ struct Grouped1D1DMatmulKernel[
                                             Self.sf_tma_dtype,
                                             type_of(atom_dst).LayoutType,
                                             MutAnyOrigin,
-                                            address_space=AddressSpace.SHARED,
+                                            address_space=.SHARED,
                                         ](
                                             rebind[
                                                 UnsafePointer[
                                                     Scalar[Self.sf_tma_dtype],
                                                     MutAnyOrigin,
-                                                    address_space=AddressSpace.SHARED,
+                                                    address_space=.SHARED,
                                                 ]
                                             ](atom_dst._storage),
                                             atom_dst.layout,
@@ -2509,12 +2536,12 @@ struct Grouped1D1DMatmulKernel[
                 var sched_expert_scales = smem.sched_expert_scales()
                 var lane = Int(lane_id())
                 for i in range(lane, _num_active_experts + 1, WARP_SIZE):
-                    sched_group_offsets[i] = a_offsets[i]
+                    sched_group_offsets[i] = a_offsets[i][0]
                 for i in range(lane, _num_active_experts, WARP_SIZE):
-                    var eid = expert_ids[i]
+                    var eid = expert_ids[i][0]
                     sched_expert_ids[i] = eid
-                    sched_expert_scales[i] = expert_scales[
-                        Int(eid)
+                    sched_expert_scales[i] = expert_scales[Int(eid)][
+                        0
                     ] if eid >= 0 else Float32(1.0)
 
             # --- Steady-state: use SMEM cache (fast) ---
@@ -2589,7 +2616,7 @@ struct Grouped1D1DMatmulKernel[
             # batched-stores-then-one-wait shape as
             # TmemFragments.store() + wait_store().
             var _sfb_st_vals = Array[
-                Array[Scalar[DType.uint32], 1],
+                Array[UInt32, 1],
                 Self.config.num_sf_k_tiles,
             ](uninitialized=True)
 
@@ -2628,9 +2655,7 @@ struct Grouped1D1DMatmulKernel[
                 # warp-collective store.
                 syncwarp()
 
-                _sfb_st_vals[sf_idx][0] = bitcast[DType.uint32, 1](sfb_scales)[
-                    0
-                ]
+                _sfb_st_vals[sf_idx][0] = bitcast[.uint32, 1](sfb_scales)[0]
                 tcgen05_st[
                     datapaths=32,
                     bits=32,
@@ -2662,7 +2687,7 @@ struct Grouped1D1DMatmulKernel[
         m_coord: UInt32,
         n_coord: UInt32,
         expert_id: Int32,
-        a_scale_offset: Scalar[DType.uint32],
+        a_scale_offset: UInt32,
         m_start: UInt32,
     ) -> Tuple[Int, Int]:
         """Return (sfa_m_coord, sfb_n_coord), swapped when AB_swapped."""
@@ -2694,6 +2719,9 @@ struct Grouped1D1DMatmulKernel[
     def load_input_tiles[
         tiles_origin: MutOrigin,
         //,
+        split_txn: Bool = False,
+        weight_txn_bytes: Int = 0,
+        activation_txn_bytes: Int = 0,
     ](
         a_tma_op: Self.ATmaOp,
         b_tma_op: Self.BTmaOp,
@@ -2714,6 +2742,7 @@ struct Grouped1D1DMatmulKernel[
         b_multicast_mask: UInt16,
         load_weights: Bool = True,
         load_activations: Bool = True,
+        wr_mbar: Optional[MbarPtr] = None,
     ):
         """Load A, B, SFA, SFB tiles using TMA.
 
@@ -2731,9 +2760,26 @@ struct Grouped1D1DMatmulKernel[
         activations-only). Branches inside are cheap compared to the
         TMA ops and the warp-level election that gates them.
 
+        `split_txn` splits the stage's single transaction count in two:
+        the weight side (A + SFA when `AB_swapped`) completes a
+        caller-supplied weight-ready barrier carrying
+        `weight_txn_bytes`, and the stage's own FULL barrier is reduced
+        to `activation_txn_bytes`. Both counts are armed during the
+        weight phase, so an activation-only follow-up call for the same
+        stage re-arms neither. A consumer that reads A must then join
+        the weight-ready barrier as well as the stage barrier. With
+        `split_txn=False` (the default) nothing about the emitted code
+        changes.
+
         Parameters:
             tiles_origin: SMEM `MutOrigin` of the producer tiles (inferred
                 from `tiles`).
+            split_txn: When `True`, account the weight bytes on `wr_mbar`
+                and the activation bytes on the stage barrier instead of
+                arming the stage barrier with `input_expected_bytes`.
+            weight_txn_bytes: Weight-side expected bytes (`split_txn`).
+            activation_txn_bytes: Activation-side expected bytes
+                (`split_txn`).
 
         Args:
             a_tma_op: TMA operation descriptor for A tile loads.
@@ -2763,7 +2809,18 @@ struct Grouped1D1DMatmulKernel[
                 `AB_swapped`, else B+SFB) (defaults to `True`).
             load_activations: When `True`, load the activation side
                 (defaults to `True`).
+            wr_mbar: Weight-ready barrier the weight-side TMAs signal
+                under `split_txn`. Must be present whenever `split_txn`
+                is set; ignored otherwise.
         """
+        comptime assert (
+            not split_txn
+            or weight_txn_bytes + activation_txn_bytes
+            == Self.input_expected_bytes
+        ), (
+            "split_txn byte counts must reconstruct input_expected_bytes"
+            " exactly, or the stage's transactions never balance"
+        )
         var peer_rank_n = peer_cta_coord[0]
         var peer_rank_m = peer_cta_coord[1]
         var peer_m_rank = peer_cta_coord[2]
@@ -2823,9 +2880,30 @@ struct Grouped1D1DMatmulKernel[
             # phase so activation-only calls (post-PDL-wait) don't re-expect.
             if load_weights:
                 if elect_one_cta:
-                    tiles.expect_bytes(Self.input_expected_bytes)
+                    comptime if split_txn:
+                        # BOTH counts are armed in the weight phase, so the
+                        # `load_weights=False, load_activations=True`
+                        # follow-up call for the same stage re-arms
+                        # neither and no transaction is left outstanding.
+                        wr_mbar.unsafe_value()[0].expect_bytes(
+                            Int32(weight_txn_bytes)
+                        )
+                        tiles.expect_bytes(activation_txn_bytes)
+                    else:
+                        tiles.expect_bytes(Self.input_expected_bytes)
 
             var barrier = tiles.barrier()
+            # Per-side completion barriers. Both are the stage barrier
+            # unless the caller split the transaction, in which case the
+            # WEIGHT side (A+SFA when AB_swapped, B+SFB otherwise) moves
+            # onto the caller's weight-ready barrier.
+            var a_side_barrier = barrier
+            var b_side_barrier = barrier
+            comptime if split_txn:
+                comptime if Self.config.AB_swapped:
+                    a_side_barrier = wr_mbar.unsafe_value()
+                else:
+                    b_side_barrier = wr_mbar.unsafe_value()
 
             comptime for jj in range(Self.config.k_group_size):
                 var j = UInt32(jj)
@@ -2851,21 +2929,21 @@ struct Grouped1D1DMatmulKernel[
                 if load_a_side:
                     a_tma_op.async_multicast_load[Self.cta_group](
                         a_peer_tt,
-                        barrier[0],
+                        a_side_barrier[0],
                         (k_coord, a_gmem_m_coord),
                         a_multicast_mask,
                     )
                 if load_b_side:
                     b_tma_op.async_multicast_load[Self.cta_group](
                         b_peer_tt,
-                        barrier[0],
+                        b_side_barrier[0],
                         (k_coord, b_gmem_n_coord),
                         b_multicast_mask,
                     )
 
                 # Scale factor load with offset
                 # TMA 4D now has TileTensor overload - pass tiles directly
-                var a_scale_offset = a_scale_offsets[Int(group_idx)]
+                var a_scale_offset = a_scale_offsets[Int(group_idx)][0]
 
                 var sfa_m_coord: Int
                 var sfb_n_coord: Int
@@ -2890,20 +2968,20 @@ struct Grouped1D1DMatmulKernel[
                         Self.sf_tma_dtype,
                         type_of(sfa_tt).LayoutType,
                         MutAnyOrigin,
-                        address_space=AddressSpace.SHARED,
+                        address_space=.SHARED,
                     ](
                         rebind[
                             UnsafePointer[
                                 Scalar[Self.sf_tma_dtype],
                                 MutAnyOrigin,
-                                address_space=AddressSpace.SHARED,
+                                address_space=.SHARED,
                             ]
                         ](sfa_tt._storage),
                         sfa_tt.layout,
                     )
                     sfa_tma_op.async_copy_4d[Self.cta_group](
                         sfa_tt_u16,
-                        barrier[0],
+                        a_side_barrier[0],
                         (
                             0,
                             Int(
@@ -2922,20 +3000,20 @@ struct Grouped1D1DMatmulKernel[
                             Self.sf_tma_dtype,
                             type_of(sfb_tt).LayoutType,
                             MutAnyOrigin,
-                            address_space=AddressSpace.SHARED,
+                            address_space=.SHARED,
                         ](
                             rebind[
                                 UnsafePointer[
                                     Scalar[Self.sf_tma_dtype],
                                     MutAnyOrigin,
-                                    address_space=AddressSpace.SHARED,
+                                    address_space=.SHARED,
                                 ]
                             ](sfb_tt._storage),
                             sfb_tt.layout,
                         )
                         sfb_tma_op.async_copy_4d[Self.cta_group](
                             sfb_tt_u16,
-                            barrier[0],
+                            b_side_barrier[0],
                             (
                                 0,
                                 Int(
@@ -3286,7 +3364,7 @@ struct Grouped1D1DMatmulKernel[
                             src_u[_j] = upper_ip[r0 * 4 + _off + _j]
                         var dst_u = (
                             (src_u * scale)
-                            .cast[DType.bfloat16]()
+                            .cast[.bfloat16]()
                             .cast[Self.accum_type]()
                         )
                         comptime for _j in range(SIMD_CAST_W):
@@ -3298,7 +3376,7 @@ struct Grouped1D1DMatmulKernel[
                                 src_l[_j] = lower_ip[r0 * 4 + _off + _j]
                             var dst_l = (
                                 (src_l * scale)
-                                .cast[DType.bfloat16]()
+                                .cast[.bfloat16]()
                                 .cast[Self.accum_type]()
                             )
                             comptime for _j in range(SIMD_CAST_W):
@@ -3477,12 +3555,10 @@ struct Grouped1D1DMatmulKernel[
                         var output_scale = Float32(0.0)
                         if block_max != Float32(0.0):
                             comptime if is_mxfp8:
-                                output_scale = recip(
-                                    sf_byte.cast[DType.float32]()
-                                )
+                                output_scale = recip(sf_byte.cast[.float32]())
                             else:
                                 output_scale = tensor_sf * recip(
-                                    sf_byte.cast[DType.float32]()
+                                    sf_byte.cast[.float32]()
                                 )
 
                         var p_scaled = pack16 * output_scale
@@ -3503,7 +3579,7 @@ struct Grouped1D1DMatmulKernel[
                                 Int(n_abs) // 2 + Int(warp_row_offset) // 2
                             )
                             if lane_row == UInt32(0) and token_g < m_end:
-                                var packed_u32 = bitcast[DType.uint32, 4](
+                                var packed_u32 = bitcast[.uint32, 4](
                                     packed16_ip
                                 )
                                 swiglu_out.store_packed_word(
@@ -3622,7 +3698,7 @@ struct Grouped1D1DMatmulKernel[
             smem_idx_b: UInt32,
             pair_fp32: SIMD[Self.accum_type, 2],
         ):
-            var pair_bf = pair_fp32.cast[DType.bfloat16]()
+            var pair_bf = pair_fp32.cast[.bfloat16]()
             smem_bf16_ptr.store(Int(SWIZZLE_BF(smem_idx_a)), pair_bf[0])
             smem_bf16_ptr.store(Int(SWIZZLE_BF(smem_idx_b)), pair_bf[1])
 
@@ -3759,14 +3835,14 @@ struct Grouped1D1DMatmulKernel[
                 comptime BF16_LOAD_W = 8
                 comptime n_loads = (2 * src_width) // BF16_LOAD_W
                 var smem_base = UInt32(token_idx) * UInt32(BM) + UInt32(k_raw)
-                var pair_bf = SIMD[DType.bfloat16, 2 * src_width]()
+                var pair_bf = SIMD[.bfloat16, 2 * src_width]()
                 comptime for li in range(n_loads):
                     var chunk = smem_bf16_ptr.load[width=BF16_LOAD_W](
                         Int(SWIZZLE_BF(smem_base + UInt32(li * BF16_LOAD_W)))
                     )
                     comptime for ci in range(BF16_LOAD_W):
                         pair_bf[li * BF16_LOAD_W + ci] = chunk[ci]
-                var pair = pair_bf.cast[DType.float32]()
+                var pair = pair_bf.cast[.float32]()
                 var gate, up = pair.deinterleave()
 
                 # silu(g) and the final SF reciprocal use `recip()`
@@ -3816,10 +3892,10 @@ struct Grouped1D1DMatmulKernel[
                 var output_scale = Float32(0.0)
                 if block_max != Float32(0.0):
                     comptime if is_mxfp8:
-                        output_scale = recip(sf_byte.cast[DType.float32]())
+                        output_scale = recip(sf_byte.cast[.float32]())
                     else:
                         output_scale = tensor_sf * recip(
-                            sf_byte.cast[DType.float32]()
+                            sf_byte.cast[.float32]()
                         )
 
                 var z_scaled = z * output_scale
@@ -3830,10 +3906,10 @@ struct Grouped1D1DMatmulKernel[
                 # under the kernel's MMA geometry, so word stores
                 # coalesce on the L2 sector.
                 comptime if is_mxfp8:
-                    var packed16 = z_scaled.cast[DType.float8_e4m3fn]()
+                    var packed16 = z_scaled.cast[.float8_e4m3fn]()
                     if in_bounds and m_global < m_end:
                         var byte_base_global = Int(n_abs // 2) + Int(k_post)
-                        var packed_u32 = bitcast[DType.uint32, 4](packed16)
+                        var packed_u32 = bitcast[.uint32, 4](packed16)
                         swiglu_out.store_packed_word(
                             Int(m_global), byte_base_global, packed_u32[0]
                         )

@@ -184,6 +184,8 @@ _EXTRA_CONSTRAINTS = {
     # Each test iterates dtype (FP8 / BF16 / FP16) inside `main()` —
     # HK MHA pattern; single BUILD target per file (no dtype for-loop).
     "test_4wave_matmul.mojo": ["//:mi355_gpu"],
+    # Streams a preshuffled B via CDNA4 16x16x32 bf16 MFMA; MI355X-only.
+    "test_smallm_streaming_matmul.mojo": ["//:mi355_gpu"],
     "test_4wave_epilogue.mojo": ["//:mi355_gpu"],
     "test_4wave_split_k.mojo": ["//:mi355_gpu"],
     "test_4wave_nonaligned.mojo": ["//:mi355_gpu"],
@@ -239,6 +241,7 @@ _B200_TESTS = [
     "test_matmul_sm100_epilogue.mojo",
     "test_matmul_sm100_partial_n_tile_epilogue.mojo",
     "test_matmul_sm100_swapAB_epilogue.mojo",
+    "test_matmul_sm100_transposed_epilogue_bounds.mojo",
     "test_matmul_sm100_1sm_bf16_1d_bias.mojo",
     "test_matmul_sm100_2sm_bf16_1d_bias.mojo",
     "test_matmul_sm100_2sm_bf16.mojo",
@@ -399,6 +402,7 @@ _GPU_MEMORY = {
     "test_mxfp4_matmul_amd.mojo": "2",
     "test_mxfp4_moe_matmul_amd_routed.mojo": "8",
     "test_mxfp8_matmul_amd.mojo": "2",
+    "test_mxfp8_matmul_amd_preb.mojo": "8",
     "test_mx_split_k_epilogue_amd.mojo": "2",
     "test_ping_pong.mojo": "1",
     "test_ping_pong_shapes.mojo": "2",

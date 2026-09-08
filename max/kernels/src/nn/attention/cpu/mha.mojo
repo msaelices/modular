@@ -117,13 +117,15 @@ struct _Matmul[dtype: DType, simd_width: Int]:
         var ak_ptr = a_ptr
         var bk_ptr = b_ptr
 
-        @__parameter
         @always_inline
-        def loop_body[lane_count: Int](k: Int):
-            var a_tile = Array[SIMD[Self.dtype, lane_count], tile_m](fill=0)
-
-            comptime for m in range(tile_m):
-                a_tile[m] = ak_ptr.load[width=lane_count](m * a_stride)
+        def loop_body[
+            lane_count: Int
+        ](k: Int) {mut ak_ptr, mut bk_ptr, mut c_tile, imm}:
+            var a_tile = Array[_, tile_m](
+                fill_with=lambda (m: Int) -> SIMD[
+                    Self.dtype, lane_count
+                ]: ak_ptr.load[width=lane_count](m * a_stride)
+            )
 
             ak_ptr += lane_count
 
@@ -138,7 +140,7 @@ struct _Matmul[dtype: DType, simd_width: Int]:
 
                 bk_ptr += b_stride
 
-        tile[loop_body, [Self.simd_width, 1]](0, K)
+        tile[[Self.simd_width, 1]](0, K, loop_body)
         # TODO(MOCO-2074): Suppress false positive unused var warning.
         _ = ak_ptr
         _ = bk_ptr
@@ -158,9 +160,10 @@ struct _Matmul[dtype: DType, simd_width: Int]:
         var ak_ptr = a_ptr
         var bk_ptr = b_ptr
 
-        @__parameter
         @always_inline
-        def loop_body[unroll_factor: Int](k: Int):
+        def loop_body[
+            unroll_factor: Int
+        ](k: Int) {mut ak_ptr, mut bk_ptr, mut c_tile, imm}:
             var b_tile = Array[SIMD[Self.dtype, Self.simd_width], tile_n](
                 fill=0
             )
@@ -180,7 +183,7 @@ struct _Matmul[dtype: DType, simd_width: Int]:
                 ak_ptr += 1
                 bk_ptr += b_stride
 
-        tile[loop_body, [2, 1]](0, K)
+        tile[[2, 1]](0, K, loop_body)
         # TODO(MOCO-2074): Suppress false positive unused var warning.
         _ = ak_ptr
         _ = bk_ptr
@@ -201,13 +204,13 @@ struct _Matmul[dtype: DType, simd_width: Int]:
         var am_ptr = a_ptr
         var cm_ptr = c_ptr
 
-        @__parameter
-        def process_rows[tile_m: Int](m: Int):
+        def process_rows[tile_m: Int](m: Int) {mut am_ptr, mut cm_ptr, imm}:
             var bn_ptr = b_ptr
             var cn_ptr = cm_ptr
 
-            @__parameter
-            def process_cols[tile_n: Int](n_unscaled: Int):
+            def process_cols[
+                tile_n: Int
+            ](n_unscaled: Int) {mut bn_ptr, mut cn_ptr, imm}:
                 var c_tile = _Accumulator[
                     Self.dtype, tile_m, tile_n, Self.simd_width
                 ]()
@@ -231,8 +234,8 @@ struct _Matmul[dtype: DType, simd_width: Int]:
                 bn_ptr += tile_n * Self.simd_width
                 cn_ptr += tile_n * Self.simd_width
 
-            tile[process_cols, Self._matmul_config.col_sizes](
-                0, ceildiv(N, Self.simd_width)
+            tile[Self._matmul_config.col_sizes](
+                0, ceildiv(N, Self.simd_width), process_cols
             )
 
             am_ptr += tile_m * a_stride
@@ -242,7 +245,7 @@ struct _Matmul[dtype: DType, simd_width: Int]:
             _ = bn_ptr
             _ = cn_ptr
 
-        tile[process_rows, Self._matmul_config.row_sizes](0, M)
+        tile[Self._matmul_config.row_sizes](0, M, process_rows)
         # TODO(MOCO-2074): Suppress false positive unused var warning.
         _ = am_ptr
         _ = cm_ptr
@@ -270,9 +273,10 @@ struct _Matmul[dtype: DType, simd_width: Int]:
             row_major[transpose_width, transpose_width]()
         )
 
-        @__parameter
         @always_inline
-        def process_tile[tile_n: Int, tile_k: Int](n: Int, k: Int):
+        def process_tile[
+            tile_n: Int, tile_k: Int
+        ](n: Int, k: Int) {mut transpose_buffer, imm}:
             comptime if transpose_width == tile_n == tile_k:
                 # Use an optimized path to transpose a square tile of the
                 # input tensor.
@@ -304,7 +308,7 @@ struct _Matmul[dtype: DType, simd_width: Int]:
                             (k + kk) * aligned_n + (n + nn), val[kk]
                         )
 
-        tile[process_tile, tile_sizes, tile_sizes](0, 0, N, K)
+        tile[tile_sizes, tile_sizes](0, 0, N, K, process_tile)
         _ = transpose_buffer
 
         if aligned_n != N:
@@ -326,14 +330,14 @@ struct _Matmul[dtype: DType, simd_width: Int]:
         var aligned_n = align_up(N, Self.simd_width)
 
         for _k in range(K):
-
-            @__parameter
+            # TODO(MOCO-4664): `var _k` copy-captures the loop variable to work
+            # around wrong debug-info scopes on implicit nested-scope captures.
             @always_inline
-            def packed_copy[_simd_width: Int](idx: Int):
+            def packed_copy[_simd_width: Int](idx: Int) {var _k, imm}:
                 var val = input_b_fn[_simd_width](idx, _k)
                 output_ptr.store(idx, val)
 
-            tile[packed_copy, Self._matmul_config.pack_sizes](0, N)
+            tile[Self._matmul_config.pack_sizes](0, N, packed_copy)
 
             if aligned_n != N:
                 unsafe_memset_zero(output_ptr + N, aligned_n - N)
@@ -353,10 +357,8 @@ struct _Matmul[dtype: DType, simd_width: Int]:
         var K = static_k if static_k != UNKNOWN_VALUE else dynamic_k
         var cn_ptr = c_ptr
 
-        @__parameter
         @always_inline
-        def process_cols[tile_n: Int](n: Int):
-            @__parameter
+        def process_cols[tile_n: Int](n: Int) {mut cn_ptr, imm}:
             @always_inline
             def do_reduce[
                 _simd_width: SIMDLength
@@ -364,7 +366,7 @@ struct _Matmul[dtype: DType, simd_width: Int]:
                 start: Int,
                 end: Int,
                 mut accum: Array[SIMD[Self.dtype, _simd_width], tile_n],
-            ):
+            ) {imm}:
                 for _k in range(start, end, _simd_width):
                     var a_data = a_ptr.load[width=_simd_width](_k)
 
@@ -372,13 +374,12 @@ struct _Matmul[dtype: DType, simd_width: Int]:
                         var b_data = input_b_fn[_simd_width](n + nn, _k)
                         accum[nn] = b_data.fma(a_data, accum[nn])
 
-            @__parameter
             @always_inline
             def do_reduce_accum[
                 target_width: Int, _simd_width: SIMDLength
-            ](accum: Array[SIMD[Self.dtype, _simd_width], tile_n]) -> Array[
-                SIMD[Self.dtype, target_width], tile_n
-            ]:
+            ](accum: Array[SIMD[Self.dtype, _simd_width], tile_n]) {
+                imm
+            } -> Array[SIMD[Self.dtype, target_width], tile_n]:
                 var accum_reduce = Array[
                     SIMD[Self.dtype, target_width], tile_n
                 ](fill=0)
@@ -408,7 +409,7 @@ struct _Matmul[dtype: DType, simd_width: Int]:
 
             cn_ptr += tile_n
 
-        tile[process_cols, [4, 1]](0, N)
+        tile[[4, 1]](0, N, process_cols)
         # TODO(MOCO-2074): Suppress false positive unused var warning.
         _ = K
         _ = cn_ptr
@@ -426,9 +427,8 @@ struct _Matmul[dtype: DType, simd_width: Int]:
     ):
         var cn_ptr = c_ptr
 
-        @__parameter
         @always_inline
-        def process_cols[_simd_width: Int](n: Int):
+        def process_cols[_simd_width: Int](n: Int) {mut cn_ptr, imm}:
             var accum = SIMD[Self.dtype, _simd_width]()
 
             for k in range(K):
@@ -441,7 +441,7 @@ struct _Matmul[dtype: DType, simd_width: Int]:
             cn_ptr.store(accum)
             cn_ptr += _simd_width
 
-        tile[process_cols, Self._matmul_config.gemv_sizes](0, N)
+        tile[Self._matmul_config.gemv_sizes](0, N, process_cols)
         # TODO(MOCO-2074): Suppress false positive unused var warning.
         _ = cn_ptr
 
@@ -555,8 +555,7 @@ struct _FlashAttention[
     output_origin: Origin[mut=True],
     //,
     input_q_ptr_fn: def(IndexList[rank]) capturing -> UnsafePointer[
-        Scalar[dtype],
-        q_origin,
+        Scalar[dtype], q_origin
     ],
     input_k_fn: def[simd_width: Int, rank: Int](
         idx: IndexList[rank]
@@ -729,20 +728,21 @@ struct _FlashAttention[
 
         var num_threads = min(work_count, parallelism_level(ctx))
 
-        @__copy_capture(
-            num_threads,
-            work_count,
-            num_blocks_n,
-            num_blocks_m,
-            packed_size,
-            kv_group_count,
-            depth_dim,
-            max_seq_len,
-            num_heads,
-            sink_weights,
-        )
-        @__parameter
-        def task_func(task_id: Int):
+        def task_func(
+            task_id: Int,
+        ) {
+            var num_threads,
+            var work_count,
+            var num_blocks_n,
+            var num_blocks_m,
+            var packed_size,
+            var kv_group_count,
+            var depth_dim,
+            var max_seq_len,
+            var num_heads,
+            var sink_weights,
+            imm,
+        }:
             var qk_block_ptr = unsafe_stack_allocation[
                 Self._config.block_m * Self._config.qk_block_n,
                 Self.dtype,
@@ -959,7 +959,7 @@ struct _FlashAttention[
 
             packed_alloc^.deinit_with(_dealloc_packed)
 
-        sync_parallelize[task_func](num_threads, ctx)
+        sync_parallelize(task_func, num_threads, ctx)
 
 
 @always_inline
@@ -980,15 +980,11 @@ def _flash_attention[
         IndexList[mask_rank]
     ) capturing -> SIMD[dtype, simd_width],
 ](
-    q: LayoutTensor[
-        dtype, _, q_origin, address_space=AddressSpace.GENERIC, ...
-    ],
+    q: LayoutTensor[dtype, _, q_origin, address_space=.GENERIC, ...],
     k_shape: IndexList[rank],
     v_shape: IndexList[rank],
     mask_shape: IndexList[mask_rank],
-    output: LayoutTensor[
-        dtype, _, output_origin, address_space=AddressSpace.GENERIC, ...
-    ],
+    output: LayoutTensor[dtype, _, output_origin, address_space=.GENERIC, ...],
     scale: Float32,
     sink_weights: OptionalReg[
         LayoutTensor[dtype, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin]
@@ -1086,15 +1082,11 @@ def flash_attention[
         IndexList[mask_rank]
     ) capturing -> SIMD[dtype, simd_width],
 ](
-    q: LayoutTensor[
-        dtype, _, q_origin, address_space=AddressSpace.GENERIC, ...
-    ],
+    q: LayoutTensor[dtype, _, q_origin, address_space=.GENERIC, ...],
     k_shape: IndexList[rank],
     v_shape: IndexList[rank],
     mask_shape: IndexList[mask_rank],
-    output: LayoutTensor[
-        dtype, _, output_origin, address_space=AddressSpace.GENERIC, ...
-    ],
+    output: LayoutTensor[dtype, _, output_origin, address_space=.GENERIC, ...],
     scale: Float32,
     sink_weights: OptionalReg[
         LayoutTensor[dtype, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin]
@@ -1164,16 +1156,14 @@ def flash_attention_split_kv[
         IndexList[mask_rank]
     ) capturing -> SIMD[dtype, simd_width],
 ](
-    q: LayoutTensor[mut=False, dtype, address_space=AddressSpace.GENERIC, ...],
+    q: LayoutTensor[mut=False, dtype, address_space=.GENERIC, ...],
     k_shape: IndexList[rank],
     v_shape: IndexList[rank],
     # {k,v}_cache_shape are rank + 1 because reshape in MO IR prevents fusion.
     k_cache_shape: IndexList[rank + 1],
     v_cache_shape: IndexList[rank + 1],
     mask_shape: IndexList[mask_rank],
-    output: LayoutTensor[
-        mut=True, dtype, address_space=AddressSpace.GENERIC, ...
-    ],
+    output: LayoutTensor[mut=True, dtype, address_space=.GENERIC, ...],
     scale: Float32,
     ctx: Optional[DeviceContext] = None,
 ) raises:
@@ -1227,8 +1217,7 @@ def flash_attention_split_kv[
     comptime assert rank == 4
 
     @always_inline
-    @__parameter
-    def description_fn() -> String:
+    def description_fn() {imm} -> String:
         return String(";").join(
             Span(
                 [
@@ -1244,7 +1233,7 @@ def flash_attention_split_kv[
 
     with Trace[TraceLevel.OP, target=StaticString("cpu")](
         "flash_attention_split_kv",
-        Trace[TraceLevel.OP]._get_detail_str[description_fn](),
+        Trace[TraceLevel.OP]._get_detail_str(description_fn),
     ):
         comptime kv_rank = rank + 1
 
@@ -1339,15 +1328,11 @@ def _flash_attention_kv_cache[
     ) capturing -> SIMD[dtype, simd_width],
     mask_rank: Int,
 ](
-    q: LayoutTensor[
-        dtype, _, q_origin, address_space=AddressSpace.GENERIC, ...
-    ],
+    q: LayoutTensor[dtype, _, q_origin, address_space=.GENERIC, ...],
     k: cache_t,
     v: cache_t,
     scale: Float32,
-    output: LayoutTensor[
-        dtype, _, output_origin, address_space=AddressSpace.GENERIC, ...
-    ],
+    output: LayoutTensor[dtype, _, output_origin, address_space=.GENERIC, ...],
     sink_weights: OptionalReg[
         LayoutTensor[dtype, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin]
     ] = None,
@@ -1496,18 +1481,12 @@ def flash_attention_kv_cache[
     output_origin: Origin[mut=True],
     //,
 ](
-    q: LayoutTensor[
-        dtype, _, q_origin, address_space=AddressSpace.GENERIC, ...
-    ],
+    q: LayoutTensor[dtype, _, q_origin, address_space=.GENERIC, ...],
     k: cache_t,
     v: cache_t,
-    mask: LayoutTensor[
-        mut=False, dtype, address_space=AddressSpace.GENERIC, ...
-    ],
+    mask: LayoutTensor[mut=False, dtype, address_space=.GENERIC, ...],
     scale: Float32,
-    output: LayoutTensor[
-        dtype, _, output_origin, address_space=AddressSpace.GENERIC, ...
-    ],
+    output: LayoutTensor[dtype, _, output_origin, address_space=.GENERIC, ...],
     sink_weights: OptionalReg[
         LayoutTensor[dtype, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin]
     ] = None,
@@ -1550,16 +1529,12 @@ def flash_attention_kv_cache[
     output_origin: Origin[mut=True],
     //,
 ](
-    q: LayoutTensor[
-        dtype, _, q_origin, address_space=AddressSpace.GENERIC, ...
-    ],
+    q: LayoutTensor[dtype, _, q_origin, address_space=.GENERIC, ...],
     k: cache_t,
     v: cache_t,
     mask: mask_t,
     scale: Float32,
-    output: LayoutTensor[
-        dtype, _, output_origin, address_space=AddressSpace.GENERIC, ...
-    ],
+    output: LayoutTensor[dtype, _, output_origin, address_space=.GENERIC, ...],
     sink_weights: OptionalReg[
         LayoutTensor[
             mut=False, dtype, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
@@ -1609,22 +1584,18 @@ def flash_attention_kv_cache[
     output_origin: Origin[mut=True],
     //,
 ](
-    q: LayoutTensor[
-        dtype, _, q_origin, address_space=AddressSpace.GENERIC, ...
-    ],
+    q: LayoutTensor[dtype, _, q_origin, address_space=.GENERIC, ...],
     q_input_row_offsets: LayoutTensor[
-        mut=False, DType.uint32, address_space=AddressSpace.GENERIC, ...
+        mut=False, .uint32, address_space=.GENERIC, ...
     ],
     kv_input_row_offsets: LayoutTensor[
-        mut=False, DType.uint32, address_space=AddressSpace.GENERIC, ...
+        mut=False, .uint32, address_space=.GENERIC, ...
     ],
     k: cache_t,
     v: cache_t,
     mask: mask_t,
     scale: Float32,
-    output: LayoutTensor[
-        dtype, _, output_origin, address_space=AddressSpace.GENERIC, ...
-    ],
+    output: LayoutTensor[dtype, _, output_origin, address_space=.GENERIC, ...],
     sink_weights: OptionalReg[
         LayoutTensor[dtype, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin]
     ] = None,

@@ -30,7 +30,7 @@ from std.memory import bitcast, unsafe_stack_allocation
 from layout.tile_tensor import stack_allocation as tt_stack_allocation
 from std.sys import align_of, simd_width_of, size_of
 from std.sys.intrinsics import readfirstlane
-from std.gpu import block_idx, lane_id, thread_idx
+from max.gpu import block_idx, lane_id, thread_idx
 from max.gpu.sync import barrier
 from layout import TileTensor
 from layout import row_major
@@ -419,14 +419,10 @@ struct Attention[
     var p_reg_buffer: Self.PRegisterBufferType
 
     var k_smem_ptr: UnsafePointer[
-        Scalar[Self.k_t.dtype],
-        MutUntrackedOrigin,
-        address_space=AddressSpace.SHARED,
+        Scalar[Self.k_t.dtype], MutUntrackedOrigin, address_space=.SHARED
     ]
     var v_smem_ptr: UnsafePointer[
-        Scalar[Self.v_t.dtype],
-        MutUntrackedOrigin,
-        address_space=AddressSpace.SHARED,
+        Scalar[Self.v_t.dtype], MutUntrackedOrigin, address_space=.SHARED
     ]
     # Dedicated warp-reduction scratch SMEM. Decoupling from K SMEM
     # avoids races between softmax's scratch ds_writes and other warps'
@@ -434,18 +430,14 @@ struct Attention[
     # `mla_kv_alias` mode (V reads from K's SMEM, so there's no later
     # V DMA to overwrite the corruption).
     var warp_scratch_ptr: UnsafePointer[
-        Scalar[Self.accum_type],
-        MutUntrackedOrigin,
-        address_space=AddressSpace.SHARED,
+        Scalar[Self.accum_type], MutUntrackedOrigin, address_space=.SHARED
     ]
 
     var q_buffer: Self.QRegisterBufferType
 
     @__allow_legacy_any_origin_fields
     var output_tile: TileTensor[
-        Self.output_type,
-        Self.OutputTileLayout,
-        MutAnyOrigin,
+        Self.output_type, Self.OutputTileLayout, MutAnyOrigin
     ]
 
     var batch_idx: Int
@@ -490,7 +482,7 @@ struct Attention[
         Self.accum_type,
         type_of(Self._warp_scratch_layout),
         MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
     ]
     comptime _warp_scratch_size = (2 * Int(Self.num_warps_n) * Int(Self.BM))
 
@@ -614,7 +606,7 @@ struct Attention[
         self.k_smem_ptr = unsafe_stack_allocation[
             Self._max_kv_smem_size if Self.amd_structured_config.shared_kv else Self._k_smem_size,
             Self.k_t.dtype,
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
             alignment=Self._smem_alignment,
         ]()
         self.v_smem_ptr = self.k_smem_ptr.bitcast[
@@ -622,18 +614,18 @@ struct Attention[
         ]() if Self.amd_structured_config.shared_kv else unsafe_stack_allocation[
             Self._v_smem_size,
             Self.v_t.dtype,
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
             alignment=Self._smem_alignment,
         ]()
 
         self.warp_scratch_ptr = unsafe_stack_allocation[
             Self._warp_scratch_size,
             Self.accum_type,
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
         ]()
 
         self.p_reg_buffer = Self.PRegisterBufferType(
-            tt_stack_allocation[Self.q_type, address_space=AddressSpace.SHARED](
+            tt_stack_allocation[Self.q_type, address_space=.SHARED](
                 Self.PRegisterBufferType._smem_layout
             )
         )
@@ -1118,7 +1110,7 @@ struct Attention[
                 output_cols_per_warp,
             ](m_mma, 0)
             var sub_reg = tt_stack_allocation[
-                Self.accum_type, address_space=AddressSpace.LOCAL
+                Self.accum_type, address_space=.LOCAL
             ](sub_layout)
             comptime for n_mma in range(Self.num_n_mmas_output):
                 comptime for k in range(Self.output_frag_size):

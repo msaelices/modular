@@ -32,9 +32,9 @@ from structured_kernels.smem_types import SMemArray
 from structured_kernels.tile_types import SMemTileArray2D
 from layout.swizzle import Swizzle, make_swizzle
 
-import std.gpu.primitives.warp as warp
+import max.gpu.primitives.warp as warp
 from max.algorithm.reduction import _reduce_generator
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     block_idx,
@@ -64,7 +64,7 @@ from layout import (
     Coord,
     Idx,
     TensorLayout,
-    TensorStorage,
+    TensorEngine,
     TileTensor,
     UNKNOWN_VALUE,
     row_major,
@@ -224,9 +224,9 @@ def gemv_kernel_vector[
     c_layout: TensorLayout,
     a_layout: TensorLayout,
     b_layout: TensorLayout,
-    c_storage: TensorStorage,
-    a_storage: TensorStorage,
-    b_storage: TensorStorage,
+    c_engine: TensorEngine,
+    a_engine: TensorEngine,
+    b_engine: TensorEngine,
     *,
     simd_width: Int,
     transpose_b: Bool = False,
@@ -235,9 +235,9 @@ def gemv_kernel_vector[
     check_bounds: Bool = True,
     pdl_level: PDLLevel = PDLLevel(),
 ](
-    c: TileTensor[c_type, c_layout, MutAnyOrigin, Storage=c_storage],  # m
-    a: TileTensor[a_type, a_layout, ImmutAnyOrigin, Storage=a_storage],  # m * k
-    b: TileTensor[b_type, b_layout, ImmutAnyOrigin, Storage=b_storage],  # 1 * k
+    c: TileTensor[c_type, c_layout, MutAnyOrigin, Engine=c_engine],  # m
+    a: TileTensor[a_type, a_layout, ImmutAnyOrigin, Engine=a_engine],  # m * k
+    b: TileTensor[b_type, b_layout, ImmutAnyOrigin, Engine=b_engine],  # 1 * k
     m: Int32,
     n: Int32,
     k: Int32,
@@ -328,9 +328,9 @@ def gemv_kernel_vector_multirow[
     c_layout: TensorLayout,
     a_layout: TensorLayout,
     b_layout: TensorLayout,
-    c_storage: TensorStorage,
-    a_storage: TensorStorage,
-    b_storage: TensorStorage,
+    c_engine: TensorEngine,
+    a_engine: TensorEngine,
+    b_engine: TensorEngine,
     *,
     simd_width: Int,
     rows_per_warp: Int,
@@ -340,9 +340,9 @@ def gemv_kernel_vector_multirow[
     check_bounds: Bool = True,
     pdl_level: PDLLevel = PDLLevel(),
 ](
-    c: TileTensor[c_type, c_layout, MutAnyOrigin, Storage=c_storage],  # m
-    a: TileTensor[a_type, a_layout, ImmutAnyOrigin, Storage=a_storage],  # m * k
-    b: TileTensor[b_type, b_layout, ImmutAnyOrigin, Storage=b_storage],  # 1 * k
+    c: TileTensor[c_type, c_layout, MutAnyOrigin, Engine=c_engine],  # m
+    a: TileTensor[a_type, a_layout, ImmutAnyOrigin, Engine=a_engine],  # m * k
+    b: TileTensor[b_type, b_layout, ImmutAnyOrigin, Engine=b_engine],  # 1 * k
     m: Int32,
     n: Int32,
     k: Int32,
@@ -452,26 +452,22 @@ def _dot_accum[
     comptime if (
         is_amd_gpu()
         and not _is_amd_mi250x()
-        and a_type == DType.bfloat16
-        and b_type == DType.bfloat16
-        and accum_type == DType.float32
+        and a_type == .bfloat16
+        and b_type == .bfloat16
+        and accum_type == .float32
     ):
         # v_dot2_f32_bf16: D.f32 = S0.bf16[0]*S1.bf16[0] + S0.bf16[1]*S1.bf16[1] + S2.f32
         comptime for p in range(width // 2):
-            var a_pair = rebind[SIMD[DType.bfloat16, 2]](
-                a.slice[2, offset=p * 2]()
-            )
-            var b_pair = rebind[SIMD[DType.bfloat16, 2]](
-                b.slice[2, offset=p * 2]()
-            )
+            var a_pair = rebind[SIMD[.bfloat16, 2]](a.slice[2, offset=p * 2]())
+            var b_pair = rebind[SIMD[.bfloat16, 2]](b.slice[2, offset=p * 2]())
             result = rebind[Scalar[accum_type]](
                 llvm_intrinsic[
                     "llvm.amdgcn.fdot2.f32.bf16",
-                    Scalar[DType.float32],
+                    Float32,
                 ](
                     a_pair,
                     b_pair,
-                    rebind[Scalar[DType.float32]](result),
+                    rebind[Float32](result),
                     False,
                 )
             )
@@ -507,9 +503,9 @@ def gemv_split_k[
     c_layout: TensorLayout,
     a_layout: TensorLayout,
     b_layout: TensorLayout,
-    c_storage: TensorStorage,
-    a_storage: TensorStorage,
-    b_storage: TensorStorage,
+    c_engine: TensorEngine,
+    a_engine: TensorEngine,
+    b_engine: TensorEngine,
     simd_width: Int,
     tile_m: Int,
     tile_n: Int,
@@ -522,9 +518,9 @@ def gemv_split_k[
     check_bounds_n: Bool = True,
     pdl_level: PDLLevel = PDLLevel(),
 ](
-    output: TileTensor[c_type, c_layout, MutAnyOrigin, Storage=c_storage],
-    act: TileTensor[a_type, a_layout, ImmutAnyOrigin, Storage=a_storage],
-    weight: TileTensor[b_type, b_layout, ImmutAnyOrigin, Storage=b_storage],
+    output: TileTensor[c_type, c_layout, MutAnyOrigin, Engine=c_engine],
+    act: TileTensor[a_type, a_layout, ImmutAnyOrigin, Engine=a_engine],
+    weight: TileTensor[b_type, b_layout, ImmutAnyOrigin, Engine=b_engine],
     m: Int32,
     n: Int32,
     k: Int32,
@@ -549,9 +545,9 @@ def gemv_split_k[
         c_layout: Layout descriptor for the output tensor.
         a_layout: Layout descriptor for the activation matrix.
         b_layout: Layout descriptor for the weight matrix.
-        c_storage: Storage kind for the output tensor.
-        a_storage: Storage kind for the activation matrix.
-        b_storage: Storage kind for the weight matrix.
+        c_engine: Engine of the output tensor.
+        a_engine: Engine of the activation matrix.
+        b_engine: Engine of the weight matrix.
         simd_width: Number of elements per vectorized load; sets
             `tile_k` with `num_threads`.
         tile_m: Number of output rows each thread accumulates.
@@ -599,14 +595,14 @@ def gemv_split_k[
     var tid = thread_idx.x
     var tile_w = tt_stack_allocation[
         dtype=b_type,
-        address_space=AddressSpace.LOCAL,
+        address_space=.LOCAL,
         alignment=simd_width * size_of[b_type](),
     ](row_major[tile_n, simd_width]())
     # these are the partial accumlations for each thread this a matrix of values
     # since each thread will process a tile_m x tile_n partials of the output vector
-    var acc = tt_stack_allocation[
-        dtype=accum_type, address_space=AddressSpace.LOCAL
-    ](row_major[tile_m, tile_n]()).fill(0)
+    var acc = tt_stack_allocation[dtype=accum_type, address_space=.LOCAL](
+        row_major[tile_m, tile_n]()
+    ).fill(0)
     var iteration = 0
     comptime WeightVecType = SIMD[b_type, simd_width]
 
@@ -685,9 +681,9 @@ def gemv_split_k[
     comptime k_warp_num = num_threads // WARP_SIZE
     var warp_id = warp_id()
     var lane_id = lane_id()
-    var shmem = tt_stack_allocation[
-        dtype=accum_type, address_space=AddressSpace.SHARED
-    ](row_major[1, tile_m * tile_n * k_warp_num]())
+    var shmem = tt_stack_allocation[dtype=accum_type, address_space=.SHARED](
+        row_major[1, tile_m * tile_n * k_warp_num]()
+    )
 
     # Each warp sums across its threads and stages results in shared memory.
     # Shared memory data is row mojor (num_warps, tile_m, tile_n) stored in 1D.
@@ -761,13 +757,13 @@ def router_gate_mixed_gemv[
     c_layout: TensorLayout,
     a_layout: TensorLayout,
     b_layout: TensorLayout,
-    c_storage: TensorStorage,
-    a_storage: TensorStorage,
-    b_storage: TensorStorage,
+    c_engine: TensorEngine,
+    a_engine: TensorEngine,
+    b_engine: TensorEngine,
 ](
-    c: TileTensor[DType.float32, c_layout, MutAnyOrigin, Storage=c_storage],
-    a: TileTensor[DType.bfloat16, a_layout, ImmutAnyOrigin, Storage=a_storage],
-    b: TileTensor[DType.float32, b_layout, ImmutAnyOrigin, Storage=b_storage],
+    c: TileTensor[.float32, c_layout, MutAnyOrigin, Engine=c_engine],
+    a: TileTensor[.bfloat16, a_layout, ImmutAnyOrigin, Engine=a_engine],
+    b: TileTensor[.float32, b_layout, ImmutAnyOrigin, Engine=b_engine],
     m: Int,
     n: Int,
     k: Int,
@@ -797,9 +793,9 @@ def router_gate_mixed_gemv[
         c_layout: Layout of the fp32 output tensor.
         a_layout: Layout of the bf16 activation tensor.
         b_layout: Layout of the fp32 weight tensor.
-        c_storage: Storage of the fp32 output tensor.
-        a_storage: Storage of the bf16 activation tensor.
-        b_storage: Storage of the fp32 weight tensor.
+        c_engine: Engine of the fp32 output tensor.
+        a_engine: Engine of the bf16 activation tensor.
+        b_engine: Engine of the fp32 weight tensor.
 
     Args:
         c: Output `[M, N]` fp32 tensor.
@@ -831,9 +827,9 @@ def router_gate_mixed_gemv[
             c_layout,
             a_layout,
             b_layout,
-            c_storage,
-            a_storage,
-            b_storage,
+            c_engine,
+            a_engine,
+            b_engine,
             simd_width=simd_width,
             tile_m=tile_m,
             tile_n=tile_n,
@@ -894,7 +890,7 @@ def gevm_kernel[
     var x_shared = unsafe_stack_allocation[
         tile_size,
         accum_type,
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
     ]()
 
     comptime if pdl_level > PDLLevel.OFF:
@@ -1022,7 +1018,7 @@ def _nvidia_gemv_config[
     # weight, so tile_n=1 maximizes the launched CTA count (one output column
     # per block); 256 threads/block and unroll=2 are the swept winner, while
     # tile_n>=2 and 128T regress. (KERN-3076.)
-    comptime if a_type == DType.float32:
+    comptime if a_type == .float32:
         return IndexList[3](256, 1, 2)
 
     var num_threads: Int
@@ -1115,9 +1111,9 @@ def is_minimax_router_gemm[
 ]() -> Bool:
     """Returns whether a GEMM has the MiniMax-M3 fp32 router signature."""
     return (
-        a_type == DType.float32
-        and b_type == DType.float32
-        and c_type == DType.float32
+        a_type == .float32
+        and b_type == .float32
+        and c_type == .float32
         and static_N == 128
         and static_K == 6144
     )
@@ -1190,9 +1186,9 @@ def gemv_gpu_dispatch[
                 type_of(c).LayoutType,
                 type_of(a).LayoutType,
                 type_of(b).LayoutType,
-                type_of(c).Storage,
-                type_of(a).Storage,
-                type_of(b).Storage,
+                type_of(c).Engine,
+                type_of(a).Engine,
+                type_of(b).Engine,
                 simd_width=simd_width,
                 tile_m=tile_m,
                 tile_n=tile_n,
@@ -1268,9 +1264,9 @@ def gemv_gpu_dispatch[
                     type_of(c).LayoutType,
                     type_of(a).LayoutType,
                     type_of(b).LayoutType,
-                    type_of(c).Storage,
-                    type_of(a).Storage,
-                    type_of(b).Storage,
+                    type_of(c).Engine,
+                    type_of(a).Engine,
+                    type_of(b).Engine,
                     simd_width=simd_width,
                     transpose_b=False,
                     elementwise_lambda_fn=elementwise_lambda_fn,
@@ -1295,9 +1291,7 @@ def gemv_gpu_dispatch[
                     unsafe_from_address=Int(b.ptr)
                 )
                 var b_tile_n_major = TileTensor[
-                    b_type,
-                    type_of(b_n_major_layout),
-                    b.origin,
+                    b_type, type_of(b_n_major_layout), b.origin
                 ](b_ptr, b_n_major_layout)
 
                 comptime kernel = gemv_kernel_vector[
@@ -1307,9 +1301,9 @@ def gemv_gpu_dispatch[
                     type_of(c).LayoutType,
                     type_of(a).LayoutType,
                     type_of(b_tile_n_major).LayoutType,
-                    type_of(c).Storage,
-                    type_of(a).Storage,
-                    type_of(b_tile_n_major).Storage,
+                    type_of(c).Engine,
+                    type_of(a).Engine,
+                    type_of(b_tile_n_major).Engine,
                     simd_width=simd_width,
                     transpose_b=transpose_b,
                     elementwise_lambda_fn=elementwise_lambda_fn,
@@ -1338,9 +1332,9 @@ def gemv_gpu_dispatch[
                     type_of(c).LayoutType,
                     type_of(b).LayoutType,
                     type_of(a).LayoutType,
-                    type_of(c).Storage,
-                    type_of(b).Storage,
-                    type_of(a).Storage,
+                    type_of(c).Engine,
+                    type_of(b).Engine,
+                    type_of(a).Engine,
                     simd_width=simd_width,
                     transpose_b=transpose_b,
                     elementwise_lambda_fn=elementwise_lambda_fn,
@@ -1373,9 +1367,9 @@ def gemv_gpu_dispatch[
                     type_of(c).LayoutType,
                     type_of(b).LayoutType,
                     type_of(a).LayoutType,
-                    type_of(c).Storage,
-                    type_of(b).Storage,
-                    type_of(a).Storage,
+                    type_of(c).Engine,
+                    type_of(b).Engine,
+                    type_of(a).Engine,
                     simd_width=simd_width,
                     rows_per_warp=rows,
                     transpose_b=transpose_b,
@@ -1509,9 +1503,9 @@ def gemv_gpu_dispatch[
             BLOCK_DIM,
             transpose_b,
             elementwise_lambda_fn=elementwise_lambda_fn,
-            c_storage=type_of(c).Storage,
-            a_storage=type_of(a).Storage,
-            b_storage=type_of(b).Storage,
+            c_engine=type_of(c).Engine,
+            a_engine=type_of(a).Engine,
+            b_engine=type_of(b).Engine,
         ]
         ctx.enqueue_function[kernel](
             c,
@@ -1611,7 +1605,7 @@ def gemv_gpu[
     var kernel_func: GEMVAlgorithm
 
     if n == 1:
-        comptime if a_type == DType.bfloat16:
+        comptime if a_type == .bfloat16:
             if k % simd_width == 0:
                 kernel_func = GEMVAlgorithm.GEMV_KERNEL_VECTOR
             else:
@@ -1865,9 +1859,7 @@ struct _MmaCpAsyncGmemLoaderA[
                     1 + next_stage * 2
                 ][].try_wait(next_phase)
 
-            var gmem_base = self.act.ptr.address_space_cast[
-                AddressSpace.GLOBAL
-            ]()
+            var gmem_base = self.act.ptr.address_space_cast[.GLOBAL]()
             var smem_tile_ptr = self.smem_a[self.stage].ptr
             comptime for v in range(Self.vec_per_iter):
                 var linear = (
@@ -2007,9 +1999,7 @@ struct _MmaCpAsyncGmemLoaderB[
                     1 + next_stage * 2
                 ][].try_wait(next_phase)
 
-            var gmem_base = self.weight.ptr.address_space_cast[
-                AddressSpace.GLOBAL
-            ]()
+            var gmem_base = self.weight.ptr.address_space_cast[.GLOBAL]()
             var smem_tile_ptr = self.smem_b[self.stage].ptr
             comptime for v in range(Self.vec_per_iter):
                 var linear = (
@@ -2238,17 +2228,17 @@ struct _MmaCpAsyncSmem[
     ]
     comptime Barriers = SMemArray[SharedMemBarrier, Self.stage_cnt * 2]
 
-    var a_storage: Array[Scalar[Self.a_type], Self.SmemA.num_elements]
-    var b_storage: Array[Scalar[Self.a_type], Self.SmemB.num_elements]
+    var a_engine: Array[Scalar[Self.a_type], Self.SmemA.num_elements]
+    var b_engine: Array[Scalar[Self.a_type], Self.SmemB.num_elements]
     var barrier_storage: Self.Barriers.Storage
 
     @always_inline
     def a_tiles(ref[AddressSpace.SHARED] self) -> Self.SmemA:
-        return Self.SmemA(self.a_storage.unsafe_ptr())
+        return Self.SmemA(self.a_engine.unsafe_ptr())
 
     @always_inline
     def b_tiles(ref[AddressSpace.SHARED] self) -> Self.SmemB:
-        return Self.SmemB(self.b_storage.unsafe_ptr())
+        return Self.SmemB(self.b_engine.unsafe_ptr())
 
     @always_inline
     def barriers(ref[AddressSpace.SHARED] self) -> Self.Barriers:
@@ -2273,7 +2263,7 @@ def gemm_mma_cpasync_kernel[
     tile_n: Int = 8,
     tile_k: Int = 128,
     stage_cnt: Int = 2,
-    accum_type: DType = DType.float32,
+    accum_type: DType = .float32,
     elementwise_lambda_fn: Optional[elementwise_epilogue_type] = None,
     pdl_level: PDLLevel = PDLLevel(),
     swapAB: Bool = False,
@@ -2326,8 +2316,8 @@ def gemm_mma_cpasync_kernel[
         a_type, tile_m, tile_n, tile_k, stage_cnt
     ]
     ref smem = external_memory[
-        Scalar[DType.uint8],
-        address_space=AddressSpace.SHARED,
+        UInt8,
+        address_space=.SHARED,
         alignment=128,
     ]().bitcast[SmemType]()[]
     var smem_a = smem.a_tiles()
@@ -2476,7 +2466,7 @@ def gemm_mma_cpasync[
     comptime b_type = weight.dtype
 
     comptime assert a_type == b_type, "a_type and b_type must be the same"
-    comptime assert a_type == DType.bfloat16, "a_type/b_type must be bfloat16"
+    comptime assert a_type == .bfloat16, "a_type/b_type must be bfloat16"
     # Output may be bfloat16 (production) or float32 (accuracy verification): the
     # kernel always accumulates in f32 and only casts to c_type on store, so an
     # f32 output simply skips the final bf16 rounding.

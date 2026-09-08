@@ -37,7 +37,7 @@ Ring Buffer Configuration:
 - The trait-based design allows easy experimentation with different sync strategies
 """
 from std.sys import simd_width_of
-from std.gpu import (
+from max.gpu import (
     WARP_SIZE,
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
@@ -46,7 +46,7 @@ from std.gpu import (
 )
 from max.gpu.sync import barrier
 from max.gpu.host import DeviceContext
-from std.gpu.intrinsics import inlined_assembly
+from max.gpu.intrinsics import inlined_assembly
 from layout import Layout, LayoutTensor, TileTensor
 from layout.layout import blocked_product
 from layout.layout_tensor import ThreadScope, copy_local_to_shared
@@ -61,7 +61,7 @@ from .structured import AmdTileOperator, ThreadRole
 
 # Type aliases for cleaner code
 comptime GlobalTensor[dtype: DType, layout: Layout] = LayoutTensor[
-    dtype, layout, MutAnyOrigin, address_space=AddressSpace.GLOBAL
+    dtype, layout, MutAnyOrigin, address_space=.GLOBAL
 ]
 
 
@@ -349,7 +349,7 @@ def run_producer[
         dtype,
         Layout.row_major(elements_loaded_per_thread // simd_width, simd_width),
         MutAnyOrigin,
-        address_space=AddressSpace.LOCAL,
+        address_space=.LOCAL,
     ].stack_allocation()
     var reg_tile_frag = reg_frag.vectorize[1, simd_width]()
 
@@ -424,17 +424,13 @@ def warp_specialized_matmul_kernel[
     consumer_warps: Int,
     pipeline_stages: Int,
 ](
-    a: LayoutTensor[
-        in_type, a_layout, MutAnyOrigin, address_space=AddressSpace.GLOBAL
-    ],
-    b: LayoutTensor[
-        in_type, b_layout, MutAnyOrigin, address_space=AddressSpace.GLOBAL
-    ],
+    a: LayoutTensor[in_type, a_layout, MutAnyOrigin, address_space=.GLOBAL],
+    b: LayoutTensor[in_type, b_layout, MutAnyOrigin, address_space=.GLOBAL],
     c: LayoutTensor[
         out_type,
         c_layout,
         MutAnyOrigin,
-        address_space=AddressSpace.GLOBAL,
+        address_space=.GLOBAL,
     ],
 ):
     """Runs the warp-specialized matrix multiplication kernel on an AMD GPU.
@@ -699,9 +695,9 @@ def warp_specialized_matmul[
     consumer_warps: Int,
     pipeline_stages: Int = 1,
 ](
-    a_tt: TileTensor[DType.bfloat16, ...],
-    b_tt: TileTensor[DType.bfloat16, ...],
-    c_tt: TileTensor[DType.float32, ...],
+    a_tt: TileTensor[.bfloat16, ...],
+    b_tt: TileTensor[.bfloat16, ...],
+    c_tt: TileTensor[.float32, ...],
     ctx: DeviceContext,
 ) raises:
     """Enqueues the warp-specialized matrix multiplication kernel onto the device.
@@ -755,15 +751,9 @@ def warp_specialized_matmul[
         pipeline_stages=pipeline_stages,
     ]
 
-    var global_c_device_tensor = c_device_tensor.address_space_cast[
-        AddressSpace.GLOBAL
-    ]()
-    var global_a_device_tensor = a_device_tensor.address_space_cast[
-        AddressSpace.GLOBAL
-    ]()
-    var global_b_device_tensor = b_device_tensor.address_space_cast[
-        AddressSpace.GLOBAL
-    ]()
+    var global_c_device_tensor = c_device_tensor.address_space_cast[.GLOBAL]()
+    var global_a_device_tensor = a_device_tensor.address_space_cast[.GLOBAL]()
+    var global_b_device_tensor = b_device_tensor.address_space_cast[.GLOBAL]()
 
     ctx.enqueue_function[kernel](
         global_a_device_tensor,
