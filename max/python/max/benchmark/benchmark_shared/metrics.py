@@ -42,6 +42,15 @@ from max.benchmark.benchmark_shared.percentile_metrics import (
     compute_confidence_info,
 )
 from max.benchmark.benchmark_shared.request import ServerTokenStats
+from max.benchmark.benchmark_shared.result_groups import (
+    BenchmarkResultGroups,
+    CacheStatsGroup,
+    DiagnosticsGroup,
+    GpuStatsGroup,
+    LatencyStatsGroup,
+    SummaryGroup,
+    ThroughputStatsGroup,
+)
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
@@ -49,6 +58,7 @@ __all__ = [
     "ConfidenceLevel",
     "Metrics",
     "PercentileMetrics",
+    "build_result_groups",
 ]
 
 if TYPE_CHECKING:
@@ -404,6 +414,67 @@ class BaseBenchmarkMetrics(BaseModel, Metrics):
         return len(errors) == 0, errors
 
 
+class RequestRecord(BaseModel):
+    """One request's own outcome, keyed by its dispatch index.
+
+    The aggregates carry several per-request arrays (``input_lens``,
+    ``output_lens``, ``ttfts``, ``request_submit_times``, …), but they are
+    *not* mutually aligned: ``output_lens`` lists failures before
+    successes while ``input_lens`` follows dispatch order, so
+    ``input_lens[i]`` and ``output_lens[i]`` can describe different
+    requests. Nothing can join them back together, which makes them
+    unusable for any analysis that needs a request as a unit — comparing
+    one run's request against another run's same request, above all.
+
+    A record is that unit. ``index`` is the request's position in dispatch
+    order, stable across runs of the same workload and seed, so two runs
+    pair on it. Every request gets exactly one record, including failures
+    and cancellations, because "this request failed here and succeeded
+    there" is itself the finding.
+
+    ``generated_text`` is opt-in (``--record-request-text``): it is the
+    only unbounded field here, and a long-context run would multiply the
+    result file by the size of its own output. Correctness comparison
+    across runs needs it; a latency dashboard does not.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    index: int
+    """Position in dispatch order; the identity two runs pair on."""
+
+    prompt_len: int
+    output_len: int
+    """Generated token count. 0 for a request that failed or was cancelled,
+    which is the count it produced, not a missing value."""
+
+    success: bool
+    cancelled: bool
+    measured: bool
+    """Whether this request is inside the window the aggregates were
+    computed over. A request can succeed and still be excluded by the
+    skip-first/skip-last trim or by steady-state detection, and a reader
+    comparing a record against a percentile needs to know which."""
+
+    error: str = ""
+    ttft_ms: float | None = None
+    tpot_ms: float | None = None
+    """Mean time per output token; None below two generated tokens, where
+    it is undefined rather than zero."""
+
+    latency_ms: float | None = None
+    submit_time: float | None = None
+    complete_time: float | None = None
+    """Run-relative ``perf_counter`` stamps, as the aggregates use."""
+
+    session_id: str | None = None
+    turn_index: int | None = None
+    """Multi-turn provenance; None for single-turn workloads."""
+
+    generated_text: str | None = None
+    """None unless ``--record-request-text`` was set."""
+
+
 # Workload-specific aggregates. ``BenchmarkResult`` (below) holds at
 # most one per record, selected by ``task_type``; failed runs leave both
 # ``None``. Composing them as nested pydantic objects (rather than
@@ -573,6 +644,13 @@ class TextGenAggregates(_CompletedRunBase):
     input_lens: list[int] = Field(default_factory=list)
     output_lens: list[int] = Field(default_factory=list)
     ttfts: list[float] = Field(default_factory=list)
+    # One record per request in dispatch order, the joinable form of the
+    # arrays above. ``csv_mode=opaque`` keeps type-driven CSV from
+    # exploding it into a column per request.
+    request_records: list[RequestRecord] = Field(
+        default_factory=list,
+        json_schema_extra={"csv_mode": "opaque"},
+    )
     # Empty when the server did not report per-request cached_tokens.
     per_turn_cached_token_rates: list[float] = Field(default_factory=list)
     # Per-turn cache retention fractions (one per checked turn, N>=2). Empty
@@ -607,6 +685,7 @@ class TextGenAggregates(_CompletedRunBase):
         d["input_lens"] = self.input_lens
         d["output_lens"] = self.output_lens
         d["ttfts"] = self.ttfts
+        d["request_records"] = [r.model_dump() for r in self.request_records]
         d["per_turn_cached_token_rates"] = self.per_turn_cached_token_rates
         d["per_turn_cache_retentions"] = self.per_turn_cache_retentions
         d["global_cached_token_rate"] = self.global_cached_token_rate
@@ -804,6 +883,17 @@ class BenchmarkResult(BaseModel):
     # (bounded by the request count). See build_text_generation_result.
     num_outliers_rejected: int | None = None
 
+    # Namespaced presentation groups (summary / gpu / latency / …). Part of
+    # the stored result — console, local JSON, and BigQuery all serialize
+    # this field directly. Auto-filled when omitted so constructors and
+    # historical blobs without the key still validate. ``csv_mode=opaque``
+    # keeps type-driven CSV from expanding groups into duplicate columns
+    # alongside ``text_data`` / ``pixel_data``.
+    result_groups: BenchmarkResultGroups | None = Field(
+        default=None,
+        json_schema_extra={"csv_mode": "opaque"},
+    )
+
     @model_validator(mode="after")
     def _check_data_matches_task_type(self) -> BenchmarkResult:
         if self.text_data is not None and self.task_type != "text":
@@ -886,6 +976,15 @@ class BenchmarkResult(BaseModel):
                 input_tokens=input_tokens_tg,
                 prompt_throughput_tokens_per_second=prompt_throughput_tokens_per_second_tg,
             )
+        return self
+
+    @model_validator(mode="after")
+    def _ensure_result_groups(self) -> BenchmarkResult:
+        """Populate ``result_groups`` once when the caller omitted them."""
+        if self.result_groups is None:
+            # Assign in place: returning ``model_copy`` from an ``after``
+            # validator is ignored for ``__init__`` construction in pydantic.
+            self.result_groups = build_result_groups(self)
         return self
 
     @property
@@ -1012,6 +1111,10 @@ class BenchmarkResult(BaseModel):
             d["aggregate_server_stats"] = [
                 dataclasses.asdict(s) for s in self.aggregate_server_stats
             ]
+        # Namespaced presentation view — same object BigQuery embeds via
+        # ``model_dump_json`` and the local ``--result-filename`` JSON carries.
+        if self.result_groups is not None:
+            d["result_groups"] = self.result_groups.model_dump(mode="json")
         return d
 
     def validate_metrics(self) -> tuple[bool, list[str]]:
@@ -1035,6 +1138,114 @@ class BenchmarkResult(BaseModel):
         if agg is None:
             return []
         return agg.confidence_warnings()
+
+
+def build_result_groups(result: BenchmarkResult) -> BenchmarkResultGroups:
+    """Builds the namespaced groups for a :class:`BenchmarkResult`.
+
+    Used by ``BenchmarkResult``'s model validator when ``result_groups`` is
+    omitted. Pure projection: reads whichever of ``text_data`` /
+    ``pixel_data`` is populated and reshapes already-present fields into
+    named groups. Adds no new data. Schema types live in the lightweight
+    ``:result_groups`` target; the factory stays here beside the concrete
+    result type.
+    """
+    text_data = result.text_data
+    pixel_data = result.pixel_data
+    agg = text_data or pixel_data
+
+    summary = SummaryGroup(
+        task_type=result.task_type,
+        max_concurrency=result.max_concurrency,
+        duration=agg.duration if agg else None,
+        completed=agg.completed if agg else None,
+        failures=agg.failures if agg else None,
+        request_throughput=agg.request_throughput if agg else None,
+        aggregate_tokens_per_minute=(
+            text_data.aggregate_tokens_per_minute if text_data else None
+        ),
+        mean_ttft_ms=(
+            text_data.ttft_ms.mean if text_data and text_data.ttft_ms else None
+        ),
+        mean_tpot_ms=(
+            text_data.tpot_ms.mean if text_data and text_data.tpot_ms else None
+        ),
+        mean_itl_ms=(
+            text_data.itl_ms.mean if text_data and text_data.itl_ms else None
+        ),
+        total_generated_outputs=(
+            pixel_data.total_generated_outputs if pixel_data else None
+        ),
+    )
+
+    gpu_stats = (
+        GpuStatsGroup(
+            peak_gpu_memory_mib=result.peak_gpu_memory_mib,
+            available_gpu_memory_mib=result.available_gpu_memory_mib,
+            gpu_utilization=result.gpu_utilization,
+        )
+        if (
+            result.peak_gpu_memory_mib
+            or result.available_gpu_memory_mib
+            or result.gpu_utilization
+        )
+        else None
+    )
+
+    latency_stats: LatencyStatsGroup | None = None
+    throughput_stats: ThroughputStatsGroup | None = None
+    cache_stats: CacheStatsGroup | None = None
+    if text_data is not None:
+        latency_stats = LatencyStatsGroup(
+            latency_ms=text_data.latency_ms,
+            ttft_ms=text_data.ttft_ms,
+            tpot_ms=text_data.tpot_ms,
+            itl_ms=text_data.itl_ms,
+            step_tpot_ms=text_data.step_tpot_ms,
+        )
+        throughput_stats = ThroughputStatsGroup(
+            input_throughput=text_data.input_throughput,
+            output_throughput=text_data.output_throughput,
+        )
+        cache_stats = CacheStatsGroup(
+            global_cached_token_rate=text_data.global_cached_token_rate,
+            per_turn_cached_token_rate=text_data.per_turn_cached_token_rate,
+            per_turn_cache_retention=text_data.per_turn_cache_retention,
+        )
+    elif pixel_data is not None:
+        latency_stats = LatencyStatsGroup(latency_ms=pixel_data.latency_ms)
+
+    # ``agg.errors`` is one entry per request (empty string on success);
+    # keep only real messages, matching the dashboard aggregates mirror.
+    real_errors = [e for e in (agg.errors if agg else []) if e]
+    diagnostics: DiagnosticsGroup | None = None
+    if (
+        result.server_startup_time is not None
+        or result.steady_state_detected is not None
+        or result.steady_state_window_count is not None
+        or result.steady_state_mode is not None
+        or result.steady_state_warning is not None
+        or result.num_outliers_rejected is not None
+        or real_errors
+    ):
+        diagnostics = DiagnosticsGroup(
+            server_startup_time=result.server_startup_time,
+            steady_state_detected=result.steady_state_detected,
+            steady_state_window_count=result.steady_state_window_count,
+            steady_state_mode=result.steady_state_mode,
+            steady_state_warning=result.steady_state_warning,
+            num_outliers_rejected=result.num_outliers_rejected,
+            errors=real_errors,
+        )
+
+    return BenchmarkResultGroups(
+        summary=summary,
+        gpu_stats=gpu_stats,
+        latency_stats=latency_stats,
+        throughput_stats=throughput_stats,
+        cache_stats=cache_stats,
+        diagnostics=diagnostics,
+    )
 
 
 # ---------------------------------------------------------------------------

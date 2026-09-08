@@ -6,7 +6,7 @@ READMEs for usage instructions.
 
 ## Mojo code examples
 
-We moved the Mojo examples to [/mojo/examples](../../mojo/examples/)
+We moved the Mojo examples to [/Mojo/examples](../../Mojo/examples/)
 
 ## [Modules](modules/)
 
@@ -62,6 +62,12 @@ layouts](https://max.modular.com/layout/layouts/).
 Using the `LayoutTensor` type to manipulate multidimensional data on both CPU
 and GPU, accompanying [Using
 LayoutTensor](https://max.modular.com/layout/tensors/).
+
+## [Music generation](music_generation/)
+
+Rendering a full-length song from a caption and lyrics with MiniMax-Music3,
+either in process or through a running MAX server, and measuring the joins
+between the model's denoising windows.
 
 ---
 

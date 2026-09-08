@@ -15,7 +15,7 @@ from std.math import cosh, exp, exp2, log, sinh
 from std.sys import simd_width_of
 
 from max.algorithm.functional import elementwise
-from std.gpu import *
+from max.gpu import *
 from max.gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
 from std.testing import assert_almost_equal, assert_equal, TestSuite
 
@@ -110,18 +110,18 @@ def _test_sinh[
 
 def test_math_accuracy() raises:
     with DeviceContext() as ctx:
-        _test_exp[DType.float32](ctx)
-        _test_exp[DType.float16](ctx)
-        _test_exp[DType.bfloat16](ctx)
-        _test_exp2[DType.float32](ctx)
-        _test_exp2[DType.float16](ctx)
-        _test_exp2[DType.bfloat16](ctx)
-        _test_cosh[DType.float32](ctx)
-        _test_cosh[DType.float16](ctx)
-        _test_cosh[DType.bfloat16](ctx)
-        _test_sinh[DType.float32](ctx)
-        _test_sinh[DType.float16](ctx)
-        _test_sinh[DType.bfloat16](ctx)
+        _test_exp[.float32](ctx)
+        _test_exp[.float16](ctx)
+        _test_exp[.bfloat16](ctx)
+        _test_exp2[.float32](ctx)
+        _test_exp2[.float16](ctx)
+        _test_exp2[.bfloat16](ctx)
+        _test_cosh[.float32](ctx)
+        _test_cosh[.float16](ctx)
+        _test_cosh[.bfloat16](ctx)
+        _test_sinh[.float32](ctx)
+        _test_sinh[.float16](ctx)
+        _test_sinh[.bfloat16](ctx)
 
 
 def main() raises:

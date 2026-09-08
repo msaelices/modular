@@ -41,7 +41,7 @@ Layout reference (canonical):
         : `preShuffleWeight` (B 5D) and `preShuffleScale` (scale 4D).
 """
 
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_dim,
     block_idx,
@@ -55,7 +55,8 @@ from std.math import align_up, ceildiv
 from std.math.uutils import udivmod, uceildiv
 from std.memory import bitcast
 
-from layout import Coord, Idx, TileTensor, row_major
+from layout import Coord, Idx, TensorEngine, TileTensor, row_major
+
 from layout.tile_layout import Layout, TensorLayout, col_major
 from layout.tile_tensor import stack_allocation
 
@@ -332,12 +333,12 @@ struct Shuffler[E: Int]:
     # ---- Wrapped TileTensor types — what the preshuffle functions return ----
     comptime BTileTensor[N: Int, K_BYTES: Int] = TileTensor[
         mut=True,
-        DType.uint8,
+        .uint8,
         type_of(Self.b_5d_grouped_layout[N=N, K_BYTES=K_BYTES]),
         MutAnyOrigin,
     ]
 
-    # Scale-buffer callers use a plain `TileTensor[DType.uint8, ...]` or a
+    # Scale-buffer callers use a plain `TileTensor[.uint8, ...]` or a
     # raw `HostBuffer[DType.uint8]` — the byte layout is fully expressed by
     # `scale_4d_byte_off`, no type-system marker needed.
 
@@ -376,9 +377,11 @@ struct Shuffler[E: Int]:
         K_BYTES: Int,
         RawLayout: TensorLayout,
         DstLayout: TensorLayout,
+        RawEngine: TensorEngine,
+        DstEngine: TensorEngine,
     ](
-        raw: TileTensor[DType.uint8, RawLayout, ImmutAnyOrigin],
-        dst: TileTensor[DType.uint8, DstLayout, MutAnyOrigin],
+        raw: TileTensor[.uint8, RawLayout, ImmutAnyOrigin, Engine=RawEngine],
+        dst: TileTensor[.uint8, DstLayout, MutAnyOrigin, Engine=DstEngine],
     ):
         """LDS-staged per-tile B 5D preshuffle on AMD GPU.
 
@@ -431,7 +434,7 @@ struct Shuffler[E: Int]:
         ).vectorize[1, 1, Self.MFMA_LANE_BYTES]()
 
         # LDS staging: 16 NLane × 4 KLane atoms in their literal slot.
-        var smem = stack_allocation[DType.uint8, AddressSpace.SHARED](
+        var smem = stack_allocation[DType.uint8, address_space=.SHARED](
             row_major[Self.MFMA_MN_LANES, Self.MFMA_K_BYTES]()
         )
         var smem_atoms = smem.vectorize[1, Self.MFMA_LANE_BYTES]()
@@ -475,8 +478,8 @@ struct Shuffler[E: Int]:
         K_BYTES: Int,
         lane_bytes: Int,
     ](
-        raw: UnsafePointer[Scalar[DType.uint8], ImmutAnyOrigin],
-        dst: UnsafePointer[Scalar[DType.uint8], MutAnyOrigin],
+        raw: UnsafePointer[UInt8, ImmutAnyOrigin],
+        dst: UnsafePointer[UInt8, MutAnyOrigin],
         num_frags: Int32,
     ):
         """Scatters each lane fragment into its planes.
@@ -520,12 +523,8 @@ struct Shuffler[E: Int]:
         K_BYTES: Int,
         lane_bytes: Int,
     ](
-        raw: TileTensor[
-            mut=False, DType.uint8, address_space=AddressSpace.GENERIC, ...
-        ],
-        dst: TileTensor[
-            mut=True, DType.uint8, address_space=AddressSpace.GENERIC, ...
-        ],
+        raw: TileTensor[mut=False, .uint8, address_space=.GENERIC, ...],
+        dst: TileTensor[mut=True, .uint8, address_space=.GENERIC, ...],
         ctx: DeviceContext,
     ) raises:
         """Launches the plane-split B preshuffle.
@@ -569,12 +568,8 @@ struct Shuffler[E: Int]:
         N: Int,
         K_BYTES: Int,
     ](
-        raw: TileTensor[
-            mut=False, DType.uint8, address_space=AddressSpace.GENERIC, ...
-        ],
-        dst: TileTensor[
-            mut=True, DType.uint8, address_space=AddressSpace.GENERIC, ...
-        ],
+        raw: TileTensor[mut=False, .uint8, address_space=.GENERIC, ...],
+        dst: TileTensor[mut=True, .uint8, address_space=.GENERIC, ...],
         ctx: DeviceContext,
     ) raises:
         """Launch the GPU MXFP4 B 5D preshuffle.
@@ -609,6 +604,8 @@ struct Shuffler[E: Int]:
             K_BYTES,
             type_of(raw_any).LayoutType,
             type_of(dst_any).LayoutType,
+            type_of(raw_any).Engine,
+            type_of(dst_any).Engine,
         ]
         ctx.enqueue_function[kernel](
             raw_any,
@@ -628,9 +625,10 @@ struct Shuffler[E: Int]:
         MN: Int,
         K_SCALES: Int,
         SrcLayout: TensorLayout,
+        SrcEngine: TensorEngine,
     ](
-        src: TileTensor[DType.uint8, SrcLayout, MutAnyOrigin],
-        mut dst: HostBuffer[DType.uint8],
+        src: TileTensor[.uint8, SrcLayout, MutAnyOrigin, Engine=SrcEngine],
+        mut dst: HostBuffer[.uint8],
     ):
         # shuffles the scale layout on CPU, and pads the layout
         # to align the scales with the atom
@@ -638,6 +636,11 @@ struct Shuffler[E: Int]:
         comptime assert (
             K_SCALES % Self.S_K_BLOCK == 0
         ), "preshuffle_scale_4d: K_SCALES must be a multiple of 8"
+        comptime assert SrcEngine.element_size == 1, (
+            "preshuffle_scale_4d: requires a scalar engine"
+            " (DefaultEngine / PointerStorage); vectorized engines are not"
+            " supported."
+        )
 
         comptime MN_padded = Self.scale_padded_mn(MN)
         comptime group_bytes = MN_padded * K_SCALES
@@ -649,7 +652,12 @@ struct Shuffler[E: Int]:
                     var byte_off = e_off + Self.scale_4d_byte_off[
                         K_SCALES=K_SCALES
                     ](mn, k_scale)
-                    dst[byte_off] = src[Coord(e, mn, k_scale)]
+                    # ElementType is `SIMD[.uint8, SrcEngine.element_size]`,
+                    # but only scalar engines are accepted (asserted above),
+                    # so a width-1 load yields a `UInt8` scalar.
+                    dst[byte_off] = UInt8(
+                        src.load[width=1](Coord(e, mn, k_scale))
+                    )
 
             for mn in range(MN, MN_padded):
                 for k_scale in range(K_SCALES):
@@ -682,10 +690,22 @@ struct Shuffler[E: Int]:
         SrcLayout: TensorLayout,
         DstLayout: TensorLayout,
         AOffsetsLayout: TensorLayout,
+        SrcEngine: TensorEngine,
+        DstEngine: TensorEngine,
+        AOffsetsEngine: TensorEngine,
     ](
-        sfa_raw: TileTensor[DType.uint8, SrcLayout, ImmutAnyOrigin],
-        sfa_pre: TileTensor[mut=True, DType.uint8, DstLayout, MutAnyOrigin],
-        a_offsets: TileTensor[DType.uint32, AOffsetsLayout, ImmutAnyOrigin],
+        sfa_raw: TileTensor[
+            .uint8, SrcLayout, ImmutAnyOrigin, Engine=SrcEngine
+        ],
+        sfa_pre: TileTensor[
+            mut=True, .uint8, DstLayout, MutAnyOrigin, Engine=DstEngine
+        ],
+        a_offsets: TileTensor[
+            .uint32,
+            AOffsetsLayout,
+            ImmutAnyOrigin,
+            Engine=AOffsetsEngine,
+        ],
         num_active_experts: Int32,
         max_padded_M: Int32,
         total_wg: Int32,
@@ -723,9 +743,10 @@ struct Shuffler[E: Int]:
         var current_tile = 0
 
         for expert_slot in range(_num_active_experts):
-            var token_start = Int(a_offsets[Coord(expert_slot)])
+            var token_start = Int(a_offsets.load[width=1](Coord(expert_slot)))
             var num_tokens = (
-                Int(a_offsets[Coord(expert_slot + 1)]) - token_start
+                Int(a_offsets.load[width=1](Coord(expert_slot + 1)))
+                - token_start
             )
 
             # Empty slot — contributes zero tiles to the global counter,
@@ -763,7 +784,7 @@ struct Shuffler[E: Int]:
                 # OOB rows past num_tokens stay zero in the cell (= the
                 # last partial m_block's pad rows). Higher m_blocks are
                 # not iterated at all.
-                var cell_bytes = SIMD[DType.uint8, 4](0)
+                var cell_bytes = SIMD[.uint8, 4](0)
 
                 comptime for k_pack in range(Self.S_K_PACK):
                     comptime for mn_pack in range(Self.S_MN_PACK):
@@ -772,15 +793,15 @@ struct Shuffler[E: Int]:
                         if src_mn < num_tokens:
                             cell_bytes[
                                 k_pack * Self.S_MN_PACK + mn_pack
-                            ] = sfa_raw[Coord((token_start + src_mn), src_k)]
+                            ] = sfa_raw.load[width=1](
+                                Coord((token_start + src_mn), src_k)
+                            )
 
                 var cell_byte_off = Self.scale_4d_slot_byte_off[
                     K_SCALES=K_SCALES, packed_mode=True
                 ](expert_slot, cell_mn_base, cell_k_base, _max_padded_M)
-                var dst_ptr = (sfa_pre.ptr + cell_byte_off).bitcast[
-                    Scalar[DType.int32]
-                ]()
-                dst_ptr[0] = bitcast[DType.int32, 1](cell_bytes)[0]
+                var dst_ptr = (sfa_pre.ptr + cell_byte_off).bitcast[Int32]()
+                dst_ptr[0] = bitcast[.int32, 1](cell_bytes)[0]
 
                 target_tile += _total_wg
 
@@ -794,25 +815,13 @@ struct Shuffler[E: Int]:
         AOffsetsLayout: TensorLayout,
     ](
         sfa_raw: TileTensor[
-            mut=False,
-            DType.uint8,
-            SfaRawLayout,
-            address_space=AddressSpace.GENERIC,
-            ...,
+            mut=False, .uint8, SfaRawLayout, address_space=.GENERIC, ...
         ],
         sfa_pre: TileTensor[
-            mut=True,
-            DType.uint8,
-            SfaPreLayout,
-            address_space=AddressSpace.GENERIC,
-            ...,
+            mut=True, .uint8, SfaPreLayout, address_space=.GENERIC, ...
         ],
         a_offsets: TileTensor[
-            mut=False,
-            DType.uint32,
-            AOffsetsLayout,
-            address_space=AddressSpace.GENERIC,
-            ...,
+            mut=False, .uint32, AOffsetsLayout, address_space=.GENERIC, ...
         ],
         num_active_experts: Int,
         max_num_tokens_per_expert: Int,
@@ -834,6 +843,9 @@ struct Shuffler[E: Int]:
             type_of(raw_any).LayoutType,
             type_of(pre_any).LayoutType,
             type_of(a_off_any).LayoutType,
+            type_of(raw_any).Engine,
+            type_of(pre_any).Engine,
+            type_of(a_off_any).Engine,
         ]
         ctx.enqueue_function[kernel](
             raw_any,

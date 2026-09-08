@@ -8,8 +8,38 @@ This version is still a work in progress.
 
 ## Documentation
 
+- Added a dedicated [metrics](/serve/metrics) reference page with all
+available Prometheus metrics, categorized by subsystem. The metrics section in
+the [container](/container) page now links to the new page.
+- Added an [audio generation](/serve/audio-generation) guide, covering serving
+  a text-to-music model over `/v1/audio/speech` and `/v1/responses`, the
+  request fields and their defaults, the lyric tag syntax, and the length a
+  single render is capped at.
+- Added a music generation example that renders songs past that per-render
+  cap by rendering sections and joining them, and checks the joins for
+  audible seams.
+
 ## MAX models
 
+- Added the `audio_generation` pipeline task, for models that render audio
+  rather than tokens or pixels. Its request options (lyrics, duration,
+  denoising steps, guidance scale, output format) arrive as the `audio`
+  provider options of an OpenResponses request, and an architecture on the
+  task serves over `/v1/audio/speech` and `/v1/responses`. Responses report
+  `usage` the way image generation does: token counts stay at 0 and a
+  `usage.audio_generation_details` block carries `duration_seconds`,
+  `sample_rate`, `channels`, `num_samples`, and `steps`, measured from the
+  audio actually produced rather than the duration that was asked for.
+- Added MiniMax-Music3 (`MiniMaxMusic3ModularPipeline`) support, the first
+  architecture on the `audio_generation` task: a text-to-music model that
+  renders a style caption plus lyrics into 44.1 kHz stereo audio. The five
+  component networks exceed a 24 GB card together, so the pipeline builds and
+  releases each stage in turn within a request; the first request after a cold
+  start pays a multi-minute compile that later ones replay from the
+  compilation cache.
+- Startup no longer prints one `unknown dtype found in safetensors file`
+  warning for each tensor with a dtype that is not a weight encoding. Each
+  scan of the weight files now prints one warning for each unknown dtype.
 - Fixed unbounded host-memory usage in Gemma 4 video pre-processing: the
   server now decodes only the sampled frames of a video instead of
   materializing every frame before sampling, bounding peak memory at the
@@ -32,6 +62,10 @@ This version is still a work in progress.
     proportional to actual sequence lengths (per-layer kernel cost measured
     flat across frozen bounds), and a weekly long-context serving benchmark
     tracks the end-to-end throughput at this configuration.
+- Added multi-token prediction (MTP) speculative decoding for Inkling
+  (`UnifiedMTPInklingForConditionalGeneration`), serving the checkpoint's
+  chained dense draft depths; enabled automatically for Inkling checkpoints
+  that ship `mtp_config` with `--speculative-method mtp`.
 - Added Laguna (`LagunaForCausalLM`) support for
   `poolside/Laguna-M.1-NVFP4`, including tool calling.
 - Added DiffusionGemma (`DiffusionGemmaForBlockDiffusion`) support for
@@ -196,8 +230,43 @@ This version is still a work in progress.
 
 ## MAX framework
 
+- Added `Device.is_host_unified` (`max.driver`) and
+  `DeviceContext.is_host_unified()` (Mojo): whether a device and the host draw
+  from one physical memory pool. Reports hardware topology, so it does not imply
+  any given buffer is host-readable. Driver plugins answer it through the new
+  optional `host_unified` device property.
+- Host-side profiling spans (`max.profiler.Tracer`, `@traced`, and Mojo
+  `Trace` scopes) now annotate external profiler tools on release builds:
+  with `MODULAR_ENABLE_PROFILING` set, spans appear as NVTX ranges in
+  NVIDIA Nsight Systems captures and as roctx ranges in rocprofv3 captures,
+  with no build flags required. Previously these spans were only emitted in
+  special profiling builds.
+- Greedy speculative acceptance (`greedy_acceptance_sampler`,
+  `AcceptanceSampler` in greedy mode) now applies the structured-output
+  grammar bitmask to the target logits (with a `-inf` fill) before the
+  argmax, so a grammar-invalid draft is always rejected and recovered and
+  bonus tokens always satisfy the constraint — matching the stochastic
+  path. Unconstrained batches are unchanged.
+- `stochastic_acceptance_sampler` and `AcceptanceSampler` also accept a
+  rank-1 `[batch_size]` per-row seed tensor in stochastic argmax mode: each
+  row's acceptance sampling is then keyed off its own seed instead of row
+  0's, so a row samples independently of its co-residents. A single-row
+  batch is bit-identical to the scalar-seed behavior. The gemma4 and
+  qwen3.5 unified MTP graphs now pass their per-row seed tensors through.
+- Fixed `response_format` schema normalization skipping containers the grammar
+  backends compile: an untyped object-shaped subschema under
+  `additionalProperties`, `unevaluatedProperties`, `unevaluatedItems` or
+  `dependentSchemas` is now anchored to an object, as one under `properties`
+  already was. Such a subschema previously compiled to a grammar admitting an
+  unbounded value, letting a looping model run to `max_length`.
+- Added the experimental `--experimental-device-graph-synthesis` flag
+  (`PipelineRuntimeConfig.experimental_device_graph_synthesis`): compiles
+  model graphs with device-graph synthesis, so the compiled model records its
+  kernels into a device graph and replays it on execute. Honored only by
+  architectures that opt in (currently Gemma 4's language graph), and
+  mutually exclusive with `device_graph_capture`.
 - Added `max.pipelines.lib.MemoryPlan`, the result of memory planning when a
-  pipeline is loaded: the effective `max_length`, `max_batch_size`,
+  pipeline is loaded: the effective `planned_max_length`, `max_batch_size`,
   `max_batch_total_tokens`, KV-cache budget, and device specs the pipeline
   and its schedulers consume.
 - Renamed `MemoryEstimator.estimate_memory_footprint` to
@@ -205,6 +274,28 @@ This version is still a work in progress.
   `MemoryEstimator.plan` instead to plan from a `PipelineConfig` alone;
   `plan_from_sizes` is for callers that have already computed the weight,
   activation, and signal-buffer sizes.
+- The sequence-length rule now runs once, when the config is built:
+  `config.model.max_length` holds the resolved length and
+  `PipelineArgs.max_length` keeps what the user asked for.
+  `ArchConfig.initialize` receives that length instead of deriving it
+  (`max_seq_len` is now a required keyword argument), and memory planning
+  may only lower it, on the plan.
+  `PipelineModel.calculate_max_seq_len`,
+  `ArchConfigWithAttentionKVCache.user_provided_max_length` and
+  `model_max_seq_len` are removed; architectures own the rule, so Mistral,
+  Mistral3 and Pixtral now bound `max_length` on their configs.
+
+- Memory planning no longer writes its planned `max_length` and
+  `max_batch_total_tokens` back onto the pipeline config. After startup,
+  `PipelineConfig.model.max_length` keeps the construction-resolved value
+  and `PipelineConfig.runtime.max_batch_total_tokens` keeps the
+  user-provided value (`None` when unset); the effective
+  values live on `MemoryPlan`.
+- `PipelineModel` now requires the `memory_plan` constructor argument
+  (keyword-only; constructing a pipeline model without a plan raises a
+  `TypeError`), and `PipelineModel.max_seq_len` is a read-only view of the
+  plan's `planned_max_length` rather than a stored copy with a config
+  fallback.
 - Made `MemoryEstimator.free_memory`, `static_memory_size`,
   `available_kv_cache_memory`, and `max_supported_sequence_length` private.
   They are steps within a memory plan rather than useful on their own, and
@@ -317,6 +408,13 @@ This version is still a work in progress.
   waits for in-flight requests to finish after receiving `SIGTERM` before
   exiting (default 5 seconds). Raise it so long-running requests are drained
   rather than dropped during a rolling restart.
+- Added a request body size limit. `MAX_SERVE_MAX_REQUEST_BYTES` (default
+  100 MiB) caps the size of an accepted HTTP request body; a larger request is
+  rejected with HTTP 413 before the body is buffered, so a client cannot
+  exhaust host memory with an oversized payload. The cap is enforced both from
+  an oversized `Content-Length` and by counting the bytes actually received, so
+  a chunked or mislabeled body cannot evade it. Raise it for larger inline
+  (base64) multimodal payloads, or set it to 0 to disable the limit.
 - Data-parallel (DP) serving now shares the prefix cache across replicas, so a
   multi-turn conversation gets cache hits even when a later turn is scheduled on
   a different replica than the previous one. GPU prefix-cache hits are served by
@@ -326,6 +424,11 @@ This version is still a work in progress.
   `host_offload_max_gb` now sizes one shared host pool of that size for
   the whole deployment, rather than allocating a separate pool of that size per
   replica.
+- `--kv-connector-config '{"type": "rust_tiered", "disk_offload_max_gb": 0}'`
+  now runs the tiered connector with no disk last level: offloaded blocks stop
+  at the pinned host tier and no offload directory is created. Leaving
+  `disk_offload_max_gb` unset still sizes the disk tier from the device page
+  pool, and a negative budget is now rejected instead of silently accepted.
 - The dKV external KV-cache connector (`--kv-connector-config '{"type":
   "dkv"}'`) now supports
   data-parallel (DP) serving and shares its prefix cache across DP replicas on
@@ -361,6 +464,28 @@ This version is still a work in progress.
   now resolve on this path, folded into the handshake's `kv_config_hash`. A
   single-tenant node spanning more than one GPU must set the dKV server's
   `--fair-share-partitions` to its GPU count.
+- The dKV external KV-cache connector now waits out a busy node instead of
+  failing model load on it. dKV refuses a handshake when it has no room for
+  another share, which is a transient condition that clears once a departing
+  share's memory is released, so the refusal is now retriable and the
+  connector's admission budget (`MODULAR_DKV_ADMISSION_TIMEOUT_S`, default
+  raised from 120s to 600s) retries it. A budget too small to cover several
+  attempts is raised to that floor with a warning rather than rejected, so a
+  deployment that pinned the old default keeps starting.
+- A request's `dkv_cache_hint` now reaches the dKV external KV-cache connector,
+  which reads it to load a cached prefix from the instance that holds it rather
+  than only from the co-located one. The serving layer forwards the field
+  without interpreting it, so the hint schema is versioned in one place and a
+  hint this build cannot use costs a cache miss rather than a failed request.
+  Previously the field was parsed into a form nothing read, and every hinted
+  load went to the co-located dKV.
+- The dKV external KV-cache connector now accepts a KV cache tree that mixes
+  TP-replicated and head-sharded caches, instead of failing model load. Only
+  an all-replicated tree produces a block that is byte-identical across TP
+  shards, so a mixed tree offloads over the ordinary per-shard path. On that
+  path a replicated cache is stored once per TP shard rather than once, so
+  size the dKV share above what the `rust_tiered` connector needs for the
+  same model.
 - Added `MODULAR_MAX_RELEASE_FREE_HOST_MEMORY`, an opt-in serving knob that
   returns free host-allocator pages to the OS once model compilation finishes,
   before graph capture. Graph compilation leaves tens of GiB free-but-unreturned
@@ -385,69 +510,6 @@ This version is still a work in progress.
   drafters overrode it at load time with a warning; a bare DFlash run now
   also sizes its KV cache draft headroom at the trained width instead of the
   old default.
-- VLM tokenizers can now cache preprocessed media, so an image or video resent
-  on a later conversation turn skips the resize, rescale and patchify (and for
-  video, the whole decode) instead of redoing it. Keyed on the same
-  raw-encoded-bytes digest the vision encoder cache uses, and bounded by host
-  bytes rather than entry count: `--max-vision-preprocess-cache-bytes` and
-  `--max-video-preprocess-cache-bytes` each default to 10 GiB, their combined
-  size is capped at a quarter of the memory the process may use (a cgroup grant
-  where there is one), and `0` disables either. The budget is a ceiling rather
-  than a reservation -- the cache grows into it and evicts to stay under it --
-  and on a host with less than 80 GiB the cap scales both down proportionally
-  rather than overcommitting. Entries unused for
-  `--max-media-preprocess-cache-idle-seconds` (default 300, `0` disables) are
-  dropped on the next cache lookup or insert, so a burst of distinct media does
-  not hold host memory for the life of the process. Enabled for Gemma 4 images
-  and video, Kimi K2.5 images, and Qwen2.5-VL and Qwen3-VL-MoE images.
-- Added `max.driver.begin_launch_trace()` and
-  `max.driver.take_launch_trace()`, exposing the launch trace recorded by the
-  runtime on CUDA and HIP devices. The trace lists the operations enqueued
-  across all streams — kernel launches (name, grid/block dimensions, shared
-  memory), memory copies, and memsets — in one enqueue-ordered list of
-  `max.driver.LaunchTraceEntry` values, each with a `stream_index` identifying
-  its stream and a deterministic, address-free `semantic_hash`. Because it is
-  process-global, work enqueued on streams the caller has no handle to (such as
-  a compiled graph's internal stream) is captured too. Intended for tests and
-  debugging that assert which device work a code path enqueues and on which
-  stream. The `max.driver.launch_trace()` context manager wraps the pair and
-  always stops recording on block exit, even if the block raises.
-- The graph compiler now fuses query/key RMSNorm followed by rotate-half RoPE
-  into a single `rms_norm_rope` GPU kernel even when the RMSNorm upcasts to
-  `float32`; numerics match the unfused graph.
-- Added a `poison-all` mode to `MODULAR_DEBUG_DEVICE_ALLOCATOR` that fills
-  every memory-manager allocation with a configurable NaN-pattern byte
-  (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_POISON_PATTERN`), so uninitialized
-  device-memory reads trip differential tests without kernel instrumentation.
-  Manual debugging aid, not a default.
-- Added conda packages `max-benchmark`, `max-serve`, and `max-all`, plus a
-  `max[all]` wheel extra, for parity with the existing wheel extras.
-- Multimodal pipelines now compile their vision and language models in
-  parallel via a shared `Module` container and `session.load_all()`, cutting
-  compile/load time by up to 1.86x (Qwen3-VL-4B: 614s -> 428s).
-- Made the compiled-model (MEF) cache key relocatable across install paths:
-  absolute-path-valued pipeline options no longer enter the key, so a cache
-  warmed under one install path hits under another.
-- ModuleV3 weights are now sharded and transferred to devices inside the
-  compiled graph rather than via eager ops, reducing per-GPU memory use
-  (about 10 GiB for a DP-EP NVFP4 DeepSeek-V3).
-- The VMM defragmenting allocator is now the default memory manager on NVIDIA
-  GPUs, fixing external-fragmentation OOMs ("plenty free but no contiguous
-  block"); override with `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=0`. Also
-  fixed the earlier opt-in being a silent no-op.
-- Added a HIP-based VMM defragmenting allocator for AMD GPUs (opt-in via
-  `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`) on MI300-series hardware.
-- Coalesced consecutive Metal kernel launches into a single shared command
-  buffer with a tunable op cap, reducing per-launch overhead on Apple GPUs;
-  also restored Metal GPU execution aborted by an unimplemented
-  driver-context stub.
-- Improved expert-parallel MoE execution by running the shared expert on a
-  side stream via `ops.side_stream`, overlapping it with the routed-expert
-  computation.
-- Allowed `float16`/`bfloat16` graphs to load `float32` checkpoint weights,
-  with the weight adapter casting at load time.
-- Improved multi-device startup latency by batching replay preface copies
-  into a single submission.
 - The vision encoder cache now stores embeddings in fixed-size blocks.
   Capacity is a byte budget carved into 128-token blocks — a video spans
   many blocks and an image a few — so a video-capable model no longer
@@ -471,8 +533,74 @@ This version is still a work in progress.
   readback. A CPU device returns the buffer's own pointer, since its
   allocations are host memory already; devices whose memory is not
   CPU-addressable raise.
+- `DeviceContext.create_event()` and `DeviceEvent` are now supported on Apple
+  GPUs, backed by `MTLSharedEvent`. Event queries and waits track actual GPU
+  completion instead of command-buffer submission order, and waiting on an
+  event from another context's queue no longer blocks the host thread.
+- `DeviceContext.create_event()` on NVIDIA GPUs now honors the default
+  `disable_timing` flag (previously inverted) and recycles events through the
+  driver's event cache instead of growing it on every create/destroy cycle.
+- Device-to-device copies on Apple GPUs no longer race when the source was
+  written on another `DeviceStream`.
+- `MODULAR_DEBUG=device-sync-mode` now works on Apple GPUs, where it
+  previously did nothing.
+- Capturing `DeviceContext.enqueue_function()` now encodes the closure
+  through `DevicePassable` before launch, matching explicit kernel
+  arguments. Host handles such as `DevicePointer` reach the device as
+  device addresses rather than raw host bytes.
+- Added `max.nn.state_space.kda_decode`, a wrapper over the Kimi Delta
+  Attention recurrence op.
 
 ### Inference server
+
+- `/v1/responses` now fetches client-supplied `input_image` URLs through the
+  same media resolver as `/v1/chat/completions`, so the two paths share one
+  byte cap and one error mapping. Previously the responses path had its own
+  downloader with no size limit, meaning an arbitrarily large image could be
+  fetched and base64-expanded in memory, and its failures echoed the
+  underlying network error back to the client. The inlined `data:` URI's MIME
+  type is now sniffed from the fetched bytes instead of guessed from the URL,
+  and content that is not a decodable image is rejected with a 400 rather than
+  inlined as an image.
+
+- Structured-output grammars are now compiled once, in the model worker.
+  The API server used to compile a `response_format` schema or tool-call
+  grammar just to validate it, throw the result away, and leave the worker
+  to compile the same grammar again against a cache it does not share.
+  Removing the duplicate lowers time to first token for structured
+  requests by 12-22% (Gemma 4 31B, concurrency 32); decode latency and
+  requests without structured output are unchanged. An uncompilable
+  grammar is still rejected with the same HTTP 400, streaming requests
+  included, and a disaggregated prefill node now reports the failure to
+  the decode node instead of leaving the request to time out.
+
+- Speculative decoding can now verify only some of the draft tokens it
+  generates, varying that count with the decode batch size via the new
+  `num_speculative_tokens_per_batch_size` speculative-config field. Each entry
+  names an inclusive batch-size range and a count through the keys
+  `batch_start`, `batch_end`, and `num_tokens`, so a two-range schedule is
+  `[{"batch_start": 1, "batch_end": 16, "num_tokens": 3}, {"batch_start": 17,
+  "batch_end": 64, "num_tokens": 1}]`. The first range must start at batch size
+  1 so every batch size resolves to a count; gaps and the tail carry the
+  previous count forward. Drafting is cheap, but every draft the target verifies
+  is another query position in its forward pass, so at high concurrency those
+  positions compete with real tokens for the same compute and a rejected draft
+  is compute spent for nothing. Whether narrowing pays off therefore depends on
+  how well the drafts are being accepted, which is a property of the workload
+  rather than of the batch size. Measure your own workload before adopting a
+  schedule. The field is off by default, and unset behavior is unchanged. It
+  applies to every speculative method. A block drafter (`dflash`) still drafts
+  its whole checkpoint-fixed block every step, so a schedule narrows only how
+  much of that block the target verifies; the saving comes from the target's
+  verify pass, never from drafting less.
+
+  It is most useful for a block drafter, whose draft depth is fixed by its
+  checkpoint, making the verified count the only runtime lever on step cost.
+  Where the draft depth is itself configurable, as it is for `eagle` and
+  `mtp`, lowering `num_speculative_tokens` is the better tool: it removes the
+  draft passes as well as the verify positions, while a schedule pays for
+  drafts it then discards. A count of `0` is accepted and disables
+  verification for that batch-size range.
 
 - GLM models now map `reasoning_effort` onto the two thinking levels their
   chat template can express, instead of forwarding it verbatim. The template
@@ -498,31 +626,70 @@ This version is still a work in progress.
   cold multi-second compile of a complex schema now delays only that
   request instead of stalling inter-token latency for every active
   request.
+- A JSON schema that composes with `allOf` is now enforced instead of
+  refused. `response_format` and tool-call schemas previously returned 400
+  for any `allOf` with more than one member, or with a sibling object
+  keyword. The members now fold into one schema before compilation,
+  including members nested in another member's `allOf` and members that are
+  a bare local `$ref`, so the common "shared definition plus an extension"
+  shape compiles. A conjunction that cannot be folded exactly still returns
+  400 naming the keyword pair at fault, rather than compiling to a looser
+  grammar.
+- A JSON schema using `oneOf` is now enforced when its branches can be
+  proven pairwise disjoint, instead of being refused outright. Disjoint
+  branches make the union exactly-one, which is what `oneOf` means. Branch
+  types and `const`/`enum` value sets carry the proof, covering nullable
+  values, scalar unions, enum partitions and unions discriminated by a
+  constant property. A union that cannot be proven disjoint still returns
+  400, as does a `const`/`enum` branch carrying a keyword the lowering
+  drops. The refusals apply when unsupported-schema rejection
+  (`reject_unsupported`) is enabled.
+- Fixed a union (`anyOf`/`oneOf`) folding its sibling keywords into each
+  branch too widely, which could accept values the schema forbids. These
+  shapes now return 400 instead, when
+  unsupported-schema rejection (`reject_unsupported`) is enabled: a closing
+  `additionalProperties`, `items` or `unevaluatedProperties` beside a union,
+  a base constraint beside `$ref`, `const` or `enum` — whether folded in
+  from a union or written in the same object — and `$ref` beside a
+  sibling union.
 
-- MAX Serve no longer drops uvicorn's log records. The console, file, and
-  OTLP handlers filter on an allowlist of logger prefixes that omitted
-  uvicorn, which owns the HTTP error log, so an exception escaping the ASGI
-  application, a malformed request, and the cancellation of in-flight
-  requests when the shutdown drain expires all went unreported. The uvicorn
-  logger stays at `WARNING`, so the per-request access log remains
-  suppressed.
+- Hardened the server-side fetch of client-supplied `image_url` / `video_url`
+  references against SSRF: the host is now validated and hosts that resolve to
+  internal or reserved addresses are rejected before the fetch. On by default
+  (`MAX_SERVE_MEDIA_URL_SSRF_PROTECTION_ENABLED`); a per-host allowlist
+  (`MAX_SERVE_MEDIA_URL_ALLOWED_HOSTS`, hostnames or CIDRs) permits trusted
+  internal hosts.
 
-- Added `MAX_SERVE_HTTP_KEEPALIVE_TIMEOUT_S` to control how long an idle HTTP
-  connection is held open, defaulting to 120 seconds (previously hard-coded to
-  5 seconds). A server that retires idle connections sooner than its clients do
-  always wins the close race, and a close landing just as a pooled client
-  writes its next request reaches that client as a TCP reset rather than a
-  response. A client cannot replay a POST body, so it surfaces the reset
-  instead of retrying. Keep this above the idle-connection timeout of every
-  client that pools connections to MAX Serve.
+- Compiling deeply nested JSON schemas is substantially faster and uses
+  less memory by avoiding repeated subtree copies while constructing cache
+  keys. Emitted grammars are unchanged.
 
-- An unhandled server error now returns the standard OpenAI `error` envelope as
-  JSON rather than a bare `text/plain` `Internal Server Error`. The
-  request-session middleware runs outside Starlette's exception middleware, so
-  raising from it bypassed the app's exception handler and reached
-  `ServerErrorMiddleware`, which replies in plain text and then re-raises,
-  prompting uvicorn to close the connection under a client that was owed a
-  response.
+- Fixed strict JSON Schema compilation silently dropping string length
+  bounds when a pattern or format is present. Redundant bounds now compile,
+  while unsatisfiable or partially overlapping constraints return 400.
+  Equivalent direct, `allOf`, and union-folded schemas receive the same
+  result. Regex length analysis has a per-schema work limit, so oversized
+  patterns return 400 promptly.
+
+- Fixed JSON Schema compilation resolving a local `$ref` against the wrong
+  resource when the document declares a resource identifier (`$id`, or `id` in
+  Draft 4) below its root. A fragment names a place inside the resource it is
+  resolved against, and every fragment was resolved against the whole document,
+  so a definition name that appeared in both an embedded resource and at the
+  root bound the root's copy in silence. When unsupported-schema rejection
+  (`reject_unsupported`) is enabled, such a document now returns 400 naming the
+  declaration, rather than compiling a grammar the author never wrote. A
+  document whose only resource identifier sits at the root, or that has none at
+  all, is one resource and is unaffected.
+
+- JSON Schema compilation now recognizes the `$schema` dialects it models:
+  Draft 4, whose resource identifier is `id`, and Drafts 6, 7, 2019-09 and
+  2020-12, whose identifier is `$id`. When unsupported-schema rejection
+  (`reject_unsupported`) is enabled, any other `$schema` returns 400 rather
+  than being read as a modern document, because assuming the wrong dialect
+  walks past the resources a document declares and resolves its fragments
+  against the wrong one. Omitting `$schema`, as most tool schemas do, still
+  means the current draft and is unaffected.
 
 - Speculative decoding takes `--draft-proposal sampled` (default `argmax`,
   unchanged). The draft model samples its proposal under the request's
@@ -534,6 +701,30 @@ This version is still a work in progress.
 
 ### Server metrics
 
+- `maxserve_cache_hits_tokens_total` now carries a `tier` label naming what
+  served each token: `g0` for the on-device prefix cache (including
+  cross-replica device-to-device copies), `external` for the KV connector.
+  The per-tier series sum to the untagged total, so an existing single-series
+  query that doesn't group by `tier` returns the same numbers as before. Misses
+  stay unlabeled, which means a PromQL binary operation pairing hits against
+  misses (a hit-rate expression) now matches on mismatched label sets and
+  returns empty: add `ignoring(tier)`, or wrap the hits side in
+  `sum without(tier) (...)`. The in-tree Datadog dashboard aggregates the tag
+  away and is unaffected; external Prometheus consumers are the exposure.
+  Previously the on-device share could only be derived by subtracting the
+  external tier's own server-side counters, which measure what that tier holds
+  rather than what a request could use and so overstate reuse. Note that the
+  untagged series is replaced rather than extended, so a `rate()` window
+  spanning the upgrade sees the old series go stale and the labeled ones start
+  from zero.
+- Added `maxserve_dkv_read_blocks_total`, the count of KV blocks that landed in
+  device memory from the dKV tier. Only confirmed-complete transfers count, so
+  it measures delivered reuse. It is emitted only on dKV deployments, while
+  `maxserve_cache_hits_tokens_total{tier="external"}` is stamped for any KV
+  connector, so a missing counter means "not dKV" rather than "nothing landed".
+  On a dKV deployment the two track each other for every load that lands, and
+  comparing them needs the server's `--kv-cache-page-size`, since one is in
+  blocks and the other in tokens.
 - Fixed the speculative-decoding per-position acceptance-rate histogram
   (`maxserve_spec_decode_acceptance_rate_per_position`) understating
   acceptance: decode batches that performed zero verifications published a
@@ -557,6 +748,13 @@ This version is still a work in progress.
   now also disables LoRA that a recipe enabled, instead of being ignored.
 
 ### Python API
+
+- `max.nn.kernels.msa_sparse_attention_ragged` and
+  `msa_sparse_attention_ragged_mxfp8` take a required
+  `sparse_block_size`: the KV block size in tokens from the model's
+  `sparse_attention_config`. It must equal the KV cache page size, and
+  the kernel now asserts that rather than inferring a block size from
+  the attention tile-width default.
 
 - `max.experimental.nn.Module.compile` reuses precompiled MEFs when the session
   has them, so a ModuleV3 model can be compiled where no accelerator is attached
@@ -586,6 +784,19 @@ This version is still a work in progress.
   saying whether a value reachable by two paths is one object or two. Import
   the module as a namespace: `from max.experimental import tree_utils as tree`.
 
+- Added `max.experimental.compilation`, three transforms over plain
+  callables. `stage(fn)(*args, **kwargs)` traces `fn` into a `max.graph`
+  that can be printed and inspected as MLIR. The arguments are `fn`'s own,
+  except that each tensor is given as a `TensorType`. This partially
+  evaluates `fn`: the tensor types become graph inputs, and every other
+  argument is evaluated during tracing. `compile(fn, weights=...)(*args,
+  **kwargs)` stages the same way and compiles the graph; the result is
+  callable on real tensors. Weights and device memory load only on the
+  first call, so `export_mef` can save the compiled graph to a file without
+  loading either. `as_subgraph(fn)` returns a drop-in replacement for `fn`
+  that, during tracing, calls one shared subgraph instead of inlining its
+  body, so a stack of identical layers compiles once.
+
 - `max.graph.ops.reduce_scatter_rms_norm` takes an optional `group_size`
   argument, matching `max.graph.ops.reducescatter.sum`: the devices split into
   contiguous groups of that many, each reducing independently, so the fused op
@@ -604,6 +815,19 @@ This version is still a work in progress.
   by its `dtype`, `shape`, and `device`. `repr(buffer)` still returns the
   metadata-only representation.
 
+- Added `max.driver.Usage`, an allocation-intent flag for `Buffer`.
+  `Buffer(..., usage=Usage.STAGING)` requests host memory for staging
+  transfers to and from the given device, which may be page-locked
+  depending on the backend. `Buffer.usage` reports the intent;
+  `Buffer.pinned` reports whether the memory is page-locked.
+
+- **Breaking:** the `pinned=` argument to `Buffer(...)` and
+  `Buffer.zeros(...)` is removed. Use `usage=Usage.STAGING` instead.
+
+- DLPack export of a staging buffer (`__dlpack__`, and `to_numpy()` in
+  turn) does not synchronize pending device work. Synchronize explicitly
+  before reading one after a device operation.
+
 - `max.nn.sampling.AcceptanceSampler` and
   `max.nn.sampling.stochastic_acceptance_sampler` take a `draft_proposal`
   argument. The default, `"argmax"`, is unchanged: the draft proposes
@@ -619,6 +843,35 @@ This version is still a work in progress.
 ### C API
 
 ## MAX kernels
+
+- SM100 matmuls with an elementwise epilogue no longer leave output columns
+  unwritten when `N` is not a multiple of 16, such as `N=136` or `N=776`.
+
+- SM100 bf16 and fp8-input matmuls whose N leaves the output row stride short
+  of TMA's 16-byte alignment, such as a 258-wide MoE router projection, now
+  take the split-K GEMV at up to 64 rows instead of falling back to vendor
+  BLAS.
+
+- The SM100 MLA decode dispatch now enumerates 12, 24 and 48 query heads
+  alongside the powers of two it already covered, so a model whose per-device
+  head count is not a power of two can bind its dispatch metadata.
+
+- KDA prefill now runs on the chunk-parallel pipeline. The pipeline existed as
+  a Mojo kernel with no graph-op registration, so every prefill fell back to
+  the token-sequential decode recurrence: O(total_seq_len) sequential steps per
+  sequence, with no parallelism to spend on a long prompt. Registering
+  `kda_chunk` as its own graph op takes that to O(total_seq_len / CHUNK_SIZE).
+
+- Added `MODULAR_APPLE_M5_ALLOW_LOSSY_F32_ATTENTION`. Set it to `0` to keep
+  fp32 attention off the Apple M5 MMA, which truncates operands to fp19. It
+  defaults to the fast (lossy) path, matching
+  `MODULAR_APPLE_M5_ALLOW_LOSSY_F32_MATMUL`.
+
+- Improved MXFP8 block-scaled matmul decode latency for attention
+  output-projection shapes at M=4, M=32, M=64, and M=128 on MI355.
+
+- Improved MXFP8 block-scaled fused QKV projection decode latency at M=4 on
+  MI355.
 
 - The MLA sparse-attention indexer (DeepSeek V3.2, GLM 5.x) now does work
   proportional to each row's actual key count instead of the batch's
@@ -672,38 +925,138 @@ This version is still a work in progress.
   that distribution to build a rejection residual, and reads the sampled
   token's own probability out of it -- a value that has to agree with the
   sampler's accept decision, so it comes from the sampling kernel rather than
-  a separate softmax. The existing single-output path is unchanged.
+  a separate softmax. When top-k, top-p, and min-p are disabled, the
+  distribution-producing path now skips its cutoff search. The existing
+  single-output path is unchanged. On AMD GPUs, the distribution output also
+  serves as temporary storage for exponentiated logits during sampling.
+- MiniMax-M3 sampled MTP now samples only the accepted initial draft row
+  instead of every possible acceptance position.
 - Added `max.nn.kernels.topk_topp_masked_probs`, which computes a row's
   top-k/top-p masked renormalized softmax without sampling and without a
   sort. Speculative decoding verification reads the target's masked
   probability of each drafted token and builds its rejection residual from
   this one tensor, in the same form the draft sampler emits its proposal
-  distribution.
+  distribution. When top-k and top-p are disabled, the kernel now skips the
+  cutoff search because every positive-probability token already survives.
+  On AMD GPUs, it also caches exponentiated logits in the output buffer so
+  cutoff-search passes do not recompute them. Rows with top-k disabled also
+  omit positive-value counting from the initial mass reduction and cutoff
+  search.
+- Top-p-only distribution kernels bias cutoff-search pivots toward lower
+  weights when the retained-mass budget is large relative to the mass still
+  above the search's low bound, so the gain follows the bracket state rather
+  than the requested `top_p`.
 - The fused gumbel-argmax sampling kernel takes a `from_probs` parameter,
   exposed as `max.nn.kernels.gumbel_argmax_from_probs`: each row's score is
   `ln(p) + gumbel` over unnormalized probabilities, drawn with noise the
   kernel generates from a per-row seed. This enables sampling a speculative
   decoding rejection residual `max(p_target - q_draft, 0)` that the caller
   builds in graph ops. GPU-only, non-Apple.
+- Improved wide-row FP32 Gumbel sampling performance on AMD GPUs.
+- Retuned the MI355X dispatch table for a grouped block-scaled MoE
+  matmul (gate-up and down projections) at the estimated-total-M > 2048
+  band that real serving traffic hits, plus the down projection's
+  estimated-total-M <= 2048 band. Gate-up projection speeds up 7.4-10.1%
+  and down projection 18.2-19.6% (etm > 2048) and 6.9-23.3% (etm <= 2048)
+  across real ragged-M, skewed routing scenarios.
 
 ## Breaking changes
 
-- `max.pipelines.PipelineArgs` is now immutable: assigning to one of its
-  top-level fields after construction raises a pydantic `ValidationError`.
-  Construct it with the values you need. Its sub-configs (`runtime`,
-  `sampling`, etc.) are unchanged for now.
+- Removed the `NPU` device class from `max.driver` and the corresponding
+  `DeviceRef.NPU()`, `DeviceRef.is_npu()`, and `DeviceKind.NPU` from
+  `max.graph`, along with the `M_newNPUDevice()` C API entry point. `NPU` was
+  a thin subclass of `Accelerator` that differed only in the device label it
+  stamped on the graph; it had no callers, and accelerator backends reached
+  through a driver plugin are already served by `Accelerator`. Construct
+  `Accelerator()` (or `DeviceRef.GPU()`) for any non-CPU device, and read the
+  `Accelerator.api` property to tell the concrete backends apart.
+- The tile-tensor storage policy is renamed to an engine, and the
+  `layout.tensor_storage` module is renamed `layout.tensor_engine`. The
+  `TensorStorage` trait becomes `TensorEngine`, `TileTensor`'s `Storage`
+  parameter becomes `Engine`, and the conforming policies `PointerStorage`,
+  `DevicePointerStorage`, and `StaticOffsetStorage` become `DefaultEngine`,
+  `DevicePointerEngine`, and `StaticOffsetEngine`. The trait describes the
+  operations a tile tensor performs on its handle (load, store, bitcast,
+  elementwise) rather than the memory it points at, so the old name described
+  the wrong thing. Update `Storage=` keyword arguments to `Engine=` and any
+  `tensor.Storage` accesses to `tensor.Engine`. The `TensorOps` trait and the
+  associated `StorageType` handle keep their names, since they still describe
+  the borrowed memory itself.
 
-- `max.pipelines.lib.LoRAConfig` and `max.pipelines.lib.ProfilingConfig` are
-  now immutable (pydantic `frozen=True`); assigning to a field after
-  construction raises a `ValidationError`. Construct with the desired values.
+  Kernel signatures follow. Every comptime parameter bound to `TensorEngine`
+  or `TensorOps` now ends in `Engine`, replacing the three spellings that
+  were in use: `OutputStorage` and `XStorage` become `OutputEngine` and
+  `XEngine`, `QStorageType` and `SeedStorageType` become `QEngine` and
+  `SeedEngine`, and the snake_case `q_storage` and `x_store` become
+  `q_engine` and `x_engine`. Callers passing any of these by keyword need to
+  update the name.
+- The KV connector's external host and disk tiers now report occupancy and
+  transfer volume in bytes rather than in blocks. Those tiers are byte budgets
+  the operator sizes in bytes (`host_offload_max_gb`, `disk_offload_max_gb`),
+  their block width need not match the device's, and bytes rate directly
+  against PCIe and disk bandwidth. The device (G0) cache is unchanged and
+  still reports blocks.
+
+  `KVConnector` replaces `host_block_count` / `disk_block_count` with
+  `host_byte_count` / `disk_byte_count`, returning a new `ByteCount` (the same
+  `free` / `total` / `used` / `used_pct` / `free_pct` surface as `BlockCount`,
+  measured in bytes). The KV cache managers make the same swap;
+  `block_count()` is untouched. `KVCacheMetrics` renames `h2d_blocks_copied`,
+  `d2h_blocks_copied`, `disk_blocks_read`, and `disk_blocks_written` to
+  `h2d_bytes_copied`, `d2h_bytes_copied`, `disk_bytes_read`, and
+  `disk_bytes_written`.
+
+  The exported metrics follow: `maxserve.cache.h2d_blocks_copied`,
+  `maxserve.cache.d2h_blocks_copied`, `maxserve.cache.disk_blocks_read`, and
+  `maxserve.cache.disk_blocks_written` become `h2d_bytes_copied`,
+  `d2h_bytes_copied`, `disk_bytes_read`, and `disk_bytes_written`, with unit
+  `bytes`. `maxserve.cache.used_host_kv_pct` and
+  `maxserve.cache.used_disk_kv_pct` keep their names and are now computed over
+  bytes. Dashboards and alerts on the old tier counter names need updating.
+
+- The pipeline configs are now immutable: `PipelineArgs`,
+  `PipelineConfig`, `PipelineRuntimeConfig`, `SamplingConfig`,
+  `MAXModelConfig`, `KVCacheConfig` and its nested `KVConnectorConfig`,
+  `LoRAConfig`, and `ProfilingConfig`. Assigning to a field after
+  construction raises a pydantic `ValidationError`. Construct them with
+  the values you need.
+
+- `ModelManifest` is now immutable from construction: mutating the mapping
+  (item assignment, `update`, `pop`, and so on) raises a `TypeError`, and
+  `ModelManifest.resolve()` is removed — a manifest is complete when built.
+  Construct it with the component configs you need. The unused
+  `total_weights_size` property is also removed.
+- `SpeculativeConfig` is now immutable: assigning to a field after
+  construction raises a pydantic `ValidationError`. Construct it with the
+  values you need. A failed speculative target-architecture rewrite now
+  raises from `PipelineConfig.from_args()` instead of being logged and
+  ignored.
+
+- An architecture can set `checkpoint_draft_width` on its
+  registration to supply the draft width its checkpoint was trained for,
+  so users of those models do not have to pass `--num-speculative-tokens`.
+  A width that disagrees with the checkpoint is replaced, with a warning.
+
+- Constructing a `MAXModelConfig` directly now only validates the fields
+  you pass. It no longer fills in the weight and model paths or loads the
+  HuggingFace config. Configs the pipeline builds are unchanged.
+
+- `ArchConfig.calculate_max_seq_len()` no longer takes `pipeline_config`,
+  and `model_config` is now required.
+
+- `KVCacheConfig.allow_kv_head_replication`, the architecture registration
+  field `requires_kv_head_replication`, and the
+  `--allow-kv-head-replication` flag are removed. An architecture now asks
+  for KV head replication in its `construct_kv_params()`.
+
 - The KV cache connector is now configured as a single object: its type moved
   onto `--kv-connector-config` as a `type` field, and the separate
   `--kv-connector` flag is removed. Replace `--kv-connector rust_tiered` with
   `--kv-connector-config '{"type": "rust_tiered"}'`, and in a recipe set
   `model.kv_cache.kv_connector_config.type`. `host_kvcache_swap_space_gb` is
   renamed `host_offload_max_gb` to match `disk_offload_max_gb`, and both now
-  default to sizing their tier from the device page pool (twice it on host,
-  three times on disk) rather than to a fixed 50 GiB. Dict-valued `kv_cache`
+  default to sizing their tier from the device page pool (1.5 times it on host,
+  twice on disk) rather than to a fixed 50 GiB. Dict-valued `kv_cache`
   flags now merge field-wise over a config file's value instead of replacing
   it, so overriding one connector field on the command line keeps the rest --
   previously a partial override reset the connector type and silently disabled
@@ -754,18 +1107,187 @@ This version is still a work in progress.
   overloads and unused `bencher_iter_custom_multicontext()`. Pass the launch
   closure as a value: `bencher_iter_custom(bencher, fn, ctx)`.
 
+- Removed `max.algorithm.reduce_boolean()`, which took its `reduce_fn` and
+  `continue_fn` as `capturing` compile-time parameters and had no callers. Use
+  `max.algorithm.reduce()` with a boolean accumulator, or write the early-exit
+  loop directly.
+
+- Removed the parametric `max.algorithm.parallelize[func](num_work_items, ...)`
+  and `max.algorithm.parallelize_over_rows[func](shape, axis, grain_size, ...)`
+  overloads that took a `capturing` closure as a compile-time parameter. Pass
+  the body as a unified closure in the first runtime argument instead:
+  `parallelize(func, num_work_items, ...)` and
+  `parallelize_over_rows(func, shape, axis, grain_size, ...)`. Closure bodies
+  drop `@__parameter` / `@__copy_capture` in favor of an explicit capture list,
+  for example `def body(start: Int, end: Int) {imm}:`.
+
+- Removed the parametric
+  `max.algorithm.sync_parallelize[func](num_work_items, ...)` overload that
+  took a `capturing` closure as a compile-time parameter. Pass the body as a
+  unified closure in the first runtime argument instead:
+  `sync_parallelize(func, num_work_items, ...)`. The remaining overload
+  accepts `def(Int) raises -> None`, so both raising and non-raising
+  closures bind. Closure bodies drop `@__parameter` / `@__copy_capture` in
+  favor of an explicit capture list, for example `def body(i: Int) {imm}:`.
+
+- Removed the parametric
+  `max.benchmark.bench_multicontext[fn](bench, ctxs, ...)` overload. Pass the
+  body as a unified closure in the second runtime argument:
+  `bench_multicontext(bench, fn, ctxs, ...)`. Nested closures passed this way
+  drop `@__parameter` in favor of an explicit capture list such as `{imm}` or
+  `{mut buf, imm}`.
+
+- Removed the parametric `capturing` overloads of
+  `DeviceContext.execution_time[fn](num_iters)`,
+  `DeviceContext.execution_time_iter[fn](num_iters)`, and
+  `DeviceContext.enqueue_cpu_function[fn]()`. Pass the closure as a runtime
+  argument instead: `execution_time(fn, num_iters)`,
+  `execution_time_iter(fn, num_iters)`, and `enqueue_cpu_function(fn)`. Nested
+  closures passed this way are unified closures, so replace `@__parameter` and
+  `@__copy_capture(x)` with an explicit capture list such as `{imm}` or
+  `{var x, imm}`.
+
+- Removed the parametric capturing `layout.int_tuple.apply[func](t)`,
+  `reduce[reducer](t, initializer)`, and capturing `apply_zip[func](...)`
+  overloads. Pass the closure as a runtime value: `apply(t, func)`,
+  `reduce(t, initializer, reducer)`, and `apply_zip(t1, t2, func)` (or
+  `apply_zip(t1, t2, t3, func)`). Nested closures passed this way are
+  unified closures, so replace `@__parameter` with an explicit capture list
+  such as `{}` or `{imm}`. Thin `apply_zip[func](t1, t2)` function-pointer
+  overloads are unchanged.
+
+- `DeviceGraphBuilder.add_function[kernel](*args, ...)` takes a thin
+  function pointer (`func: def(...) thin -> None`), the same identity as
+  `DeviceContext.compile_function[kernel]()`.
+
 - `PipelineRegistry.retrieve_factory` now returns a `RetrievedPipeline`
   dataclass with `tokenizer`, `factory`, and `memory_plan` fields instead of
   a `(tokenizer, factory)` tuple, so callers can reach the memory plan
   computed during retrieval. Replace tuple unpacking with attribute access.
   `PipelineRegistry.retrieve` is unchanged.
 
+- The serving surface now reads the planned sequence length and batch token
+  budget from the memory plan instead of re-reading them from the pipeline
+  config. `TokenGenerationSchedulerConfig.from_pipeline_config`,
+  `start_model_worker`, the scheduler loaders, and the startup log helpers
+  (`log_basic_config`, `log_pipeline_info`) take the memory plan as a
+  parameter. Resolved values are unchanged.
+
+- Renamed `MemoryPlan.max_length` to `MemoryPlan.planned_max_length` to
+  distinguish the plan's value from the user intent on
+  `PipelineArgs.max_length` and the construction-resolved
+  `PipelineConfig.model.max_length`, which keep their names.
+
+- Denoising-cache input is now a frozen `DenoisingCacheSettings` on
+  `PipelineArgs` (`denoising_cache`; in config files this section moves
+  from `runtime.denoising_cache` to the top level). Construction fills
+  unset fields from the architecture's TaylorSeer defaults into a frozen
+  `DenoisingCacheConfig`. Enabling TaylorSeer without resolvable tuning
+  fails at construction, as does enabling TaylorSeer and first-block
+  caching together.
+
 ## Fixes
+
+- Fixed a pre-tokenized prompt longer than `--max-length` killing the model
+  worker instead of being rejected. Only a string prompt was length-checked,
+  so a token-array prompt — an OpenAI `/v1/completions` token array, or the
+  pre-tokenized prompt an orchestrator supplies for KV cache-aware routing —
+  was admitted at any length and produced a request whose length exceeded the
+  model's context window. Under speculative decoding the response path then
+  raised rather than capping, taking the worker down and wiping its prefix
+  cache; such a request now returns HTTP 400 like an over-length string
+  prompt.
+
+- Fixed constrained decoding producing invalid output when combined with
+  speculative decoding on AMD GPUs. The in-graph wait that gates the grammar
+  bitmask copy was not recorded into captured device graphs, so replays read a
+  stale mask.
+
+- Fixed tool calls being returned as raw markup in the assistant's `content`
+  when a request did not declare a `tools` array. A tool established only by
+  the conversation history, such as retrying a call that previously failed,
+  now comes back as a structured `tool_calls` entry. Parsing runs whenever the
+  model has a tool parser configured; `tool_choice="none"` still opts out.
+
+- Fixed `max-debug.source-tracebacks` (for example
+  `MODULAR_DEBUG=source-tracebacks` or
+  `Graph.debug.source_tracebacks = True`) being silently ignored when it
+  was enabled after `max.graph` was first imported. The flag was cached at
+  import time, so runtime error messages lacked the `Source Traceback`
+  section pointing back at the Python code that built the failing op, even
+  though the config reported the feature as enabled.
+
+- Fixed the `disk_bytes_written` KV cache metric counting blocks the tiered
+  connector's disk tier declined to write because they were already saved or
+  had a write pending. Re-offloading a block that had been evicted from the
+  host tier but was still on disk inflated the count, and with it any
+  disk-throughput figure derived from it.
+
+- Fixed `generate_async` raising `KeyError: Request ID not found in replica
+  batch` when requests in one batch finish on different steps, which happens
+  whenever they are given different `max_new_tokens`.
+
+- Fixed the offline `generate()` and `generate_async()` APIs releasing only a
+  finished request's KV cache blocks, and never the pipeline itself. The
+  pipeline-level release is what frees a recurrent state pool slot and drops a
+  request's vision encoder cache references, so architectures that carry
+  recurrent state — such as Nemotron-H, Mamba, and LFM2 — leaked one state slot
+  per request, and a second run in the same process could inherit the first
+  run's slot and return different greedy tokens.
+
+- Fixed `DeviceExternalFunction` crashing on Metal instead of launching, so
+  separately compiled kernels now load and launch there as they already did on
+  other GPU backends.
+
+- Fixed device buffer allocation no longer being pooled on GPUs without
+  GPUDirect RDMA support, such as GeForce cards. A
+  `DeviceContext.enqueue_create_buffer()` create and destroy round trip on an
+  affected device took roughly 67 us instead of 375 ns.
+
+- Fixed abandoned image, video, and audio generation requests still being
+  rendered. The scheduler these tasks share never read its cancellation
+  queue, so a request whose client had disconnected was executed in full
+  once it reached the front of the queue, and the cancellations themselves
+  accumulated. A request cancelled before it starts is now dropped and
+  answered as cancelled; one already in flight still runs to completion,
+  since a render is a single uninterruptible call.
+
+- Fixed reductions over a zero-extent axis — for example `ops.sum(x, axis=1)`
+  where that axis has length `0` — leaving their output unwritten, along with
+  anything fused into the reduction's epilogue. Each now writes its identity:
+  `0` for `sum`, `1` for `prod`, the dtype's minimum for `max` and its maximum
+  for `min`, index `0` for `argmax` and `argmin`, and NaN for floating-point
+  `mean` (as `numpy.mean` reports). Integer `mean` returns `0`. Note that
+  `max`, `min`, `argmax`, and `argmin` return an identity here rather than
+  raising the way numpy does.
+
+- Fixed `max benchmark --base-url` failing before the first request against
+  remote OpenAI-compatible endpoints: the server-readiness probe and the
+  prefix-cache flush now target the `--base-url` endpoint (instead of
+  `http://<host>:<port>`) and send `Authorization: Bearer $OPENAI_API_KEY`,
+  matching the benchmark requests themselves.
+
+- Fixed run-to-run nondeterminism of `layer_norm`, `rms_norm`, and other
+  Row-API rowwise reductions on Apple Silicon GPUs: a block that reduced
+  several rows re-used its shared-memory strip across row iterations
+  without ordering the trailing broadcast read against the next combine's
+  first store. Model outputs on Metal (for example FLUX.2 image
+  generation) are now byte-identical across runs; NVIDIA and AMD codegen
+  is unchanged.
 
 - On Apple Silicon, a missing Metal Toolchain (a separate download since
   Xcode 16) now surfaces `xcrun`'s own error, which names the fix
   (`xcodebuild -downloadComponent MetalToolchain`), instead of the opaque
   "Please submit a bug report." message.
+
+- Fixed GPU discovery inside a container granted only MIG compute instances,
+  which made MAX and Mojo unusable on MIG-sliced clusters. Discovery reported
+  `GPU is not present`, and a container holding several instances carved from
+  the same GPU saw only one of them. Where NVML answers for the parent GPU,
+  discovery now defers to CUDA, which describes the instance: for a device's
+  memory when NVML rejects the query, and for the device count when MIG is
+  enabled.
+  ([Issue #6896](https://github.com/modular/modular/issues/6896))
 
 - Fixed tool-call requests failing with HTTP 400 (`anyOf branch and base
   schema both set "description"`) on models whose grammar compiles in strict
@@ -821,6 +1343,10 @@ This version is still a work in progress.
   the unmasked softmax mass instead of the masked kept mass, so it summed to
   less than one and skewed the rejection residual. The sampled token stream
   was and remains unchanged.
+
+- Fixed a model worker crash when constrained decoding and speculative
+  decoding were enabled together. A batch at the prefill-to-decode boundary
+  verifies no drafts, which the grammar bitmask fill rejected.
 
 ## Mojo language
 

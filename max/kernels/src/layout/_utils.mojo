@@ -16,7 +16,7 @@ from std.sys import size_of
 from std.sys.intrinsics import readfirstlane
 
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
-from std.gpu.intrinsics import AMDBufferResource
+from max.gpu.intrinsics import AMDBufferResource
 from max.gpu.compute.mma import mma
 from layout import *
 from layout.layout_tensor import LayoutTensor, LayoutTensorIter
@@ -32,12 +32,8 @@ struct ManagedLayoutTensor[
     layout: Layout,
     *,
 ]:
-    comptime index_type: DType = _get_index_type(
-        Self.layout, AddressSpace.GENERIC
-    )
-    comptime element_type: DType = _get_layout_type(
-        Self.layout, AddressSpace.GENERIC
-    )
+    comptime index_type: DType = _get_index_type(Self.layout, .GENERIC)
+    comptime element_type: DType = _get_layout_type(Self.layout, .GENERIC)
     comptime layout_tensor_type = LayoutTensor[
         Self.dtype,
         Self.layout,
@@ -295,8 +291,8 @@ def hash(tensor: LayoutTensor) -> Int:
     for i in range(tensor.dim[0]()):
         for j in range(tensor.dim[1]()):
             var val = tensor[i, j]
-            var addr = UnsafePointer(to=val)
-            var addr_int = addr.bitcast[Int16]()
-            var val_int = addr_int[0]
+            var addr = ImmPointer(to=val)
+            var addr_int = addr.unsafe_bitcast[Int16]()
+            var val_int = addr_int[]
             hash_value = ((hash_value << 5) + hash_value) + Int(val_int)
     return hash_value

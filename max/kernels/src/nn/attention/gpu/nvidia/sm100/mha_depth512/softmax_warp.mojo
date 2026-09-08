@@ -34,8 +34,8 @@ from std.math import exp2, recip
 from std.math.constants import log2e
 from std.memory import bitcast
 from std.sys import size_of
-import std.gpu.primitives.warp as warp
-from std.gpu.globals import WARPGROUP_SIZE, WARP_SIZE
+import max.gpu.primitives.warp as warp
+from max.gpu.globals import WARPGROUP_SIZE, WARP_SIZE
 from max.gpu.memory import fence_async_view_proxy
 from max.gpu.sync import (
     named_barrier,
@@ -51,7 +51,6 @@ from max.gpu.compute.arch.tcgen05 import (
     tcgen05_release_allocation_lock,
     tcgen05_store_wait,
 )
-from std.gpu.primitives.warp import _vote_nvidia_helper
 from max.gpu.primitives.cluster import block_rank_in_cluster
 from linalg.matmul.gpu.sm100_structured.structured_kernels.tmem import (
     TmemAddress,
@@ -214,7 +213,7 @@ def depth512_scale_write_output[
                 var o_k_block = col // o_sw_K
                 var o_inner = Int(m_row) * o_sw_K + col % o_sw_K
                 (o_smem + o_k_block * BM * o_sw_K + o_swizzle(o_inner)).bitcast[
-                    Scalar[DType.uint32]
+                    UInt32
                 ]().store(packed)
 
     comptime if config.split_o:
@@ -340,7 +339,7 @@ def depth512_softmax[
     comptime fuse_gqa = config.fuse_gqa
     comptime BM_eff: Int = config.BM_eff()
     comptime PairBM_mask = BM_eff * 2
-    comptime f32x2 = SIMD[DType.float32, 2]
+    comptime f32x2 = SIMD[.float32, 2]
 
     # Batch size for pipelined TMEM loads and exp computation.
     comptime batch_size = 32
@@ -699,8 +698,8 @@ def depth512_softmax[
                 comptime r = base % p_sw_K
                 var p_inner = Int(m_row) * p_sw_K + r
                 (p_smem + p_k_block * BM * p_sw_K + p_swizzle(p_inner)).bitcast[
-                    Scalar[DType.uint32]
-                ]().store(bitcast[DType.uint32, 4](vals))
+                    UInt32
+                ]().store(bitcast[.uint32, 4](vals))
 
         # Batch 0: compute exp.
         comptime for idx in range(p_batch):
@@ -807,7 +806,12 @@ def depth512_softmax[
 
         var correction: Float32
         comptime if rescale_threshold < 0:
-            if _vote_nvidia_helper(diff < rescale_threshold) != 0:
+            # Per-lane predicate, not a warp vote: under `fuse_gqa`,
+            # `per_thread_score_row` packs multiple distinct query rows
+            # (heads and/or seq positions) into one warp's 32 `m_row`
+            # values, so an OR here would leak a sibling row's rescale
+            # trajectory into this one's.
+            if diff < rescale_threshold:
                 row_max = new_row_max
                 correction = exp2(diff)
             else:

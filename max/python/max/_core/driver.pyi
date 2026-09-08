@@ -35,9 +35,7 @@ class Device:
 
     This is the base class for :class:`CPU` and :class:`Accelerator`.
     Do not instantiate this class directly; use :class:`CPU` for host
-    devices, :class:`Accelerator` for any hardware accelerator (GPU
-    by default), or :class:`NPU` to explicitly select the NPU
-    dispatch path. :class:`NPU` is a subclass of :class:`Accelerator`.
+    devices and :class:`Accelerator` for any hardware accelerator.
 
     .. code-block:: python
 
@@ -45,7 +43,6 @@ class Device:
 
         cpu = driver.CPU()
         gpu = driver.Accelerator()
-        npu = driver.NPU()
     """
 
     def can_access(self, other: Device) -> bool:
@@ -88,6 +85,22 @@ class Device:
 
             device = driver.CPU()
             device.is_host
+        """
+
+    @property
+    def is_host_unified(self) -> bool:
+        """
+        Whether this device and the host draw from one physical memory pool.
+
+        Reports hardware topology, so it does not predict whether a particular
+        buffer is readable from the host.
+
+        .. code-block:: python
+
+            from max import driver
+
+            device = driver.Accelerator()
+            device.is_host_unified
         """
 
     @property
@@ -305,18 +318,11 @@ class Accelerator(Device):
         """
         Creates an accelerator device with the specified ID and memory limit.
 
-        Represents any hardware accelerator (GPU or NPU) attached to the
-        host. Constructing ``Accelerator()`` directly produces a GPU-labeled
-        device, which is the dispatch path the graph compiler uses for
-        CUDA, HIP, Metal and any other GPU-class backend. Use the
-        :class:`NPU` subclass to explicitly select the NPU dispatch path
-        instead.
-
-        :class:`NPU` is a subclass of ``Accelerator``, so any
-        ``isinstance(device, Accelerator)`` check is satisfied by both GPU
-        and NPU devices. Treat ``Accelerator`` as "any non-CPU device"
-        when writing isinstance checks; use the concrete subclass when
-        you specifically need the GPU or NPU dispatch path.
+        Represents any hardware accelerator attached to the host: the
+        graph compiler reaches CUDA, HIP, Metal and plugin-provided
+        backends alike through this one device class. Use
+        ``isinstance(device, Accelerator)`` to mean "any non-CPU device",
+        and :attr:`api` to tell the concrete backends apart.
 
         Repeated instantiations with a previously-used device-id will still
         refer to the first such instance that was created. This is especially
@@ -334,8 +340,6 @@ class Accelerator(Device):
           device = driver.Accelerator(id=1)  # Second GPU
           # Get device id
           device_id = device.id
-          # NPU is also an Accelerator
-          isinstance(driver.NPU(), driver.Accelerator)  # True
 
         Args:
             id (int, optional): The device ID to use. Defaults to -1, which selects
@@ -343,37 +347,6 @@ class Accelerator(Device):
 
         Returns:
             Accelerator: A new Accelerator device object.
-        """
-
-class NPU(Accelerator):
-    def __init__(self, id: int = -1) -> None:
-        """
-        Creates an NPU accelerator device.
-
-        ``NPU`` is a subclass of :class:`Accelerator`: an NPU **is an**
-        accelerator, and ``isinstance(device, Accelerator)`` returns
-        ``True`` for any ``NPU`` instance. The reason to construct an
-        ``NPU`` instead of a bare ``Accelerator`` is to select the NPU
-        dispatch path: the graph compiler stamps an ``"npu"`` device
-        label, emits ``target="npu"`` Mojo kernels, and routes through
-        the NPU plugin hook rather than the default GPU dispatch path.
-
-        On platforms without an NPU backend the device will still be
-        created, but downstream graph compilation will fail with an
-        unsupported target error.
-
-        .. code-block:: python
-
-            from max import driver
-            device = driver.NPU()
-            device = driver.NPU(id=0)
-
-        Args:
-            id (int, optional): The device ID to use. Defaults to -1, which
-                selects the first available NPU.
-
-        Returns:
-            NPU: A new NPU device object.
         """
 
 class CPU(Device):
@@ -1003,6 +976,34 @@ def get_virtual_cpu_target() -> str:
         str: The CPU target string, or empty string if not set (host CPU).
     """
 
+class Usage(enum.Flag):
+    """
+    Allocation-intent descriptor for :obj:`Buffer`.
+
+    Flags compose with ``|`` and are tested with ``in``. ``max.driver``
+    owns the flag set and its per-backend mapping.
+    """
+
+    _boundary_: enum.FlagBoundary = ...
+
+    _flag_mask_: int = 1
+
+    _singles_mask_: int = 1
+
+    _all_bits_: int = 3
+
+    _inverted_: None = None
+
+    DEFAULT = 0
+    """
+    The allocation Buffer performs today: device memory for a non-host device, ordinary host memory for the CPU.
+    """
+
+    STAGING = 1
+    """
+    Host memory for staging transfers to and from the given device. May be page-locked, depending on the backend.
+    """
+
 class Buffer:
     """
     Device-resident buffer representation.
@@ -1030,8 +1031,9 @@ class Buffer:
         dtype (DType): Data type of buffer elements.
         shape (Sequence[int]): Tuple of positive, non-zero integers denoting the buffer shape.
         device (Device, optional): Device to allocate buffer onto. Defaults to the CPU.
-        pinned (bool, optional): If True, memory is page-locked (pinned). Defaults to False.
         stream (DeviceQueue, optional): Queue to associate the buffer with.
+        usage (Usage, optional): Allocation intent, see :obj:`Usage`.
+            Defaults to ``Usage.DEFAULT``.
     """
 
     @overload
@@ -1040,7 +1042,7 @@ class Buffer:
         dtype: max._core.dtype.DType,
         shape: Sequence[int],
         device: Device | None = None,
-        pinned: bool = False,
+        usage: Usage = Usage.DEFAULT,
     ) -> None: ...
     @overload
     def __init__(
@@ -1048,7 +1050,7 @@ class Buffer:
         dtype: max._core.dtype.DType,
         shape: Sequence[int],
         stream: DeviceQueue,
-        pinned: bool = False,
+        usage: Usage = Usage.DEFAULT,
     ) -> None: ...
     @overload
     def __init__(
@@ -1280,7 +1282,13 @@ class Buffer:
 
     @property
     def pinned(self) -> bool:
-        """Whether or not the underlying memory is pinned (page-locked)."""
+        """
+        Whether the allocation landed in the device's host memory space. Ask ``usage`` for what was requested.
+        """
+
+    @property
+    def usage(self) -> Usage:
+        """Allocation intent. Slices and views report their parent's usage."""
 
     def view(
         self, dtype: max._core.dtype.DType, shape: Sequence[int] | None = None
@@ -1297,7 +1305,7 @@ class Buffer:
         shape: Sequence[int],
         dtype: max._core.dtype.DType,
         device: Device | None = None,
-        pinned: bool = False,
+        usage: Usage = Usage.DEFAULT,
     ) -> Buffer:
         """
         Allocates a buffer with all elements initialized to zero.
@@ -1307,8 +1315,8 @@ class Buffer:
             dtype (DType): The data type of the buffer.
             device (Device, optional): The device to allocate the buffer on.
                 Defaults to None (CPU).
-            pinned (bool, optional): If True, allocate pinned host memory for
-                non-CPU devices. Defaults to False.
+            usage (Usage, optional): Allocation intent, see :obj:`Usage`.
+                Defaults to ``Usage.DEFAULT``.
 
         Returns:
             Buffer: A new buffer filled with zeros.

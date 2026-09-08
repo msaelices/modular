@@ -137,20 +137,16 @@ def bench_scatter[
         list_of_ctx[gpu_idx].enqueue_memset(out_bufs_list[gpu_idx], 0)
 
     # Create signal buffers for synchronization.
-    var signal_buffers = List[DeviceBuffer[DType.uint8]](capacity=ngpus)
-    var rank_sigs = Array[UnsafePointer[Signal, MutAnyOrigin], MAX_GPUS](
+    var signal_buffers = List[DeviceBuffer[.uint8]](capacity=ngpus)
+    var rank_sigs = Array[MutPointer[Signal, MutAnyOrigin], MAX_GPUS](
         uninitialized=True
     )
 
     for gpu_idx in range(ngpus):
         signal_buffers.append(
-            list_of_ctx[gpu_idx].create_buffer_sync[DType.uint8](
-                size_of[Signal]()
-            )
+            list_of_ctx[gpu_idx].create_buffer_sync[.uint8](size_of[Signal]())
         )
-        list_of_ctx[gpu_idx].enqueue_memset[DType.uint8](
-            signal_buffers[gpu_idx], 0
-        )
+        list_of_ctx[gpu_idx].enqueue_memset[.uint8](signal_buffers[gpu_idx], 0)
         rank_sigs[gpu_idx] = (
             signal_buffers[gpu_idx]
             .unsafe_ptr()
@@ -162,11 +158,11 @@ def bench_scatter[
     comptime InputTileType = TileTensor[
         dtype, type_of(row_major(num_elems)), ImmutAnyOrigin
     ]
-    var tt_in_bufs = Array[InputTileType, dp_size](uninitialized=True)
-    for dp_idx in range(dp_size):
-        tt_in_bufs[dp_idx] = TileTensor(
+    var tt_in_bufs = Array[InputTileType, dp_size](
+        fill_with=lambda (dp_idx: Int) -> InputTileType: TileTensor(
             cb_inputs[dp_idx].device_buffer(), row_major(num_elems)
         ).as_immut()
+    )
 
     comptime OutputTileType = TileTensor[
         dtype, type_of(row_major(num_elems)), MutAnyOrigin
@@ -178,11 +174,10 @@ def bench_scatter[
         )
         list_of_ctx[gpu_idx].synchronize()
 
-    @__parameter
     @always_inline
     def bench_iter(
         mut bencher: Bencher, ctx: DeviceContext, ctx_idx: Int
-    ) raises:
+    ) raises {mut tt_in_bufs, imm}:
         @always_inline
         def call_fn(
             ctx_inner: DeviceContext, cache_iter: Int
@@ -203,8 +198,9 @@ def bench_scatter[
 
         bencher_iter_custom(bencher, call_fn, ctx)
 
-    bench_multicontext[bench_iter](
+    bench_multicontext(
         b,
+        bench_iter,
         list_of_ctx,
         BenchId(name),
         [ThroughputMeasure(BenchMetric.bytes, num_bytes)],
@@ -261,7 +257,7 @@ def bench_scatter[
 def main() raises:
     var num_elems = arg_parse("num_elems", 16)
 
-    comptime dtype = get_defined_dtype["dtype", DType.uint32]()
+    comptime dtype = get_defined_dtype["dtype", .uint32]()
     comptime num_gpus = get_defined_int["num_gpus", 2]()
     comptime dp_size = get_defined_int["dp_size", 2]()
     comptime cache_busting = get_defined_bool["cache_busting", True]()

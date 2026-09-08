@@ -113,7 +113,7 @@ class KVConnectorConfig(ConfigFileModel):
     via ``extra="allow"`` and are accessible via ``model_extra``.
     """
 
-    model_config = ConfigDict(strict=False, extra="allow")
+    model_config = ConfigDict(strict=False, extra="allow", frozen=True)
 
     type: KVConnectorType = Field(
         default=KVConnectorType.null,
@@ -128,12 +128,12 @@ class KVConnectorConfig(ConfigFileModel):
         default=None,
         description=(
             "Maximum host memory (GiB) for KV cache offloading, used by the "
-            "tiered connectors. When unset, sized to hold twice the device "
+            "tiered connectors. When unset, sized to hold 1.5 times the device "
             "page pool."
         ),
     )
     """Maximum host memory in GiB for KV cache offloading. ``None`` sizes it to
-    twice the device page pool."""
+    1.5 times the device page pool."""
 
     disk_offload_dir: str | None = Field(
         default=None,
@@ -146,13 +146,21 @@ class KVConnectorConfig(ConfigFileModel):
 
     disk_offload_max_gb: float | None = Field(
         default=None,
+        ge=0,
         description=(
             "Maximum disk space (GiB) for KV cache offloading. When unset, "
-            "sized to hold three times the device page pool."
+            "sized to hold twice the device page pool. 0 drops the disk tier, "
+            "leaving a host-only connector."
         ),
     )
-    """Maximum disk space in GiB for KV cache offloading. ``None`` sizes it to
-    three times the device page pool."""
+    """Maximum disk space in GiB for KV cache offloading.
+
+    ``None`` sizes it to twice the device page pool. ``0`` builds the connector
+    with no disk last level: nothing is written to disk and no offload
+    directory is created. 0 cannot mean "unlimited" here, because the disk tier
+    derives its block capacity from this budget -- a 0 that still opened a disk
+    tier would disable eviction and grow without bound.
+    """
 
     num_disk_workers: int = Field(
         default=32,
@@ -175,16 +183,16 @@ class KVConnectorConfig(ConfigFileModel):
     )
     """Endpoint for the co-located dKV service.
 
-    Remote dKV endpoints are discovered at runtime through the
-    Orchestrator (via ``external_block_metadata`` on the request
-    context), not configured statically. For multi-store reads, the
-    discovered metadata must include MAX-native transfer-engine metadata so
-    the connector can reuse ``KVTransferEngine.connect()``.
+    Remote dKV endpoints are discovered at runtime from the Orchestrator's
+    per-request ``dkv_cache_hint``, not configured statically. The connector
+    parses the hint in Rust and dials each named instance itself.
     """
 
 
 class KVCacheConfig(ConfigFileModel):
     """Configuration for the paged KV cache."""
+
+    model_config = ConfigDict(frozen=True)
 
     kv_cache_page_size: int = Field(
         default=128,
@@ -239,18 +247,6 @@ class KVCacheConfig(ConfigFileModel):
     )
     """The fraction of available device memory the process should consume."""
 
-    allow_kv_head_replication: bool = Field(
-        default=False,
-        description=(
-            "Allow TP wider than the KV head count by replicating each KV head "
-            "across a group of devices. Used as the default for "
-            "to_params(allow_kv_head_replication=...) so it reaches base-class "
-            "paths that don't thread the flag. Only for architectures whose "
-            "attention shards K/V projections to match."
-        ),
-    )
-    """Default for :meth:`to_params`'s ``allow_kv_head_replication`` argument."""
-
     kv_cache_format: str | None = Field(
         default=None,
         description=(
@@ -259,6 +255,20 @@ class KVCacheConfig(ConfigFileModel):
         ),
     )
     """An override for the default data type of the KV cache."""
+
+    indexer_kv_cache_format: str | None = Field(
+        default=None,
+        description=(
+            "Override the MiniMax sparse-indexer (IndexK) cache dtype, "
+            "independent of ``kv_cache_format``. "
+            "Supported values: ``bfloat16``, ``float8_e4m3fn``. "
+            "``None`` (default) keeps IndexK in bfloat16 so "
+            "``--kv-cache-format=float8_e4m3fn`` still means main GQA FP8 "
+            "plus indexer BF16. Ignored by architectures without an "
+            "indexer cache. FP8 IndexK is scale-free and AMD-only."
+        ),
+    )
+    """Independent IndexK cache dtype for MiniMax sparse attention."""
 
     state_pool_dtype: str | None = Field(
         default=None,
@@ -274,6 +284,7 @@ class KVCacheConfig(ConfigFileModel):
         ),
     )
     """An override for the storage dtype of recurrent (SSM) state pools."""
+
     kv_cache_hash_algo: KVHashAlgo = Field(
         default="ahash64",
         description=(
@@ -316,7 +327,7 @@ class KVCacheConfig(ConfigFileModel):
         kvcache_quant_config: KVCacheQuantizationConfig | None = None,
         speculative_method: SpeculativeMethod | None = None,
         num_draft_tokens: int = 0,
-        allow_kv_head_replication: bool | None = None,
+        allow_kv_head_replication: bool = False,
         page_size: int | None = None,
         window_size: int | None = None,
     ) -> KVCacheParams:
@@ -343,9 +354,10 @@ class KVCacheConfig(ConfigFileModel):
                 ``None`` when speculative decoding is disabled.
             num_draft_tokens: Total draft tokens generated per
                 speculative iteration. Zero when no speculative decoding.
-            allow_kv_head_replication: Replicate KV heads for TP wider than the
-                KV head count. Defaults to ``None`` (falls back to the config's
-                :attr:`allow_kv_head_replication`).
+            allow_kv_head_replication: Replicate KV heads for TP wider than
+                the KV head count. An architecture fact: implementations of
+                ``construct_kv_params`` pass it for the head layouts that
+                need it.
             page_size: Tokens per KV cache page. Defaults to ``None`` (falls
                 back to the config's :attr:`kv_cache_page_size`). Architectures
                 with a kernel-imposed minimum page size pass their effective
@@ -355,8 +367,6 @@ class KVCacheConfig(ConfigFileModel):
         Returns:
             The constructed KV cache parameters.
         """
-        if allow_kv_head_replication is None:
-            allow_kv_head_replication = self.allow_kv_head_replication
         kv_hash_seed = resolve_kv_hash_seed(
             self.kv_cache_hash_algo, self.kv_cache_hash_seed
         )

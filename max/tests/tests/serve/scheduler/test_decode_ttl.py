@@ -46,6 +46,8 @@ def _make_self(
         transfer_engine=MagicMock(),
         response_queue=MagicMock(),
         dispatcher=MagicMock(),
+        batch_constructor=MagicMock(),
+        _handoff_landed_at={},
     )
     # Bind the real instance method so the cancel-to-prefill path runs.
     self_obj._send_cancel_to_prefill = (
@@ -60,6 +62,12 @@ def _ctx(
     return SimpleNamespace(request_id=req_id, target_endpoint=target_endpoint)
 
 
+def _completed_onload() -> MagicMock:
+    onload_event = MagicMock()
+    onload_event.is_complete.return_value = True
+    return onload_event
+
+
 def _awaiting_prefill(
     req_id: str, replica_idx: int, phase_entered_at: float
 ) -> PendingDecodeRequest:
@@ -67,6 +75,7 @@ def _awaiting_prefill(
         context=_ctx(req_id),  # type: ignore[arg-type]
         replica_idx=replica_idx,
         phase=DecodeRequestPhase.AWAITING_PREFILL,
+        onload_event=_completed_onload(),
         phase_entered_at=phase_entered_at,
     )
 
@@ -82,6 +91,7 @@ def _transferring(
         context=_ctx(req_id),  # type: ignore[arg-type]
         replica_idx=replica_idx,
         phase=DecodeRequestPhase.TRANSFERRING,
+        onload_event=_completed_onload(),
         phase_entered_at=phase_entered_at,
         transfer=MagicMock(),
         cancelled=cancelled,

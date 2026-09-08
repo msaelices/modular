@@ -16,6 +16,7 @@ from std.collections.string.string_span import get_static_string
 from std.math import align_down, ceildiv, iota
 from std.sys import align_of, bit_width_of, simd_width_of, size_of
 from std.sys.info import CompilationTarget, _current_target, is_apple_gpu
+from std.utils.numerics import neg_inf
 
 from max.algorithm import elementwise, sync_parallelize, unsafe_parallel_memcpy
 from std.algorithm.functional import tile
@@ -25,7 +26,7 @@ from max.gpu.host.info import is_cpu, is_gpu
 from layout import (
     Coord,
     Idx,
-    PointerStorage,
+    DefaultEngine,
     TileTensor,
     UNKNOWN_VALUE,
     coord_to_index_list,
@@ -41,13 +42,8 @@ from std.collections import OptionalReg
 
 
 @always_inline
-def _unsafe_normalize_neg_index(idx: Int, dim_size: Int) -> Int:
-    return idx + dim_size if idx < 0 else idx
-
-
-@always_inline
 def _unsafe_normalize_neg_index[
-    dtype: DType, width: SIMDLength, out_type: DType = DType.int
+    dtype: DType, width: SIMDLength, out_type: DType = .int
 ](idx: SIMD[dtype, width], dim_size: Int) -> SIMD[out_type, width]:
     return idx.lt(0).select(
         idx.cast[out_type]() + Scalar[out_type](dim_size),
@@ -56,24 +52,8 @@ def _unsafe_normalize_neg_index[
 
 
 @always_inline
-def normalize_neg_index(idx: Int, dim_size: Int) raises -> Int:
-    """Indices passed to gather and scatter ops may be negative. This performs
-    a normalization so that they can be used to index into a buffer.
-
-    Returns val + dim if val < 0 else val
-
-    Raises:
-        If the index is out of range [-dim_size, dim_size).
-    """
-    if -dim_size <= idx < dim_size:
-        return _unsafe_normalize_neg_index(idx, dim_size)
-
-    raise Error("indices must be in range [-dim_size, dim_size)")
-
-
-@always_inline
 def normalize_neg_index[
-    dtype: DType, width: SIMDLength, out_type: DType = DType.int
+    dtype: DType, width: SIMDLength, out_type: DType = .int
 ](idx: SIMD[dtype, width], dim_size: Int) raises -> SIMD[out_type, width]:
     """Indices passed to gather and scatter ops may be negative. This performs
     a normalization so that they can be used to index into a buffer.
@@ -147,7 +127,7 @@ def gather_reduce[
 ](
     output: TileTensor[mut=True, dtype, ...],
     input: TileTensor[mut=False, dtype, ...],
-    indices: TileTensor[mut=False, DType.int32, ...],
+    indices: TileTensor[mut=False, .int32, ...],
     reduce_init: Scalar[dtype],
     ctx: Optional[DeviceContext] = None,
 ):
@@ -216,7 +196,7 @@ def gather_reduce[
     var output_bind = TileTensor(output.ptr, row_major(Coord(output_2d_dims)))
     var input_bind = TileTensor(
         input.ptr,
-        input.layout.make_dynamic[DType.int64](),
+        input.layout.make_dynamic[.int64](),
     )
 
     var gather_axis_size = Int(input.dim(gather_axis))
@@ -358,7 +338,7 @@ def gather[
 
     comptime prefetch_offset = 12  # TODO: search
 
-    var end_indices_ptr = indices.ptr + indices.num_elements()
+    var end_indices_ptr = indices.ptr.unsafe_offset(indices.num_elements())
 
     @__parameter
     @__copy_capture(end_indices_ptr)
@@ -378,25 +358,25 @@ def gather[
         comptime assert input_coords.flat_rank == input.flat_rank
 
         # `ptr_at_offset` (the software index-prefetch below) is only defined
-        # for `PointerStorage`-backed tiles; skip the prefetch hint for other
-        # storages (e.g. `DevicePointerStorage`). Correctness is unaffected.
+        # for `DefaultEngine`-backed tiles; skip the prefetch hint for other
+        # storages (e.g. `DevicePointerEngine`). Correctness is unaffected.
         comptime if (
             prefetch_offset > 0
-            and indices.Storage == PointerStorage[element_width=1]
-            and input.Storage == PointerStorage[element_width=1]
+            and indices.Engine == DefaultEngine[element_width=1]
+            and input.Engine == DefaultEngine[element_width=1]
         ):
             var indices_ptr = indices.ptr_at_offset(indices_coords)
             var indices_remaining = (
                 Int(end_indices_ptr) - Int(indices_ptr)
             ) // size_of[indices_type]()
             # assumes that indices are laid out in row major order
-            var next_idx_ptr = indices_ptr + min(
-                indices_remaining - 1, prefetch_offset
+            var next_idx_ptr = indices_ptr.unsafe_offset(
+                min(indices_remaining - 1, prefetch_offset)
             )
             input_coords[axis] = rebind[input_coords.element_types[axis]](
                 Int64(
                     _unsafe_normalize_neg_index(
-                        next_idx_ptr.load(),
+                        next_idx_ptr.unsafe_load(),
                         Int(input.dim[axis]()),
                     )
                 )
@@ -529,7 +509,7 @@ def gather_elementwise_fn_wrapper[
     indices_shape: IndexList,
     output_shape: IndexList,
     coords: IndexList,
-    error_index_ptr: OptionalReg[UnsafePointer[Int, MutAnyOrigin]] = None,
+    error_index_ptr: OptionalReg[MutPointer[Int, MutAnyOrigin]] = None,
 ):
     """Performs a single elementwise gather step for one output coordinate.
 
@@ -714,12 +694,10 @@ def gather[
 
         # Create an error reporting location since we cannot raise from an elementwise lambda.
         var error_index: Int = -1
-        var error_index_ptr = OptionalReg[UnsafePointer[Int, MutAnyOrigin]](
-            None
-        )
+        var error_index_ptr = OptionalReg[MutPointer[Int, MutAnyOrigin]](None)
         comptime if is_cpu[target]():
-            error_index_ptr = OptionalReg[UnsafePointer[Int, MutAnyOrigin]](
-                UnsafePointer[Int, MutAnyOrigin](to=error_index)
+            error_index_ptr = OptionalReg[MutPointer[Int, MutAnyOrigin]](
+                MutPointer[Int, MutAnyOrigin](to=error_index)
             )
 
         @always_inline
@@ -820,7 +798,7 @@ def _atomic_reduce[
     reduction_fn: def[dtype: DType, width: SIMDLength](
         SIMD[dtype, width], SIMD[dtype, width]
     ) thin -> SIMD[dtype, width],
-](ptr: UnsafePointer[mut=True, Scalar[dtype], ...], update: Scalar[dtype]):
+](ptr: MutPointer[Scalar[dtype], ...], update: Scalar[dtype]):
     """Applies `ptr[] = reduction_fn(ptr[], update)` atomically.
 
     Scatter reductions may receive duplicate index vectors, in which case
@@ -863,18 +841,10 @@ def scatter_nd_generator[
     *,
     _trace_description: StaticString = "scatter_nd",
 ](
-    data: TileTensor[
-        mut=False, output_type, address_space=AddressSpace.GENERIC, ...
-    ],
-    indices: TileTensor[
-        mut=False, indices_type, address_space=AddressSpace.GENERIC, ...
-    ],
-    updates: TileTensor[
-        mut=False, output_type, address_space=AddressSpace.GENERIC, ...
-    ],
-    output: TileTensor[
-        mut=True, output_type, address_space=AddressSpace.GENERIC, ...
-    ],
+    data: TileTensor[mut=False, output_type, address_space=.GENERIC, ...],
+    indices: TileTensor[mut=False, indices_type, address_space=.GENERIC, ...],
+    updates: TileTensor[mut=False, output_type, address_space=.GENERIC, ...],
+    output: TileTensor[mut=True, output_type, address_space=.GENERIC, ...],
     context: DeviceContext,
 ) raises:
     """
@@ -1069,7 +1039,7 @@ def scatter_nd_generator[
             comptime if reduce_fn:
                 for i in range(count_copy):
                     _atomic_reduce[reduce_fn.value()](
-                        output_flat.ptr + (output_offset + i),
+                        output_flat.ptr.unsafe_offset(output_offset + i),
                         updates_flat.load[width=1](Coord(updates_offset + i)),
                     )
 
@@ -1150,7 +1120,9 @@ def scatter_nd_generator[
             comptime if reduce_fn:
                 comptime for lane in range(simd_width):
                     _atomic_reduce[reduce_fn.value()](
-                        output_flat.ptr + (output_base + elem + lane),
+                        output_flat.ptr.unsafe_offset(
+                            output_base + elem + lane
+                        ),
                         update_vec[lane],
                     )
             else:
@@ -1236,18 +1208,10 @@ def scatter_nd[
     //,
     target: StaticString = "cpu",
 ](
-    data: TileTensor[
-        mut=False, output_type, address_space=AddressSpace.GENERIC, ...
-    ],
-    indices: TileTensor[
-        mut=False, indices_type, address_space=AddressSpace.GENERIC, ...
-    ],
-    updates: TileTensor[
-        mut=False, output_type, address_space=AddressSpace.GENERIC, ...
-    ],
-    output: TileTensor[
-        mut=True, output_type, address_space=AddressSpace.GENERIC, ...
-    ],
+    data: TileTensor[mut=False, output_type, address_space=.GENERIC, ...],
+    indices: TileTensor[mut=False, indices_type, address_space=.GENERIC, ...],
+    updates: TileTensor[mut=False, output_type, address_space=.GENERIC, ...],
+    output: TileTensor[mut=True, output_type, address_space=.GENERIC, ...],
     context: DeviceContext,
 ) raises:
     """Scatter_nd operation without any reduction.
@@ -1440,7 +1404,7 @@ def scatter_elements[
         ctx: Device context for execution.
     """
     comptime assert (
-        indices_type == DType.int32 or indices_type == DType.int64
+        indices_type == .int32 or indices_type == .int64
     ), "indices in scatter_elements must be int32 or int64"
 
     if input.shape() != output.shape():
@@ -1485,7 +1449,7 @@ def scatter_elements[
                     Int(output_tt.dynamic_stride(i)) * output_coords[i]
                 )
             _atomic_reduce[reduce_fn.value()](
-                output.unsafe_ptr() + output_offset, update_val
+                output.unsafe_ptr().unsafe_offset(output_offset), update_val
             )
         else:
             output.to_tile_tensor()[Coord(output_coords)] = update_val
@@ -1580,7 +1544,7 @@ def gather_elements[
         ctx: Device context for execution.
     """
     comptime assert (
-        indices_type == DType.int32 or indices_type == DType.int64
+        indices_type == .int32 or indices_type == .int64
     ), "indices in gather_elements must be int32 or int64"
 
     if rebind[IndexList[input.rank]](
@@ -1898,7 +1862,7 @@ def apply_packed_bitmask[
 ](
     output: TileTensor[mut=True, dtype, ...],
     logits: TileTensor[dtype, ...],
-    packed: TileTensor[DType.int32, ...],
+    packed: TileTensor[.int32, ...],
     fill_value: Scalar[dtype],
     ctx: DeviceContext,
 ) raises:
@@ -1910,6 +1874,14 @@ def apply_packed_bitmask[
     is set, otherwise `output[b, v]` is set to `fill_value` (the masked-out
     sentinel, e.g. a large negative number). This replaces a CPU unpack +
     `ops.where` in constrained decoding.
+
+    A position the model itself excluded with `-inf` stays `-inf` rather than
+    taking `fill_value`. Callers pass a finite `fill_value` so that a row the
+    grammar masks entirely degrades to a uniform draw instead of NaN, and
+    writing it over a model-excluded position would make that position
+    sampleable again. Since a grammar may only ever remove candidates, never
+    add them back, carrying `-inf` through is the mask's correct semantics.
+    A row cannot become entirely `-inf` this way, so the NaN guarantee holds.
 
     Parameters:
         dtype: Element type of `logits`, `output`, and `fill_value`.
@@ -1941,20 +1913,22 @@ def apply_packed_bitmask[
         ), "apply_packed_bitmask: simd_width must be <= 32"
         var b = Int(idx[0].value())
         var v = Int(idx[1].value())
-        var tok = Int32(v) + iota[DType.int32, width]()
+        var tok = Int32(v) + iota[.int32, width]()
         var base = v >> 5
-        var w0 = SIMD[DType.int32, width](packed[b, base][0])
+        var w0 = SIMD[.int32, width](packed[b, base][0])
         # Second word only feeds the spilled lanes; clamp the index so the
         # no-spill case never loads out of bounds.
         var last_word = Int(packed.dim[1]()) - 1
-        var w1 = SIMD[DType.int32, width](
-            packed[b, min(base + 1, last_word)][0]
-        )
+        var w1 = SIMD[.int32, width](packed[b, min(base + 1, last_word)][0])
         var word = (tok >> 5).ne(Int32(base)).select(w1, w0)
         var keep = ((word >> (tok & 31)) & 1).ne(0)
         var values = logits.load[width=width]((b, v))
         var filled = SIMD[dtype, width](fill_value)
-        output.store((b, v), keep.select(values, filled))
+        comptime if dtype.is_floating_point():
+            var excluded = values.eq(neg_inf[dtype]())
+            output.store((b, v), (keep | excluded).select(values, filled))
+        else:
+            output.store((b, v), keep.select(values, filled))
 
     comptime simd_width = simd_width_of[dtype]()
     var dispatch_shape = Coord(Int(output.dim[0]()), Int(output.dim[1]()))

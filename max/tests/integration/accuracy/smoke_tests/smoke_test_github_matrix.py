@@ -29,7 +29,6 @@ RUNNERS = {
     "4xMI355": "modrunner-mi355-4x",
     "8xB200": "modrunner-b200-efa-8x",
     "8xMI355": "modrunner-mi355-8x",
-    "8xB200_internal": "modrunner-prod-2-b200-8x",
 }
 
 # Framework → GPUs that framework cannot run on.
@@ -39,13 +38,12 @@ HW_EX = {
 }
 
 # Tags: skip model on multi-GPU runners.
-XL = {"8xB200", "4xMI355", "8xMI355", "8xB200_internal"}
+XL = {"8xB200", "4xMI355", "8xMI355"}
 MULTI = {"2xB200", "2xMI355"} | XL
-NON_XL = (set(RUNNERS) - XL) | {"8xB200_internal"}
+NON_XL = set(RUNNERS) - XL
 DISABLE = set(RUNNERS)
-# Runs only on the dedicated internal 8xB200 runner; everything else excluded.
-INTERNAL_ONLY = set(RUNNERS) - {"8xB200_internal"}
 B200_2X_ONLY = set(RUNNERS) - {"2xB200"}
+B200_8X_ONLY = set(RUNNERS) - {"8xB200"}
 # The AMD members of XL. A B200-only model excludes the whole set rather than
 # naming one runner, so adding the next AMD runner is a change here and not a
 # sweep over every entry that forgot to mention it.
@@ -96,7 +94,10 @@ HF_MODELS: Mapping[str, set[str]] = {
     # the AMD 8x runner, hence the literal 4xMI355 where its neighbours use
     # AMD_XL. max-ci exercises the private M3 arch; sglang serves the HF
     # checkpoint as a reference. vLLM and released MAX are excluded.
-    "MiniMaxAI/MiniMax-M3-MXFP8": NON_XL | {"4xMI355", "max", "vllm"},
+    # 8xB200 serves the production MTP recipe, which is the __mtp alias below;
+    # sglang still runs the plain checkpoint there as the reference.
+    "MiniMaxAI/MiniMax-M3-MXFP8": NON_XL
+    | {"4xMI355", "max", "vllm", "max-ci@8xB200"},
     "modularai/MiniMax-M3-MXFP6": NON_XL | {"8xB200", "max"},
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": MULTI | {"vllm"},
     "modularai/Llama-3.1-405B-Instruct-autofp8": NON_XL | {"8xMI355", "max"},
@@ -124,7 +125,6 @@ CUSTOM_MODELS: Mapping[str, set[str]] = {
     "microsoft/Phi-3.5-mini-instruct__modulev3": MULTI,
     "microsoft/phi-4__modulev3": MULTI,
     "deepseek-ai/DeepSeek-V2-Lite-Chat__modulev3": MULTI,
-    "deepseek-ai/DeepSeek-V3.1-Terminus__modulev3": NON_XL | AMD_XL,
     "nvidia/DeepSeek-V3.1-NVFP4__fp8kv": NON_XL | AMD_XL,
     "nvidia/DeepSeek-V3.1-NVFP4__tpep": NON_XL | AMD_XL,
     "nvidia/DeepSeek-V3.1-NVFP4__tpep_ar": NON_XL | AMD_XL,
@@ -134,6 +134,9 @@ CUSTOM_MODELS: Mapping[str, set[str]] = {
     "meta-llama/Llama-3.1-8B-Instruct__dflash": MULTI,
     "nvidia/DeepSeek-V3.1-NVFP4__mtp": NON_XL | AMD_XL,
     "nvidia/DeepSeek-V3.1-NVFP4__mtp_tpep": NON_XL | AMD_XL,
+    # The experimental_device_graph_synthesis flag is not in a released MAX yet, so
+    # max-ci only. Synthesis is single-device (first cut), hence MULTI.
+    "google/gemma-4-12B-it__device_graph_synthesis": MULTI | {"max"},
     # DSpark arch is not in a released MAX yet, so max-ci only.
     "google/gemma-4-12B-it__dspark": MULTI | {"max"},
     # Tuned recipes use an FP8 KV cache that does not support MI355.
@@ -141,15 +144,62 @@ CUSTOM_MODELS: Mapping[str, set[str]] = {
     "google/gemma-4-31B-it__tuned": MULTI | {"MI355"},
     "nvidia/Gemma-4-26B-A4B-NVFP4__tuned": MULTI | {"MI355"},
     "nvidia/Gemma-4-31B-IT-NVFP4__tuned": MULTI | {"MI355"},
+    "nvidia/Kimi-K2.7-Code-NVFP4__modulev3": NON_XL | AMD_XL,
     "meta-llama/Llama-3.1-8B-Instruct__rust_tiered_kvconnector": MULTI | {"MI355"},
     "nvidia/GLM-5.2-NVFP4__mtp_tpep": NON_XL | AMD_XL,
-    # Jenga requires data_parallel_degree=1 and doesn't support KVConnector /
-    # disaggregated serving yet, so it can't run on multi-GPU runners.
-    "google/gemma-4-31B-it__jenga": MULTI,
+    "RadixArk/GLM-5.3-NVFP4__mtp_tpep": NON_XL | AMD_XL,
+    "thinkingmachines/Inkling-Small-NVFP4__mtp": B200_2X_ONLY,
+    "MiniMaxAI/MiniMax-M3-MXFP8__mtp": B200_8X_ONLY | {"max"},
 }
+
+# Aliases whose recipe ships with a private arch, so it cannot appear in
+# MODEL_RECIPES: the private entrypoint resolves it from its own hw_recipes
+# table instead.
+PRIVATE_RECIPE_MODELS = frozenset({"MiniMaxAI/MiniMax-M3-MXFP8__mtp"})
 
 MODELS: Mapping[str, set[str]] = {**HF_MODELS, **CUSTOM_MODELS}
 # fmt: on
+
+NIGHTLY_MODELS = frozenset(
+    {
+        "google/diffusiongemma-26B-A4B-it",
+        "google/gemma-4-12B-it__dspark",
+        "google/gemma-4-26B-A4B-it",
+        "google/gemma-4-26B-A4B-it__tuned",
+        "google/gemma-4-31B-it",
+        "google/gemma-4-31B-it__tuned",
+        "nvidia/Gemma-4-26B-A4B-NVFP4",
+        "nvidia/Gemma-4-26B-A4B-NVFP4__tuned",
+        "nvidia/Gemma-4-31B-IT-NVFP4",
+        "nvidia/Gemma-4-31B-IT-NVFP4__tuned",
+        "nvidia/diffusiongemma-26B-A4B-it-NVFP4",
+        "MiniMaxAI/MiniMax-M3-MXFP8",
+        "MiniMaxAI/MiniMax-M3-MXFP8__mtp",
+        "amd/MiniMax-M3-MXFP4",
+        "modularai/MiniMax-M3-MXFP6",
+        "nvidia/GLM-5.2-NVFP4__mtp_tpep",
+        "amd/Kimi-K2.7-Code-MXFP4",
+        "nvidia/Kimi-K2.7-Code-NVFP4",
+        "thinkingmachines/Inkling-Small-NVFP4__mtp",
+    }
+)
+
+TIERS = ("nightly", "all")
+
+
+def tier_models(tier: str) -> list[str]:
+    """Lists the models a tier schedules, before framework/GPU exclusions.
+
+    Args:
+        tier: Either ``"nightly"`` for the deployed families or ``"all"`` for
+            every entry in ``MODELS``.
+
+    Returns:
+        The model keys the tier covers.
+    """
+    if tier == "all":
+        return list(MODELS)
+    return [model for model in MODELS if model in NIGHTLY_MODELS]
 
 
 def excluded(framework: str, gpu: str, model: str) -> bool:
@@ -182,6 +232,13 @@ def parse_override(raw: str | None) -> list[str]:
     default=None,
     help="Comma list of models; skips exclusions.",
 )
+@click.option(
+    "--tier",
+    type=click.Choice(TIERS),
+    default="all",
+    show_default=True,
+    help="Model set: 'nightly' for the deployed families, 'all' for every model.",
+)
 @click.option("--run-on-b200", is_flag=True)
 @click.option("--run-on-mi355", is_flag=True)
 @click.option("--run-on-2xb200", is_flag=True)
@@ -189,10 +246,10 @@ def parse_override(raw: str | None) -> list[str]:
 @click.option("--run-on-4xmi355", is_flag=True)
 @click.option("--run-on-8xb200", is_flag=True)
 @click.option("--run-on-8xmi355", is_flag=True)
-@click.option("--run-on-8xb200-internal", is_flag=True)
 def main(
     framework: str,
     models_override: str | None,
+    tier: str,
     run_on_b200: bool,
     run_on_mi355: bool,
     run_on_2xb200: bool,
@@ -200,7 +257,6 @@ def main(
     run_on_4xmi355: bool,
     run_on_8xb200: bool,
     run_on_8xmi355: bool,
-    run_on_8xb200_internal: bool,
 ) -> None:
     flags = {
         "B200": run_on_b200,
@@ -210,10 +266,9 @@ def main(
         "4xMI355": run_on_4xmi355,
         "8xB200": run_on_8xb200,
         "8xMI355": run_on_8xmi355,
-        "8xB200_internal": run_on_8xb200_internal,
     }
     gpus = [gpu for gpu, ok in flags.items() if ok]
-    models = parse_override(models_override) or list(MODELS)
+    models = parse_override(models_override) or tier_models(tier)
     ignore_exclusions = models_override is not None
 
     job = []

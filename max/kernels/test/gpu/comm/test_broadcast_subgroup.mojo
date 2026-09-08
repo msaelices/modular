@@ -68,9 +68,13 @@ def broadcast_subgroup_test[
 
     var in_tile = TileTensor(input_dev, row_major(length)).as_immut()
 
-    var signal_buffers = List[DeviceBuffer[DType.uint8]](capacity=ngpus)
-    var rank_sigs = Array[UnsafePointer[Signal, MutAnyOrigin], MAX_GPUS](
-        uninitialized=True
+    var signal_buffers = List[DeviceBuffer[.uint8]](capacity=ngpus)
+    # Production leaves the slots past the group size uninitialized; poison
+    # them so an out-of-group read faults deterministically.
+    var rank_sigs = Array[_, MAX_GPUS](
+        fill=MutPointer[Signal, MutAnyOrigin](
+            unsafe_from_address=0xDEAD_BEEF_0000
+        )
     )
     for i in range(ngpus):
         var ctx = list_of_ctxs[i]
@@ -83,16 +87,9 @@ def broadcast_subgroup_test[
     var num_bytes = length * size_of[dtype]()
     var signal_buf_size = size_of[Signal]() + ceildiv(num_bytes, ngpus)
 
-    # Production leaves the slots past the group size uninitialized; poison
-    # them so an out-of-group read faults deterministically.
-    for i in range(MAX_GPUS):
-        rank_sigs[i] = UnsafePointer[Signal, MutAnyOrigin](
-            unsafe_from_address=0xDEAD_BEEF_0000
-        )
-
     for i in range(ngpus):
         signal_buffers.append(
-            list_of_ctxs[i].create_buffer_sync[DType.uint8](signal_buf_size)
+            list_of_ctxs[i].create_buffer_sync[.uint8](signal_buf_size)
         )
         init_signal_buffer(signal_buffers[i], list_of_ctxs[i])
         rank_sigs[i] = (

@@ -593,6 +593,48 @@ class TextBatchConstructor:
         )
         return replica_idx
 
+    @property
+    def structured_output_enabled(self) -> bool:
+        """Whether constrained decoding can fire at all for this process:
+        ``--enable-structured-output`` (user-supplied JSON schemas) or
+        ``--enable-tool-call-constrained-decode`` with a grammar-capable
+        tool parser (server-generated tool-call grammars).
+
+        Mirrors ``PipelineConfig.needs_bitmask_constraints`` -- the same
+        signal that gates whether the bitmask-aware sampler graph and
+        pinned D2H buffer were even compiled/allocated for this process.
+        """
+        pipeline_config = getattr(self.pipeline, "pipeline_config", None)
+        return (
+            pipeline_config is not None
+            and pipeline_config.needs_bitmask_constraints
+        )
+
+    def submit_grammar_build(self, ctx: TextContext) -> None:
+        """Starts a request's off-thread grammar-matcher build, if needed.
+
+        Exposed so a caller admitting a request before it ever reaches
+        ``enqueue_new_request`` (DI's decode scheduler, at initial
+        admission) can overlap the build with prefill's round trip instead
+        of stacking it sequentially onto TTFT. ``AsyncGrammarGate.submit``
+        is idempotent, so ``enqueue_new_request``'s own submit call later is
+        a no-op re-check, not a duplicate compile.
+        """
+        if self._grammar_gate is not None:
+            self._grammar_gate.submit(ctx)
+
+    def release_grammar_build(self, request_id: RequestID) -> None:
+        """Drops a request's outstanding grammar build, if any.
+
+        Exposed for callers that remove a request before it ever reaches
+        ``enqueue_new_request``/``release_request`` (DI's decode scheduler,
+        on cancellation, TTL eviction, or prefill rejection) but may have
+        already started its build via ``submit_grammar_build``. Safe to call
+        unconditionally: a no-op when nothing was submitted.
+        """
+        if self._grammar_gate is not None:
+            self._grammar_gate.release(request_id)
+
     def enqueue_new_request(
         self, ctx: TextContext, replica_idx: int | None = None
     ) -> None:
@@ -614,7 +656,7 @@ class TextBatchConstructor:
                 return
             error = self._grammar_gate.install_ready(ctx)
             if error is not None:
-                self._fail_grammar_request(ctx.request_id, error)
+                self._fail_grammar_request(ctx, error)
                 return
 
         self._admit_request(ctx, replica_idx)
@@ -769,17 +811,20 @@ class TextBatchConstructor:
             if error is None:
                 self._admit_request(pending.ctx, pending.replica_idx)
             else:
-                self._fail_grammar_request(req_id, error)
+                self._fail_grammar_request(pending.ctx, error)
 
-    def _fail_grammar_request(self, request_id: RequestID, error: str) -> None:
+    def _fail_grammar_request(self, ctx: TextContext, error: str) -> None:
         """Fails a request whose grammar build errored, without admitting it.
 
         Nothing was claimed for the request (it was never bound), so only the
         pipeline needs releasing; the owning scheduler drains
         :meth:`take_grammar_failed` to terminate it client-side.
         """
-        self.pipeline.release(request_id)
-        self._grammar_failed.append((request_id, error))
+        METRICS.structured_output_grammar_rejection(
+            "tool_grammar" if ctx.grammar else "json_schema"
+        )
+        self.pipeline.release(ctx.request_id)
+        self._grammar_failed.append((ctx.request_id, error))
 
     def take_grammar_failed(self) -> list[tuple[RequestID, str]]:
         """Returns and clears requests failed by the grammar gate."""
@@ -1023,6 +1068,25 @@ class TextBatchConstructor:
             return self._get_inflight_kv_transfer_count(replica_idx) > 0
         return False
 
+    def _preempt_ce_block_holder(self, replica_idx: int) -> bool:
+        """Preempts the newest queued CE request that still holds KV blocks.
+
+        Two kinds of requests sit in ce_reqs with blocks for KV they already
+        hold: a chunked prefill between chunks (advance_requests requeues it
+        without releasing), and a cordoned request whose onload completed
+        (_readmit_completed_onloads returns it with its onloaded blocks).
+        """
+        replica_requests = self.replicas[replica_idx]
+        for ctx in reversed(list(replica_requests.ce_reqs.values())):
+            if self.kv_cache.contains(ctx) and self.kv_cache.get_req_blocks(
+                ctx
+            ):
+                self._preempt_request(
+                    ctx, replica_idx, reason=PreemptionReason.KV_CACHE_MEMORY
+                )
+                return True
+        return False
+
     def _is_insufficient_blocks_fatal(
         self, replica_idx: int, no_other_work: bool
     ) -> bool:
@@ -1179,6 +1243,12 @@ class TextBatchConstructor:
                     break
                 except InsufficientBlocksError as e:
                     if len(candidate_ids) == 0:
+                        # No TG candidates left, but a request parked in
+                        # ce_reqs (a chunked prefill between chunks, or a
+                        # readmitted onload) may still hold reclaimable
+                        # blocks.
+                        if self._preempt_ce_block_holder(replica_idx):
+                            continue
                         # Only a genuine OOM is fatal: nothing left to
                         # preempt, an empty batch, and the deficit can't be
                         # covered by anything in flight.
@@ -1272,6 +1342,19 @@ class TextBatchConstructor:
 
                 if len(batch) == 0 and priority_override is None:
                     self._add_tg_requests(batch, replica_idx)
+                else:
+                    # This iteration is CE-only: the TG fallback above didn't
+                    # fire, so any pending TG requests get zero progress this
+                    # iteration (see _add_tg_requests, only reached from the
+                    # branch above). Pair with this batch's own execution
+                    # duration to estimate the TPOT cost of the stolen
+                    # iteration.
+                    pending_tg_count = len(self.replicas[replica_idx].tg_reqs)
+                    if len(batch) > 0 and pending_tg_count > 0:
+                        METRICS.di_ce_preempted_tg_iteration_count()
+                        METRICS.di_ce_preempted_tg_pending_count(
+                            pending_tg_count
+                        )
 
             case RequestType.TG:
                 self._add_tg_requests(batch, replica_idx)
