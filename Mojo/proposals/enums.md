@@ -25,12 +25,12 @@ enum Color:
     case red
     case green
     case blue
-    case rgb(r: Int, g: Int, b: Int)
+    case rgb(Int, Int, Int)
 ```
 
 A `Color` value contains exactly one of these cases at a time. The `red`,
-`green`, and `blue` cases carry no associated state, while `rgb` carries three
-integer values.
+`green`, and `blue` cases carry no associated state, while `rgb` carries a
+single payload of type `Tuple[Int, Int, Int]`.
 
 Enums should otherwise behave like normal Mojo nominal types. They may have
 methods, conform to traits, be generic, contain nested declarations, and
@@ -47,22 +47,29 @@ Here is a simple example that we’d like to support:
 
 ```mojo
 enum Result[T: Deinitable, E: Deinitable]:
-    case success(value: T)
-    case failure(error: E)
+    case success(T)
+    case failure(E)
 ```
 
 A value of type `Result[T, E]` is either a `success` containing a `T` or a
-`failure` containing an `E` , there is always exactly one active case.
+`failure` containing an `E`; there is always exactly one active case.
 
-A case may contain zero or more associated values:
+A case may carry zero or one payload. The payload is a single unlabeled type.
+As a convenience, writing several types in the case parentheses declares a
+payload of that tuple type:
 
 ```mojo
 enum Token:
     case eof
-    case identifier(value: String)
-    case integer(value: Int)
-    case source_range(start: Int, end: Int)
+    case identifier(String)
+    case integer(Int)
+    case source_range(Int, Int)  # payload type is Tuple[Int, Int]
 ```
+
+There are no keyword labels on case payloads. Tuples do not have named
+elements, so `case source_range(start: Int, end: Int)` is not part of the
+model. If named fields are needed, you may define an explicit `struct` and use
+that as the payload (then destructure with struct patterns).
 
 The associated state is part of the case itself rather than stored state common
 to the enum.
@@ -75,14 +82,14 @@ compiler:
 enum Foo:
     var timestamp: Int  # error: enums may not have additional state
 
-    case first(value: Int)
-    case second(value: String)
+    case first(Int)
+    case second(String)
 ```
 
-This can already be expressed explicitly with composition, and allowing it would
-open a raft of semantic questions for initialization, pattern matching, etc. It
-is better to start narrow an extend later: for reference, Swift and Rust never
-have supported this.
+Rationale: This can already be expressed explicitly with composition, and
+allowing it would open a raft of semantic questions for initialization, pattern
+matching, etc. It is better to start narrow an extend later: for reference,
+Swift and Rust never have supported this.
 
 ## Declaring Enum Cases
 
@@ -95,15 +102,15 @@ enum Color:
     case blue
 ```
 
-Payload-bearing cases use argument-like syntax:
+Payload-bearing cases list a single unlabeled type (or an inline tuple):
 
 ```mojo
 enum Color:
-    case rgb(r: Int, g: Int, b: Int)
+    case rgb(Int, Int, Int)  # same as rgb(Tuple[Int, Int, Int])
 ```
 
 This syntax deliberately makes a case resemble the constructor it introduces,
-specifying the keyword labels.
+without inventing a parallel labeled-parameter model for payloads.
 
 For now, each case must be declared independently, but we can allow multiple
 cases in a single line, e.g. `case red, green, blue` in the future. Requiring
@@ -116,24 +123,19 @@ Associated values may use generic types:
 ```mojo
 enum Optional[T: Fooable]:
     case none
-    case some(value: T)
+    case some(T)
 ```
 
-and cases may carry multiple values:
+and multi-element payloads are just tuples:
 
 ```mojo
 enum ParseResult[T: Fooable]:
-    case success(value: T, consumed: Int)
-    case failure(offset: Int, message: String)
+    case success(T, Int)           # Tuple[T, Int]
+    case failure(Int, String)      # Tuple[Int, String]
 ```
 
-Case parameters describe the stored state associated with that alternative. They
-are not independent fields of the enclosing enum.
-
-The initial design should avoid unnecessarily extending the function parameter
-model into cases. Features such as default arguments, variadic arguments, or
-case overloading can be considered separately if compelling use cases arise.
-Let’s stay minimal and focused.
+The payload type describes the stored state associated with that alternative.
+It is not a set of independent fields of the enclosing enum.
 
 ## Constructing Enum Values
 
@@ -147,16 +149,17 @@ var color = Color.red
 ```
 
 Payload-bearing cases are constructed using call syntax (this is just invoking
-a synthesized static method):
+a synthesized static method). Arguments are positional, matching the unlabeled
+payload type:
 
 ```mojo
-var color = Color.rgb(r=255, g=128, b=0)
+var color = Color.rgb(255, 128, 0)
 ```
 
 Similarly:
 
 ```mojo
-var result = Result[Int, Error].success(value=42)
+var result = Result[Int, Error].success(42)
 ```
 
 Case constructors already naturally work with contextual member inference,
@@ -171,7 +174,7 @@ setBrushColor(.red)
 and:
 
 ```mojo
-setBrushColor(.rgb(r=255, g=0, b=0))
+setBrushColor(.rgb(255, 0, 0))
 ```
 
 ## Matching and destructuring cases
@@ -195,11 +198,49 @@ case .rgb(var r, var g, var b):
 ```
 
 The case pattern first tests whether the value contains the specified
-enumerator. If so, its associated-value patterns are recursively applied to the
-case's payload.
+enumerator. If so, its payload pattern is recursively applied to the case's
+single associated value. Multi-element payloads are tuples, so ordinary tuple
+patterns decompose them positionally:
 
-Case patterns are ordinary **refutable patterns**. They are not specific to the
-`match` statement and should work in the proposed `if let` syntax as well:
+```mojo
+match some_token:
+case .eof:
+    ...
+case .identifier(value):
+    ...
+case .integer(value):
+    ...
+case .source_range(start, end):
+    ...  # tuple pattern against Tuple[Int, Int]
+```
+
+Keyword labels on the payload are not allowed—there are no labeled fields to
+bind:
+
+```mojo
+case .source_range(start=x, end=y):  # error: not allowed
+```
+
+To destructure by name, store a named struct as the payload and use a struct
+pattern:
+
+```mojo
+struct SourceRange:
+    var start: Int
+    var end: Int
+
+enum Token:
+    case eof
+    case source_range(SourceRange)
+
+match some_token:
+case .source_range(SourceRange(start=x, end=y)):
+    ...
+```
+
+The case pattern's payload subpatterns are ordinary **refutable patterns**. They
+are not specific to the `match` statement and should work in the proposed
+`if let` syntax as well:
 
 ```mojo
 if var .rgb(r, g, b) = color:
@@ -229,7 +270,8 @@ From the programmer's point of view, there are two surface forms:
    active case matches the name. They introduce no payload bindings.
 2. **Case-with-payload patterns** look like a call: `Optional.Some(ref elt)`,
    `.rgb(var r, var g, var b)`. These succeed when the case matches **and**
-   each payload subpattern matches the associated state.
+   the payload subpattern(s) match the associated value. A multi-element
+   payload is one tuple value, so several subpatterns are a tuple pattern.
 
 A few rules follow from that split:
 
@@ -240,6 +282,8 @@ A few rules follow from that split:
   are used. `Optional.Some()` with empty parentheses is rejected; write
   `Optional.Some(_)` to ignore the payload, or `Optional.Some` (case-only) to
   test the discriminant without projecting it.
+- Payload patterns are positional. There are no `name=` bindings against the
+  case itself; use a struct payload when named fields are required.
 - Leading-dot forms (`.Some(ref x)`) resolve the case name against the
   subject's type, the same way contextual member lookup works for
   construction.
@@ -254,9 +298,9 @@ emitting these patterns. It asks whether the **subject type** conforms to
    searching `_enum_case_names`.
 2. Emits a predicate comparing `_get_enum_discriminant()` to that index.
 3. If the pattern has payload subpatterns, projects the active payload with
-   `_unsafe_get_enum_payload[id]()` and recursively matches each subpattern
-   against that projected value (short-circuiting so the payload is only
-   projected when the discriminant matches).
+   `_unsafe_get_enum_payload[id]()` and recursively matches the payload
+   pattern against that projected value (short-circuiting so the payload is
+   only projected when the discriminant matches).
 
 Payload bindings use the same `var` / `ref` / bare-binding rules as every
 other pattern. For example:
@@ -286,7 +330,7 @@ enum Color:
     case red
     case green
     case blue
-    case rgb(r: Int, g: Int, b: Int)
+    case rgb(Int, Int, Int)
 
     def is_grayscale(self) -> Bool:
         match self:
@@ -299,9 +343,9 @@ enum Color:
 Likewise, enums should support trait conformance:
 
 ```mojo
-enum ResultT: Movable, E: Movable:
-    case success(value: T)
-    case failure(error: E)
+enum Result[T: Movable, E: Movable](Movable):
+    case success(T)
+    case failure(E)
 ```
 
 and generic parameters and constraints should work according to the normal rules
@@ -339,7 +383,7 @@ contain. For example:
 ```mojo
 enum Optional[T: Deinitable]:
     case none
-    case some(value: T)
+    case some(T)
 ```
 
 must correctly represent the ownership semantics of `T` when the `some` case is
@@ -430,7 +474,7 @@ The runtime discriminant selects the active alternative:
 Color.red._get_enum_discriminant() == 0
 Color.green._get_enum_discriminant() == 1
 Color.blue._get_enum_discriminant() == 2
-Color.rgb(r=1, g=2, b=3)._get_enum_discriminant() == 3
+Color.rgb(1, 2, 3)._get_enum_discriminant() == 3
 ```
 
 The discriminant is a semantic case index, not necessarily a promise about the
@@ -529,7 +573,7 @@ For example:
 ```mojo
 enum Optional[T]:
     case none
-    case some(value: T)
+    case some(T)
 
     def has_value(self) -> Bool:
         if .some(_) = self:
@@ -585,7 +629,8 @@ In particular:
 - Enum instance storage comes exclusively from case-associated values.
 - Enums do not contain additional stored instance fields.
 - Cases form a closed set known to the compiler.
-- Cases may carry associated state.
+- Cases may carry a single unlabeled payload (including an inline tuple type).
+  Named payload fields require an explicit struct type.
 - Enums otherwise support normal nominal-type capabilities such as methods,
   traits, and generics.
 - The physical representation of an enum is unspecified by default. Let’s not
@@ -643,8 +688,8 @@ express this with existing language features if possible, e.g.:
 
 ```mojo
 enum LinkedListItem[T: Copyable] {
-    case endPoint(value: T)
-    case linkNode(value: T, next: HeapBox[LinkedListItem])
+    case endPoint(T)
+    case linkNode(T, HeapBox[LinkedListItem])
 }
 ```
 
