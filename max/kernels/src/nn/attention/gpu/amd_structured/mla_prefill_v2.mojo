@@ -99,7 +99,7 @@ default-True path for the FP8 KV=128 target shape, every reused
 primitive exercises the exact codegen this kernel ships.
 """
 
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     block_idx,
@@ -116,7 +116,7 @@ from std.sys import get_defined_bool, get_defined_int, size_of
 from std.sys.intrinsics import readfirstlane
 from std.utils import StaticTuple
 
-from layout import TensorLayout, TileTensor
+from layout import TensorEngine, TensorLayout, TileTensor
 from layout.coord import Coord, Idx
 from layout.tile_layout import row_major
 from layout._utils import make_amd_buffer_resource
@@ -453,7 +453,7 @@ struct MlaPrefillV2[config: MlaConfigV2]:
             the DRAM path at the call site.
         """
         comptime assert (
-            Self.config.dtype == DType.float8_e4m3fn
+            Self.config.dtype == .float8_e4m3fn
         ), "MlaPrefillV2._load_q_lds_exact: FP8 e4m3 only"
 
         comptime _BK = Self._MmaOp.MMA_K
@@ -499,7 +499,7 @@ struct MlaPrefillV2[config: MlaConfigV2]:
                     UnsafePointer[
                         Scalar[Self.config.dtype],
                         MutAnyOrigin,
-                        address_space=AddressSpace.SHARED,
+                        address_space=.SHARED,
                     ]
                 ](q_slot.tile[1, Self.D_QK](r, 0).ptr)
             )
@@ -559,7 +559,7 @@ struct MlaPrefillV2[config: MlaConfigV2]:
             comptime for h in range(_H):
                 comptime for w in range(_W):
                     q_v[h, w, 0] = (
-                        q_v[h, w, 0].cast[DType.float32]() * scale_log2e
+                        q_v[h, w, 0].cast[.float32]() * scale_log2e
                     ).cast[Self.config.dtype]()
 
         return q_reg
@@ -572,12 +572,13 @@ struct MlaPrefillV2[config: MlaConfigV2]:
         mask_t: MHAMask,
         out_dtype: DType,
         o_layout: TensorLayout,
+        o_engine: TensorEngine,
         //,
     ](
         mut q_reg: RegTile[
             Self.config.dtype, Self._Q_LAYOUT_MLA_T, MutUntrackedOrigin
         ],
-        mut o_reg: RegTile[DType.float32, Self._O_LAYOUT_T, MutUntrackedOrigin],
+        mut o_reg: RegTile[.float32, Self._O_LAYOUT_T, MutUntrackedOrigin],
         mut softmax: OnlineSoftmax[Self._SOFTMAX_DTYPE],
         mask_functor: mask_t,
         mut att_block: RegTile[
@@ -587,7 +588,9 @@ struct MlaPrefillV2[config: MlaConfigV2]:
         v_ring: SMemTile[Self.config.dtype, _, MutUntrackedOrigin, ...],
         k_op: k_t,
         v_op: v_t,
-        o_warp_2d: TileTensor[out_dtype, o_layout, MutAnyOrigin],
+        o_warp_2d: TileTensor[
+            out_dtype, o_layout, MutAnyOrigin, Engine=o_engine
+        ],
         num_tiles: Int,
         max_num_tiles_local: Int,
         tile_idx: Int,
@@ -1679,10 +1682,10 @@ struct MlaPrefillV2[config: MlaConfigV2]:
 
         comptime _o_view_layout = Self._MmaOp.O_T_LAYOUT
         var o_normalized_view = TileTensor[
-            DType.float32,
+            .float32,
             type_of(_o_view_layout),
             MutUntrackedOrigin,
-            address_space=AddressSpace.LOCAL,
+            address_space=.LOCAL,
         ](o_reg.ptr, _o_view_layout)
         var epilogue_writer = RegTileEpilogue[out_dtype, 1](o_warp_2d)
         # int32 clamp: `seq_len`/`block_tile_idx`/`w_id` originate as Int32
@@ -1772,26 +1775,24 @@ struct MlaPrefillV2[config: MlaConfigV2]:
         output_dtype: DType,
         q_layout: TensorLayout,
         o_layout: TensorLayout,
+        q_engine: TensorEngine,
+        o_engine: TensorEngine,
         ragged: Bool = False,
     ](
-        q: TileTensor[q_dtype, q_layout, ImmutAnyOrigin],
+        q: TileTensor[q_dtype, q_layout, ImmutAnyOrigin, Engine=q_engine],
         k_nope_op: k_nope_t,
         k_rope_op: k_rope_t,
         v_op: v_t,
-        o: TileTensor[output_dtype, o_layout, MutAnyOrigin],
+        o: TileTensor[output_dtype, o_layout, MutAnyOrigin, Engine=o_engine],
         mask_functor: mask_t,
         scale: Float32,
         num_keys_dev: Int32,
         start_pos_dev: Int32,
-        work_indptr_ptr: UnsafePointer[
-            Scalar[DType.int32], ImmutAnyOrigin
-        ] = UnsafePointer[
-            Scalar[DType.int32], ImmutAnyOrigin
+        work_indptr_ptr: UnsafePointer[Int32, ImmutAnyOrigin] = UnsafePointer[
+            Int32, ImmutAnyOrigin
         ].unsafe_dangling(),
-        work_info_ptr: UnsafePointer[
-            Scalar[DType.int32], ImmutAnyOrigin
-        ] = UnsafePointer[
-            Scalar[DType.int32], ImmutAnyOrigin
+        work_info_ptr: UnsafePointer[Int32, ImmutAnyOrigin] = UnsafePointer[
+            Int32, ImmutAnyOrigin
         ].unsafe_dangling(),
         num_works_dev: Int32 = 0,
     ):
@@ -1816,6 +1817,8 @@ struct MlaPrefillV2[config: MlaConfigV2]:
                 equal `config.output_dtype`.
             q_layout: Memory layout of the Q tile tensor.
             o_layout: Memory layout of the output tile tensor.
+            q_engine: Engine of the Q tile tensor.
+            o_engine: Engine of the output tile tensor.
             ragged: Whether the batch uses ragged variable-length
                 sequences (defaults to `False`).
 
@@ -1869,7 +1872,9 @@ struct MlaPrefillV2[config: MlaConfigV2]:
         _ = num_works
 
         var q_typed = rebind[
-            TileTensor[Self.config.dtype, q_layout, ImmutAnyOrigin]
+            TileTensor[
+                Self.config.dtype, q_layout, ImmutAnyOrigin, Engine=q_engine
+            ]
         ](q)
 
         var seq_len = Int(readfirstlane(Int32(q.dim[1]())))
@@ -2010,7 +2015,7 @@ struct MlaPrefillV2[config: MlaConfigV2]:
 
             # ---- Per-work-item register state ----------------------------
             # The reference footprint: Q(24) + att(64 FP32) + o_reg(64 FP32).
-            var o_reg = reg_alloc[DType.float32](Self._MmaOp.O_LAYOUT)
+            var o_reg = reg_alloc[.float32](Self._MmaOp.O_LAYOUT)
             var softmax = OnlineSoftmax[Self._SOFTMAX_DTYPE]()
             _ = o_reg.fill(0)
             var att_block = reg_alloc[Self._SOFTMAX_DTYPE](
@@ -2133,9 +2138,7 @@ struct MlaPrefillV2[config: MlaConfigV2]:
         output_ptr: UnsafePointer[Scalar[output_dtype], MutAnyOrigin],
         mask_functor: mask_t,
         scale: Float32,
-        input_row_offsets_ptr: UnsafePointer[
-            Scalar[DType.uint32], ImmutAnyOrigin
-        ],
+        input_row_offsets_ptr: UnsafePointer[UInt32, ImmutAnyOrigin],
     ):
         """Ragged-batch GPU kernel entry. Per-sequence setup mirrors
         `MlaPrefillV2Core.ragged_kernel` (self-attention; `num_keys =
@@ -2205,6 +2208,8 @@ struct MlaPrefillV2[config: MlaConfigV2]:
             output_dtype,
             type_of(q_tt).LayoutType,
             type_of(o_tt).LayoutType,
+            type_of(q_tt).Engine,
+            type_of(o_tt).Engine,
             ragged=True,
         ](
             q_tt,
@@ -2240,7 +2245,7 @@ def mla_prefill_v2_ragged[
     output_ptr: UnsafePointer[Scalar[output_dtype], MutAnyOrigin],
     mask_functor: mask_t,
     scale: Float32,
-    input_row_offsets_ptr: UnsafePointer[Scalar[DType.uint32], ImmutAnyOrigin],
+    input_row_offsets_ptr: UnsafePointer[UInt32, ImmutAnyOrigin],
     max_prompt_len: Int,
     batch_size: Int,
     ctx: DeviceContext,

@@ -31,7 +31,8 @@ from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 # ===-----------------------------------------------------------------------===#
 
 
-struct MaskName(Writable):
+@fieldwise_init
+struct MaskName(Equatable, Writable):
     """A canonical string name identifying a mask type."""
 
     var name: String
@@ -45,9 +46,6 @@ struct MaskName(Writable):
     comptime CHUNKED_CAUSAL = Self("chunked_causal")
     comptime CAUSAL_PADDING = Self("causal_padding")
 
-    def __init__(out self, name: String):
-        self.name = name
-
     def write_to(self, mut writer: Some[Writer]):
         """Writes the mask name.
 
@@ -56,14 +54,8 @@ struct MaskName(Writable):
         """
         writer.write_string(self.name)
 
-    def __eq__(self, rhs: Self) -> Bool:
-        return self.name == rhs.name
-
     def __eq__(self, rhs: String) -> Bool:
         return self.name == rhs
-
-    def __ne__(self, rhs: Self) -> Bool:
-        return self.name != rhs.name
 
 
 # ===-----------------------------------------------------------------------===#
@@ -121,7 +113,8 @@ struct TileMaskStatus(
         writer.write("unknown mask")
 
 
-struct MaskStrategy(TrivialRegisterPassable):
+@fieldwise_init
+struct MaskStrategy(Equatable, TrivialRegisterPassable):
     """Bit-flag enum that selects the masking strategy for a tile iteration set.
 
     Strategies are combined with bitwise OR. `NO_MASK` skips masking
@@ -155,18 +148,6 @@ struct MaskStrategy(TrivialRegisterPassable):
     `UPPER_TRIANGULAR` (and `OUT_OF_BOUNDS` for masks that fold it into
     `mask_bits`).
     """
-
-    @always_inline
-    def __init__(out self, value: Int32):
-        self._value = value
-
-    @always_inline
-    def __eq__(self, other: Self) -> Bool:
-        return self._value == other._value
-
-    @always_inline
-    def __ne__(self, other: Self) -> Bool:
-        return self._value != other._value
 
     @always_inline
     def __and__(self, other: Self) -> Self:
@@ -211,7 +192,7 @@ trait MHAMask(Copyable, DevicePassable, TrivialRegisterPassable):
         width: SIMDLength,
         //,
         *,
-        element_type: DType = DType.uint32,
+        element_type: DType = .uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
@@ -234,7 +215,7 @@ trait MHAMask(Copyable, DevicePassable, TrivialRegisterPassable):
         ...
 
     def status[
-        *, element_type: DType = DType.uint32
+        *, element_type: DType = .uint32
     ](
         self,
         seq_id: UInt32,
@@ -506,7 +487,7 @@ struct CausalMask(MHAMask, TrivialRegisterPassable):
         width: SIMDLength,
         //,
         *,
-        element_type: DType = DType.uint32,
+        element_type: DType = .uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
@@ -531,7 +512,7 @@ struct CausalMask(MHAMask, TrivialRegisterPassable):
 
     @always_inline
     def status[
-        *, element_type: DType = DType.uint32
+        *, element_type: DType = .uint32
     ](
         self,
         seq_id: UInt32,
@@ -560,12 +541,12 @@ struct CausalMask(MHAMask, TrivialRegisterPassable):
             (tile_offset.data[0] + 1).lt(
                 tile_offset.data[1] + tile_size.data[1]
             )
-        ).cast[DType.uint8]()
+        ).cast[.uint8]()
 
         # If true, the tile is fully masked
         var max_q_lt_min_k = (
             (tile_offset.data[0] + tile_size.data[0]).le(tile_offset.data[1])
-        ).cast[DType.uint8]()
+        ).cast[.uint8]()
 
         # Use 2 bits to represent:
         # (F, F) -> no mask
@@ -701,7 +682,7 @@ struct NullMask(MHAMask, TrivialRegisterPassable):
         width: SIMDLength,
         //,
         *,
-        element_type: DType = DType.uint32,
+        element_type: DType = .uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
@@ -711,7 +692,7 @@ struct NullMask(MHAMask, TrivialRegisterPassable):
 
     @always_inline
     def status[
-        *, element_type: DType = DType.uint32
+        *, element_type: DType = .uint32
     ](
         self,
         seq_id: UInt32,
@@ -863,7 +844,7 @@ struct ChunkedMask[local_window_size: Int](MHAMask, TrivialRegisterPassable):
         width: SIMDLength,
         //,
         *,
-        element_type: DType = DType.uint32,
+        element_type: DType = .uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
@@ -894,10 +875,8 @@ struct ChunkedMask[local_window_size: Int](MHAMask, TrivialRegisterPassable):
                 // Scalar[element_type](Self.local_window_size)
             ) * UInt32(Self.local_window_size)
 
-            var mask_val = SIMD[DType.bool, width](fill=False)
-            var k_indices = (
-                k_start_idx.cast[DType.uint32]() + iota[DType.uint32, width]()
-            )
+            var mask_val = SIMD[.bool, width](fill=False)
+            var k_indices = k_start_idx.cast[.uint32]() + iota[.uint32, width]()
             if q_chunk_idx == k_start_chunk_idx:
                 mask_val = k_indices.ge(boundary)
             elif q_chunk_idx == k_end_chunk_idx:
@@ -910,7 +889,7 @@ struct ChunkedMask[local_window_size: Int](MHAMask, TrivialRegisterPassable):
 
     @always_inline
     def status[
-        *, element_type: DType = DType.uint32
+        *, element_type: DType = .uint32
     ](
         self,
         seq_id: UInt32,
@@ -1166,7 +1145,7 @@ struct SlidingWindowCausalMask[window_size: Int](
         dtype: DType,
         width: SIMDLength,
         *,
-        element_type: DType = DType.uint32,
+        element_type: DType = .uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
@@ -1204,7 +1183,7 @@ struct SlidingWindowCausalMask[window_size: Int](
 
     @always_inline
     def status[
-        *, element_type: DType = DType.uint32
+        *, element_type: DType = .uint32
     ](
         self,
         seq_id: UInt32,
@@ -1468,7 +1447,7 @@ struct SlidingWindowNonCausalMask[window_size: Int](
         dtype: DType,
         width: SIMDLength,
         *,
-        element_type: DType = DType.uint32,
+        element_type: DType = .uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
@@ -1495,7 +1474,7 @@ struct SlidingWindowNonCausalMask[window_size: Int](
 
     @always_inline
     def status[
-        *, element_type: DType = DType.uint32
+        *, element_type: DType = .uint32
     ](
         self,
         seq_id: UInt32,
@@ -1666,7 +1645,7 @@ struct CausalPaddingMask[layout_: Layout, origin_: ImmOrigin](
     comptime mask_safe_out_of_bounds: Bool = True
     comptime check_mask_during_decoding: Bool = True
 
-    var valid_lengths: LayoutTensor[DType.uint32, Self.layout_, Self.origin_]
+    var valid_lengths: LayoutTensor[.uint32, Self.layout_, Self.origin_]
 
     comptime device_type: AnyType = Self
 
@@ -1685,7 +1664,7 @@ struct CausalPaddingMask[layout_: Layout, origin_: ImmOrigin](
 
     def __init__(
         out self,
-        valid_lengths: LayoutTensor[DType.uint32, Self.layout_, Self.origin_],
+        valid_lengths: LayoutTensor[.uint32, Self.layout_, Self.origin_],
     ):
         self.valid_lengths = valid_lengths
 
@@ -1695,7 +1674,7 @@ struct CausalPaddingMask[layout_: Layout, origin_: ImmOrigin](
         width: SIMDLength,
         //,
         *,
-        element_type: DType = DType.uint32,
+        element_type: DType = .uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
@@ -1713,7 +1692,7 @@ struct CausalPaddingMask[layout_: Layout, origin_: ImmOrigin](
 
     @always_inline
     def status[
-        *, element_type: DType = DType.uint32
+        *, element_type: DType = .uint32
     ](
         self,
         seq_id: UInt32,
@@ -1951,9 +1930,7 @@ struct MaterializedMask[dtype_: DType, layout_: Layout, origin_: ImmOrigin](
 
     @__allow_legacy_any_origin_fields
     var start_pos: OptionalReg[
-        LayoutTensor[
-            DType.uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
-        ]
+        LayoutTensor[.uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin]
     ]
     var is_multiple_of_2: Bool
 
@@ -1977,7 +1954,7 @@ struct MaterializedMask[dtype_: DType, layout_: Layout, origin_: ImmOrigin](
         mask_tensor: LayoutTensor[Self.dtype_, Self.layout_, Self.origin_],
         start_pos: OptionalReg[
             LayoutTensor[
-                DType.uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
+                .uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
             ]
         ] = None,
     ):
@@ -2007,7 +1984,7 @@ struct MaterializedMask[dtype_: DType, layout_: Layout, origin_: ImmOrigin](
         width: SIMDLength,
         //,
         *,
-        element_type: DType = DType.uint32,
+        element_type: DType = .uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
@@ -2056,7 +2033,7 @@ struct MaterializedMask[dtype_: DType, layout_: Layout, origin_: ImmOrigin](
 
     @always_inline
     def status[
-        *, element_type: DType = DType.uint32
+        *, element_type: DType = .uint32
     ](
         self,
         seq_id: UInt32,
@@ -2267,13 +2244,13 @@ struct AndMask[T: MHAMask, S: MHAMask, //, lhs: T, rhs: S](
         width: SIMDLength,
         //,
         *,
-        element_type: DType = DType.uint32,
+        element_type: DType = .uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
         score_vec: SIMD[dtype, width],
     ) -> SIMD[dtype, width]:
-        comptime if dtype == DType.bool or dtype.is_integral():
+        comptime if dtype == .bool or dtype.is_integral():
             return self.lhs.mask(coord, score_vec) & self.rhs.mask(
                 coord, score_vec
             )
@@ -2286,7 +2263,7 @@ struct AndMask[T: MHAMask, S: MHAMask, //, lhs: T, rhs: S](
 
     @always_inline
     def status[
-        *, element_type: DType = DType.uint32
+        *, element_type: DType = .uint32
     ](
         self,
         seq_id: UInt32,
@@ -2441,13 +2418,13 @@ struct OrMask[T: MHAMask, S: MHAMask, //, lhs: T, rhs: S](
         width: SIMDLength,
         //,
         *,
-        element_type: DType = DType.uint32,
+        element_type: DType = .uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
         score_vec: SIMD[dtype, width],
     ) -> SIMD[dtype, width]:
-        comptime if dtype == DType.bool or dtype.is_integral():
+        comptime if dtype == .bool or dtype.is_integral():
             return self.lhs.mask(coord, score_vec) | self.rhs.mask(
                 coord, score_vec
             )
@@ -2459,7 +2436,7 @@ struct OrMask[T: MHAMask, S: MHAMask, //, lhs: T, rhs: S](
 
     @always_inline
     def status[
-        *, element_type: DType = DType.uint32
+        *, element_type: DType = .uint32
     ](
         self,
         seq_id: UInt32,
@@ -2758,13 +2735,13 @@ struct RelativeLogitsMask[
 
     @__allow_legacy_any_origin_fields
     var cache_lengths: LayoutTensor[
-        DType.uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
+        .uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
     ]
     """Cached tokens before this call's new tokens."""
 
     @__allow_legacy_any_origin_fields
     var input_row_offsets: LayoutTensor[
-        DType.uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
+        .uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
     ]
     """Ragged row offset into `bias`/`q` for this call's new tokens, `(batch + 1,)`."""
 
@@ -2787,10 +2764,10 @@ struct RelativeLogitsMask[
         out self,
         bias: LayoutTensor[Self.dtype_, Self.layout_, Self.origin_],
         cache_lengths: LayoutTensor[
-            DType.uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
+            .uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
         ],
         input_row_offsets: LayoutTensor[
-            DType.uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
+            .uint32, Layout.row_major(UNKNOWN_VALUE), ImmutAnyOrigin
         ],
     ):
         comptime assert (
@@ -2823,7 +2800,7 @@ struct RelativeLogitsMask[
         width: SIMDLength,
         //,
         *,
-        element_type: DType = DType.uint32,
+        element_type: DType = .uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
@@ -2869,7 +2846,7 @@ struct RelativeLogitsMask[
 
     @always_inline
     def status[
-        *, element_type: DType = DType.uint32
+        *, element_type: DType = .uint32
     ](
         self,
         seq_id: UInt32,
@@ -2927,7 +2904,12 @@ struct RelativeLogitsMask[
     def nonfull_sets[
         BM: Int, BN: Int
     ]() -> StaticTuple[TileMaskStatus, Self.count_nonfull_sets(BM, BN)]:
-        return {TileMaskStatus.UNKNOWN_MASK}
+        # One contiguous PARTIAL band when `visibility` publishes a known
+        # partition (the bias hits every visible tile); else forward UNKNOWN.
+        comptime if _nonfull_sets_known[Self.V, BM, BN]():
+            return {TileMaskStatus.PARTIAL_MASK}
+        else:
+            return {TileMaskStatus.UNKNOWN_MASK}
 
     @staticmethod
     def mask_strategies[

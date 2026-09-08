@@ -67,12 +67,12 @@ from std.collections import OptionalReg
 from std.math import ceildiv
 from std.math.constants import log2e
 from std.sys import size_of
-from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, warp_id
+from max.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, warp_id
 from max.gpu.sync import barrier
-from std.gpu.globals import WARPGROUP_SIZE
+from max.gpu.globals import WARPGROUP_SIZE
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from max.gpu.primitives.grid_controls import launch_dependent_grids
-from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
+from max.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from max.gpu.memory import external_memory
 from max.gpu.compute.arch.tcgen05 import (
     tcgen05_alloc,
@@ -88,6 +88,7 @@ from layout import (
     CoordLike,
     Layout,
     RowMajorLayout,
+    TensorEngine,
     TileTensor,
     row_major,
 )
@@ -111,6 +112,7 @@ from nn.attention.gpu.nvidia.sm100.mla_decode_utils import (
     MLA_SM100_Decode_Config,
     MLA_SM100_Decode_Common,
     QOTMATile,
+    ORaggedTMATile,
     ScalesTMATile,
     MLA_Decode_Pack,
     OffsetPosition,
@@ -141,6 +143,7 @@ struct MLA_SM100_Decode_QKV_FP8_PerTokenScale_RopeAware[
     MaskType: MHAMask,
     config: MLA_SM100_Decode_Config,
     ValidLengthType: OptionalPointer,
+    Engine: TensorEngine,
     _is_cache_length_accurate: Bool = False,
     ragged: Bool = False,
     has_per_token_scales: Bool = False,
@@ -172,6 +175,7 @@ struct MLA_SM100_Decode_QKV_FP8_PerTokenScale_RopeAware[
             counts, head counts, and TMEM layout for the kernel.
         ValidLengthType: The optional pointer type for the
             per-request valid sequence length buffer.
+        Engine: Engine policy of the `scalar_args` tile operand.
         _is_cache_length_accurate: Whether the cache length used for
             offset computation is accurate (defaults to `False`).
         ragged: Whether ragged (variable-length) sequences are used,
@@ -332,7 +336,7 @@ struct MLA_SM100_Decode_QKV_FP8_PerTokenScale_RopeAware[
         ],
         # Per-token scales TMA: float32, [1, BN_QK], SWIZZLE_NONE
         scale_tma: ScalesTMATile[BN_QK=Self.config.BN_QK],
-        o_tma: QOTMATile[
+        o_tma: ORaggedTMATile[
             dtype=Self.output_type,
             BM=Self.config.out_rows,
             # Per-warp output stripe (= BN_PV/4), not BN_QK.
@@ -349,13 +353,12 @@ struct MLA_SM100_Decode_QKV_FP8_PerTokenScale_RopeAware[
         # Per-token Q scale pointer: float32 array with one scale per Q token.
         # sigma_Q[q_token_idx] is folded into scale_log2e inside Softmax.
         # Null pointer means no Q scale (sigma_Q = 1.0).
-        q_scale_ptr: OptionalReg[
-            UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-        ],
+        q_scale_ptr: OptionalReg[UnsafePointer[Float32, MutAnyOrigin]],
         scalar_args: TileTensor[
-            DType.int64,
+            .int64,
             RowMajorLayout[ComptimeInt[3]],
             MutAnyOrigin,
+            Engine=Self.Engine,
         ],
     ):
         # SlidingWindowCausalMask is supported ONLY by the native FP8 backend
@@ -408,7 +411,7 @@ struct MLA_SM100_Decode_QKV_FP8_PerTokenScale_RopeAware[
                 UnsafePointer[
                     Scalar[Self.ValidLengthType.dtype],
                     ImmutAnyOrigin,
-                    address_space=AddressSpace.GENERIC,
+                    address_space=.GENERIC,
                 ]
             ](valid_length.value()),
             q_max_seq_len,
@@ -423,10 +426,8 @@ struct MLA_SM100_Decode_QKV_FP8_PerTokenScale_RopeAware[
                     offset_position.split_idx,
                     offset_position.batch_idx,
                     offset_position.max_seq_len,
-                    offset_position.out_row_offset,
                     batch_size,
                     lse_accum_split_ptr,
-                    o_tma,
                 )
                 return
 
@@ -438,10 +439,8 @@ struct MLA_SM100_Decode_QKV_FP8_PerTokenScale_RopeAware[
                         offset_position.split_idx,
                         offset_position.batch_idx,
                         offset_position.max_seq_len,
-                        offset_position.out_row_offset,
                         batch_size,
                         lse_accum_split_ptr,
-                        o_tma,
                     )
 
                 return
@@ -453,7 +452,7 @@ struct MLA_SM100_Decode_QKV_FP8_PerTokenScale_RopeAware[
         # Q_nope FP8: 64 × 512 × 1 = 32768 bytes (SWIZZLE_64B)
         var q_nope_smem = external_memory[
             Scalar[Self.fp8_type],
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
             alignment=128,
             name="mha_dynamic_shared_memory",
         ]()
@@ -506,9 +505,7 @@ struct MLA_SM100_Decode_QKV_FP8_PerTokenScale_RopeAware[
         # Placed right after li_smem. Used by the load warp to store per-token
         # sigma_KV values from HBM before they are applied later.
         # In MLA's absorbed mode, K and V share one scale per token.
-        var scale_smem_base = (li_smem + WARPGROUP_SIZE).bitcast[
-            Scalar[DType.float32]
-        ]()
+        var scale_smem_base = (li_smem + WARPGROUP_SIZE).bitcast[Float32]()
         comptime per_token_scales_total_elems = Self.config.num_kv_stages * Self.config.per_token_scales_per_stage // size_of[
             DType.float32
         ]()
@@ -747,7 +744,7 @@ struct MLA_SM100_Decode_QKV_FP8_PerTokenScale_RopeAware[
             Self.ValidLengthType,
             Self.config.decoding_warp_split_k,
         ],
-        scale_smem_base: SharedMemPointer[Scalar[DType.float32]],
+        scale_smem_base: SharedMemPointer[Float32],
     ):
         if offset_position.num_keys_this_split == 0:
             return
@@ -799,7 +796,7 @@ struct MLA_SM100_Decode_QKV_FP8_PerTokenScale_RopeAware[
             dtype,
             type_of(tt_row_major[elems]()),
             MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
         ]
         comptime q_nope_elems = type_of(q_nope_tma).tile_shape[0] * type_of(
             q_nope_tma
@@ -868,7 +865,7 @@ struct MLA_SM100_Decode_QKV_FP8_PerTokenScale_RopeAware[
                 var scale_stage_ptr = scale_smem_base + stage0_idx * UInt32(
                     scale_elems_per_stage
                 )
-                var scale_tensor = _smem_tt[DType.float32, scale_elems](
+                var scale_tensor = _smem_tt[.float32, scale_elems](
                     scale_stage_ptr, tt_row_major[scale_elems]()
                 )
                 scale_tma.async_copy(
@@ -928,7 +925,7 @@ struct MLA_SM100_Decode_QKV_FP8_PerTokenScale_RopeAware[
                     var scale_stage_ptr = scale_smem_base + stage_idx * UInt32(
                         scale_elems_per_stage
                     )
-                    var scale_tensor = _smem_tt[DType.float32, scale_elems](
+                    var scale_tensor = _smem_tt[.float32, scale_elems](
                         scale_stage_ptr, tt_row_major[scale_elems]()
                     )
                     scale_tma.async_copy(

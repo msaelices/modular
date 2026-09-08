@@ -26,7 +26,7 @@ from std.collections import OptionalReg
 from std.math import ceildiv, clamp
 from std.math.constants import log2e
 from std.sys import size_of
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     block_idx,
@@ -35,9 +35,9 @@ from std.gpu import (
     warp_id,
 )
 from max.gpu.sync import barrier
-from std.gpu.globals import WARPGROUP_SIZE
+from max.gpu.globals import WARPGROUP_SIZE
 from max.gpu.primitives.grid_controls import launch_dependent_grids
-from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
+from max.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from max.gpu.memory import (
     CacheEviction,
     cp_async_bulk_tensor_2d_gather4,
@@ -56,7 +56,14 @@ from layout.tma_async import (
     TMATensorTile,
     _gather4_box_width,
 )
-from layout import ComptimeInt, CoordLike, RowMajorLayout, TileTensor
+from layout import (
+    ComptimeInt,
+    CoordLike,
+    DefaultEngine,
+    RowMajorLayout,
+    TensorEngine,
+    TileTensor,
+)
 from nn.attention.gpu.nvidia.common import (
     OptionalPointer,
 )
@@ -77,6 +84,7 @@ from nn.attention.gpu.nvidia.sm100.mla_decode_utils import (
     MLA_SM100_Decode_Config,
     MLA_SM100_Decode_Common,
     QOTMATile,
+    ORaggedTMATile,
     MLA_Decode_Pack,
     OffsetPosition,
     KVPipelineGeneric,
@@ -116,6 +124,7 @@ struct MLA_SM100_Decode_Sparse_KV_BF16[
     has_attn_sink: Bool = False,
     has_extra_kv: Bool = False,
     has_variable_topk: Bool = False,
+    Engine: TensorEngine = DefaultEngine[element_width=1],
 ](TrivialRegisterPassable):
     comptime kv_type = Self.KVLUTType.dtype
     comptime AccumType = get_accum_type[Self.q_type]()
@@ -139,7 +148,7 @@ struct MLA_SM100_Decode_Sparse_KV_BF16[
     # (36 issues per elected lane).  Box width is 64 BF16 elems = 128
     # bytes (one swizzle group), so the gather4 SMEM layout is directly
     # consumable by the UMMA K-major descriptor.
-    comptime kv_gather4_tile_width = Self.config.padded_q_depth
+    comptime kv_gather4_tile_width = Self.config.input_q_depth
     comptime kv_gather4_box_w = _gather4_box_width[
         DType.bfloat16,
         Self.kv_gather4_tile_width,
@@ -208,7 +217,7 @@ struct MLA_SM100_Decode_Sparse_KV_BF16[
         q_tma: QOTMATile[
             dtype=Self.q_type,
             BM=Self.config.BM,  # 64
-            BK=Self.config.BK_QK,  # 576
+            BK=Self.config.input_q_depth,
             swizzle_mode=Self.config.swizzle_mode,
         ],
         # Single BF16 gather4 TMA: SWIZZLE_128B, BN_QK rows, box_w=64 BF16
@@ -220,7 +229,7 @@ struct MLA_SM100_Decode_Sparse_KV_BF16[
             tile_shape=IndexList[2](Self.config.BK_PV, Self.kv_gather4_box_w),
             desc_shape=IndexList[2](1, Self.kv_gather4_box_w),
         ],
-        o_tma: QOTMATile[
+        o_tma: ORaggedTMATile[
             dtype=Self.output_type,
             BM=Self.config.out_rows,
             BK=Self.config.BN_PV // 4,
@@ -236,9 +245,7 @@ struct MLA_SM100_Decode_Sparse_KV_BF16[
         d_indices: OptionalReg[UnsafePointer[Int32, MutAnyOrigin]],
         indices_stride: Int32,
         topk_lengths: OptionalReg[UnsafePointer[Int32, MutAnyOrigin]],
-        attn_sink_ptr: OptionalReg[
-            UnsafePointer[Scalar[DType.float32], origin=MutAnyOrigin]
-        ],
+        attn_sink_ptr: OptionalReg[UnsafePointer[Float32, origin=MutAnyOrigin]],
         # Extra KV TMA: BF16, SWIZZLE_128B, tile_width=padded_q_depth=576,
         # box_w=_gather4_box_width[bfloat16, 576, SWIZZLE_128B]()=64.
         # Same descriptor shape as the main K_TMA.
@@ -253,9 +260,10 @@ struct MLA_SM100_Decode_Sparse_KV_BF16[
         extra_topk_lengths: OptionalReg[UnsafePointer[Int32, MutAnyOrigin]],
         extra_indices_stride: Int32,
         scalar_args: TileTensor[
-            DType.int64,
+            .int64,
             RowMajorLayout[ComptimeInt[3]],
             MutAnyOrigin,
+            Engine=Self.Engine,
         ],
     ):
         # The upstream dispatcher monomorphizes the kernel struct for both
@@ -263,7 +271,7 @@ struct MLA_SM100_Decode_Sparse_KV_BF16[
         # selected at runtime via `num_partitions > 1`.
         var _indices_stride = Int(indices_stride)
         var _extra_indices_stride = Int(extra_indices_stride)
-        comptime assert Self.KVLUTType.dtype == DType.bfloat16
+        comptime assert Self.KVLUTType.dtype == .bfloat16
         comptime assert size_of[Self.KVLUTType.dtype]() == 2
         comptime assert Self.config.supported()
         comptime assert Self.config.scale_block_size == 0
@@ -310,7 +318,7 @@ struct MLA_SM100_Decode_Sparse_KV_BF16[
                 UnsafePointer[
                     Scalar[Self.ValidLengthType.dtype],
                     ImmutAnyOrigin,
-                    address_space=AddressSpace.GENERIC,
+                    address_space=.GENERIC,
                 ]
             ](valid_length.value()),
             q_max_seq_len,
@@ -347,29 +355,26 @@ struct MLA_SM100_Decode_Sparse_KV_BF16[
         topk = offset_position.num_keys - extra_topk
 
         # Early exit for split-K: CTAs with no work (num_keys_this_split == 0)
-        # must still write -inf LSE, zero o_accum_split, and call
-        # launch_dependent_grids() to fulfill the PDL contract with the
-        # combine kernel.  Skipping launch_dependent_grids() causes the
-        # combine kernel to hang, leading to CUDA_ERROR_ILLEGAL_ADDRESS.
+        # must still write -inf LSE and call launch_dependent_grids()
+        # to fulfill the PDL contract with the combine kernel.  Skipping
+        # launch_dependent_grids() causes the combine kernel to hang,
+        # leading to CUDA_ERROR_ILLEGAL_ADDRESS.
         comptime if Self.config.decoding_warp_split_k:
             if offset_position.num_keys_this_split == 0:
                 Self.Common_MLA_Op.pdl_early_exit(
                     offset_position.split_idx,
                     offset_position.batch_idx,
                     offset_position.max_seq_len,
-                    offset_position.out_row_offset,
                     batch_size,
                     lse_accum_split_ptr,
-                    o_tma,
                 )
                 return
 
         # Skip query positions beyond this batch's actual seq_len.  In
         # ragged mode with split-K, q_max_seq_len can be > 1 (up to 8),
         # so block_idx.y can exceed a specific batch's seq_len.  Those
-        # CTAs must still fulfill the PDL contract (write -inf LSE, zero
-        # o_accum_split, and call launch_dependent_grids) or the combine
-        # kernel will hang.
+        # CTAs must still fulfill the PDL contract (write -inf LSE and
+        # call launch_dependent_grids) or the combine kernel will hang.
         comptime if Self.ragged:
             if block_idx.y >= offset_position.seq_len:
                 comptime if Self.config.decoding_warp_split_k:
@@ -377,17 +382,15 @@ struct MLA_SM100_Decode_Sparse_KV_BF16[
                         offset_position.split_idx,
                         offset_position.batch_idx,
                         offset_position.max_seq_len,
-                        offset_position.out_row_offset,
                         batch_size,
                         lse_accum_split_ptr,
-                        o_tma,
                     )
 
                 return
 
         var q_smem = external_memory[
             Scalar[Self.q_type],
-            address_space=AddressSpace.SHARED,
+            address_space=.SHARED,
             alignment=128,
             name="mha_dynamic_shared_memory",
         ]()
@@ -503,9 +506,7 @@ struct MLA_SM100_Decode_Sparse_KV_BF16[
             # Per-head attn_sink_log2 (one head per thread in the warpgroup).
             # When attn_sink_ptr is null, attn_sink_log2 stays at -inf and
             # exp2(-inf - mi) = 0, leaving the denominator unchanged.
-            var attn_sink_log2 = Scalar[DType.float32](
-                min_or_neg_inf[DType.float32]()
-            )
+            var attn_sink_log2 = Float32(min_or_neg_inf[.float32]())
             comptime if Self.has_attn_sink:
                 var lane_idx = Int(lane_id())
                 var row = lane_idx & 0x3F
@@ -513,7 +514,7 @@ struct MLA_SM100_Decode_Sparse_KV_BF16[
                 if head_idx_local < Self.config.num_q_heads:
                     attn_sink_log2 = attn_sink_ptr.unsafe_value()[
                         head_idx_local
-                    ] * Scalar[DType.float32](log2e)
+                    ] * Float32(log2e)
 
             Self.Common_MLA_Op.Softmax[has_attn_sink=Self.has_attn_sink,](
                 ptr_tmem_addr[0],
@@ -645,7 +646,7 @@ struct MLA_SM100_Decode_Sparse_KV_BF16[
             DType.bfloat16
         ]()
         var kv_stage_ptr = kv_prod.stage_base_ptr[qk_stage=0]().bitcast[
-            Scalar[DType.bfloat16]
+            BFloat16
         ]()
         var k_mbar = kv_prod.producer_mbar[qk_stage=0]()
         var idx_smem = idx_smem_base + kv_prod.stage_index[
@@ -727,7 +728,7 @@ struct MLA_SM100_Decode_Sparse_KV_BF16[
         q_tma: QOTMATile[
             dtype=Self.q_type,
             BM=Self.config.BM,
-            BK=Self.config.BK_QK,
+            BK=Self.config.input_q_depth,
             swizzle_mode=Self.config.swizzle_mode,
         ],
         k_tma: TMATensorTile[

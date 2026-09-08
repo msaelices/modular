@@ -68,7 +68,7 @@ NVIDIA SM100 only (SS-UMMA / TMA / tcgen05). Verified against
 match via `test_mla_index_fp8`.
 """
 
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     block_idx,
@@ -93,7 +93,13 @@ from std.sys import get_defined_int, has_nvidia_gpu_accelerator, size_of
 from std.utils.index import Index
 from std.utils.static_tuple import StaticTuple
 
-from layout import TensorLayout, TileTensor, UNKNOWN_VALUE
+from layout import (
+    DefaultEngine,
+    TensorLayout,
+    TensorEngine,
+    TileTensor,
+    UNKNOWN_VALUE,
+)
 from layout.tile_layout import row_major as tt_row_major
 from layout.tma_async import (
     PipelineState,
@@ -112,9 +118,9 @@ from nn.attention.gpu.nvidia.sm100.attention_utils import (
 from nn.attention.mha_operand import MHAOperand
 from nn.attention.gpu.sparse_index_fp8_sm100_prefill import (
     _KEYSPLIT_MAX_TOKEN_TILES,
-    _KEYSPLIT_MIN_KEY_TILES,
     _PREFILL_MIN_TOKEN_TILES,
     _ctas_per_sm,
+    _is_keysplit_shape,
     fp8_index_score_sm100_prefill,
 )
 
@@ -175,6 +181,7 @@ comptime _ALT_NTOK_FORCE = get_defined_int["FP8_INDEX_ALT_NTOK", 0]()
 comptime _ALT_FORCE_ANY = get_defined_int["FP8_INDEX_ALT_FORCE", 0]()
 comptime _ALT_OFF = get_defined_int["FP8_INDEX_ALT_OFF", 0]()
 
+
 # Q buffer 1 sits at the END of the SMEM layout so a decode launch (every
 # batch entry a single token tile, so buffer 1 is never touched) can allocate
 # only the prefix and keep the un-pipelined kernel's CTAs/SM. 128B alignment
@@ -212,19 +219,26 @@ def _fp8_index_body[
     BM_key: Int,
     N_TOKENS: Int,
     _is_cache_length_accurate: Bool,
+    kpool: Int = 1,
     epilogue_chunk: Int = _EPILOGUE_CHUNK,
+    *,
+    VLEngine: TensorEngine = DefaultEngine[element_width=1],
+    QSEngine: TensorEngine = DefaultEngine[element_width=1],
+    OutEngine: TensorEngine = DefaultEngine[element_width=1],
 ](
     q_tma: QTMATileT[dtype, N_TOKENS * num_heads, depth],
     k_tma: KTMATileT[dtype, BM_key, depth],
     k_operand: KOperand,
     ks_operand: KSOperand,
-    valid_length: TileTensor[DType.uint32, VLLT, ImmutAnyOrigin],
-    q_s: TileTensor[DType.float32, QSLT, ImmutAnyOrigin],
-    output: TileTensor[DType.float32, OutLT, MutAnyOrigin],
+    valid_length: TileTensor[.uint32, VLLT, ImmutAnyOrigin, Engine=VLEngine],
+    q_s: TileTensor[.float32, QSLT, ImmutAnyOrigin, Engine=QSEngine],
+    output: TileTensor[.float32, OutLT, MutAnyOrigin, Engine=OutEngine],
     max_num_keys: Int,
     causal: Int,
     nt_start: Int,
     n_local: Int,
+    out_row_begin: Int,
+    out_row_end: Int,
 ):
     comptime assert valid_length.flat_rank == 1
     comptime MMA_N = N_TOKENS * num_heads
@@ -267,6 +281,29 @@ def _fp8_index_body[
     comptime if not _is_cache_length_accurate:
         num_keys += seq_len
 
+    # `num_keys` counts tokens, because the causal bound is expressed in
+    # tokens. `num_rows` counts what the cache holds, one pooled key per
+    # `kpool` tokens. The two are equal when `kpool == 1`.
+    var num_rows = num_keys // kpool
+
+    # This launch owns global token rows `[out_row_begin, out_row_end)` and writes
+    # them to `output` rows `[0, out_row_end - out_row_begin)`, so a caller that
+    # cannot afford the whole score matrix fills it a row-window at a time. Token
+    # tiles are counted from `tok_lo`, so the window costs the epilogue only a
+    # different liveness bound. `seq_len` stays the TRUE length -- the causal
+    # bound is an absolute position and must not see the window.
+    var tok_lo = max(0, out_row_begin - start_of_seq)
+    var tok_hi = min(seq_len, out_row_end - start_of_seq)
+    var out_row0 = start_of_seq - out_row_begin
+
+    # SINGLE source of the local token origin. The Q tile and its scales are
+    # staged for tile 0 in the prologue and for tile it+1 inside the loop, so the
+    # origin is spelled in three places; when the window shifted only the loop's
+    # copy, tile 0 kept scoring the entry's first tokens while the epilogue filed
+    # the result under the window's -- wrong scores that still look structurally
+    # valid. Derive all three from this.
+    var tok_base = tok_lo + nt_start * N_TOKENS
+
     # FA4 stateless S = K @ Q^T accumulator. `MMA_M = BM_key = 128 > 64`, so
     # `use_ws` is False and this is the standard (non-packed) TMEM datapath.
     # It carries no handshake -- the mbars below are driven by this kernel.
@@ -294,7 +331,7 @@ def _fp8_index_body[
     comptime q_elems = MMA_N * depth
     var smem = external_memory[
         Scalar[dtype],
-        address_space=AddressSpace.SHARED,
+        address_space=.SHARED,
         alignment=128,
         name="fp8_index_sm100_smem",
     ]()
@@ -340,14 +377,14 @@ def _fp8_index_body[
     # --- Stage the K tile once (A operand). A full BM_key-row tile is always
     # staged; rows past this batch's num_keys hold unrelated pool data (the
     # paged descriptor's bound is the whole pool, not num_keys, so it does not
-    # zero them). Correctness comes from the epilogue's `key_local < num_keys`
+    # zero them). Correctness comes from the epilogue's `key_local < num_rows`
     # guard, which drops those rows' scores before any write to `output`.
     comptime k_bytes = k_elems * size_of[dtype]()
     comptime q_bytes = q_elems * size_of[dtype]()
     if tid == 0:
         var k_row0 = Int(k_operand.row_idx(UInt32(b), UInt32(key_start)))
         var k_dst = TileTensor[
-            dtype, type_of(k_flat_layout), address_space=AddressSpace.SHARED
+            dtype, type_of(k_flat_layout), address_space=.SHARED
         ](k_smem, k_flat_layout)
         k_mbar[0].expect_bytes(Int32(k_bytes))
         k_tma.async_copy_3d(k_dst, k_mbar[0], (0, 0, k_row0))
@@ -356,13 +393,13 @@ def _fp8_index_body[
         # prologue arm is the sole producer of q_mbar[0]'s first completion;
         # the loop only ever issues tile nt+1 into the other buffer.
         var q_dst = TileTensor[
-            dtype, type_of(q_flat_layout), address_space=AddressSpace.SHARED
+            dtype, type_of(q_flat_layout), address_space=.SHARED
         ](q_smem, q_flat_layout)
         q_mbar[0].expect_bytes(Int32(q_bytes))
         q_tma.async_copy_3d(
             q_dst,
             q_mbar[0],
-            (0, 0, (start_of_seq + nt_start * N_TOKENS) * num_heads),
+            (0, 0, (start_of_seq + tok_base) * num_heads),
         )
 
     # k_scale depends only on this CTA's resident K rows, so stage all BM_key
@@ -370,20 +407,20 @@ def _fp8_index_body[
     # re-load them from global memory in every token tile's critical path.
     if Int(tid) < BM_key:
         var key_local = key_start + Int(tid)
-        if key_local < num_keys:
+        if key_local < num_rows:
             var ks_ptr = ks_operand.block_paged_ptr[1](
                 UInt32(b), UInt32(key_local), UInt32(0), UInt32(0)
             )
-            ks_smem[tid] = ks_ptr[0].cast[DType.float32]()
+            ks_smem[tid] = ks_ptr[0].cast[.float32]()
         else:
             ks_smem[tid] = 0.0
 
     # Tile 0's q_scale staging: the loop below only stages tile nt+1 during
     # iteration nt, so the first tile's buffer must be filled here (published
     # by the pre-loop named_barrier).
-    if nt_start * N_TOKENS + Int(tid) // num_heads < seq_len:
+    if tok_base + Int(tid) // num_heads < seq_len:
         qs_smem[tid] = q_s[
-            start_of_seq + nt_start * N_TOKENS + Int(tid) // num_heads,
+            start_of_seq + tok_base + Int(tid) // num_heads,
             Int(tid) % num_heads,
         ][0]
     else:
@@ -429,7 +466,7 @@ def _fp8_index_body[
     # publishes the cross-thread q_scale staging and keeps its buffers exactly
     # one tile deep.
     for it in range(n_local):
-        var tok0 = (nt_start + it) * N_TOKENS
+        var tok0 = tok_base + it * N_TOKENS
         var q_buf = it & 1
         var q_next = 1 - q_buf
         var has_next = it + 1 < n_local
@@ -437,7 +474,7 @@ def _fp8_index_body[
         if has_next and tid == 0:
             var q_row0 = (start_of_seq + tok0 + N_TOKENS) * num_heads
             var q_dst = TileTensor[
-                dtype, type_of(q_flat_layout), address_space=AddressSpace.SHARED
+                dtype, type_of(q_flat_layout), address_space=.SHARED
             ](q1_smem if q_next == 1 else q_smem, q_flat_layout)
             q_mbar[q_next].expect_bytes(Int32(q_bytes))
             q_tma.async_copy_3d(q_dst, q_mbar[q_next], (0, 0, q_row0))
@@ -540,11 +577,11 @@ def _fp8_index_body[
                         # on the non-causal path from codegen alone.
                         var key_bound = (
                             num_keys - (seq_len - 1 - tok_local) * causal
-                        )
-                        if key_local < key_bound and tok_local < seq_len:
-                            var global_token = start_of_seq + tok_local
+                        ) // kpool
+                        if key_local < key_bound and tok_local < tok_hi:
+                            var out_row = out_row0 + tok_local
                             output.raw_store(
-                                global_token * max_num_keys + key_local,
+                                out_row * max_num_keys + key_local,
                                 k_scale * (acc[0] + acc[1]),
                             )
                         acc = SIMD[AT, 2](0)
@@ -579,16 +616,23 @@ def _fp8_index_score_kernel_sm100[
     BM_key: Int,
     N_TOKENS: Int,
     _is_cache_length_accurate: Bool,
+    kpool: Int = 1,
+    *,
+    VLEngine: TensorEngine = DefaultEngine[element_width=1],
+    QSEngine: TensorEngine = DefaultEngine[element_width=1],
+    OutEngine: TensorEngine = DefaultEngine[element_width=1],
 ](
     q_tma: QTMATileT[dtype, N_TOKENS * num_heads, depth],
     k_tma: KTMATileT[dtype, BM_key, depth],
     k_operand: KOperand,
     ks_operand: KSOperand,
-    valid_length: TileTensor[DType.uint32, VLLT, ImmutAnyOrigin],
-    q_s: TileTensor[DType.float32, QSLT, ImmutAnyOrigin],
-    output: TileTensor[DType.float32, OutLT, MutAnyOrigin],
+    valid_length: TileTensor[.uint32, VLLT, ImmutAnyOrigin, Engine=VLEngine],
+    q_s: TileTensor[.float32, QSLT, ImmutAnyOrigin, Engine=QSEngine],
+    output: TileTensor[.float32, OutLT, MutAnyOrigin, Engine=OutEngine],
     max_num_keys_dev: Int32,
     causal_dev: Int32,
+    out_row_begin_dev: Int32,
+    out_row_end_dev: Int32,
 ):
     var max_num_keys = Int(max_num_keys_dev)
     var causal = Int(causal_dev)
@@ -599,14 +643,22 @@ def _fp8_index_score_kernel_sm100[
     var num_keys = Int(k_operand.cache_length(b))
     comptime if not _is_cache_length_accurate:
         num_keys += seq_len
+    var num_rows = num_keys // kpool
+
+    # Tokens this entry contributes to the caller's row window (see the body).
+    var out_row_begin = Int(out_row_begin_dev)
+    var out_row_end = Int(out_row_end_dev)
+    var win_tokens = min(seq_len, out_row_end - start_of_seq) - max(
+        0, out_row_begin - start_of_seq
+    )
 
     # Bail uniformly (every thread) before the helper's first collective op
     # (TMA mbar / tcgen05 alloc); a divergent early return would deadlock them.
     # OOB keys keep the caller's `-inf` fill.
-    if key_start >= num_keys or seq_len <= 0:
+    if key_start >= num_rows or win_tokens <= 0:
         return
 
-    # Flat launch covers every token tile of this sequence (grid.z == 1).
+    # Flat launch covers every windowed token tile of this sequence (grid.z == 1).
     _fp8_index_body[
         dtype,
         KOperand,
@@ -619,6 +671,10 @@ def _fp8_index_score_kernel_sm100[
         BM_key,
         N_TOKENS,
         _is_cache_length_accurate,
+        kpool,
+        VLEngine=VLEngine,
+        QSEngine=QSEngine,
+        OutEngine=OutEngine,
     ](
         q_tma,
         k_tma,
@@ -630,7 +686,9 @@ def _fp8_index_score_kernel_sm100[
         max_num_keys,
         causal,
         0,
-        ceildiv(seq_len, N_TOKENS),
+        ceildiv(win_tokens, N_TOKENS),
+        out_row_begin,
+        out_row_end,
     )
 
 
@@ -652,16 +710,23 @@ def _fp8_index_score_kernel_sm100_split[
     BM_key: Int,
     N_TOKENS: Int,
     _is_cache_length_accurate: Bool,
+    kpool: Int = 1,
+    *,
+    VLEngine: TensorEngine = DefaultEngine[element_width=1],
+    QSEngine: TensorEngine = DefaultEngine[element_width=1],
+    OutEngine: TensorEngine = DefaultEngine[element_width=1],
 ](
     q_tma: QTMATileT[dtype, N_TOKENS * num_heads, depth],
     k_tma: KTMATileT[dtype, BM_key, depth],
     k_operand: KOperand,
     ks_operand: KSOperand,
-    valid_length: TileTensor[DType.uint32, VLLT, ImmutAnyOrigin],
-    q_s: TileTensor[DType.float32, QSLT, ImmutAnyOrigin],
-    output: TileTensor[DType.float32, OutLT, MutAnyOrigin],
+    valid_length: TileTensor[.uint32, VLLT, ImmutAnyOrigin, Engine=VLEngine],
+    q_s: TileTensor[.float32, QSLT, ImmutAnyOrigin, Engine=QSEngine],
+    output: TileTensor[.float32, OutLT, MutAnyOrigin, Engine=OutEngine],
     max_num_keys_dev: Int32,
     causal_dev: Int32,
+    out_row_begin_dev: Int32,
+    out_row_end_dev: Int32,
 ):
     var max_num_keys = Int(max_num_keys_dev)
     var causal = Int(causal_dev)
@@ -672,17 +737,25 @@ def _fp8_index_score_kernel_sm100_split[
     var num_keys = Int(k_operand.cache_length(b))
     comptime if not _is_cache_length_accurate:
         num_keys += seq_len
+    var num_rows = num_keys // kpool
 
-    # grid.z splits this sequence's token tiles across CTAs; bounds are
+    # Tokens this entry contributes to the caller's row window (see the body).
+    var out_row_begin = Int(out_row_begin_dev)
+    var out_row_end = Int(out_row_end_dev)
+    var win_tokens = min(seq_len, out_row_end - start_of_seq) - max(
+        0, out_row_begin - start_of_seq
+    )
+
+    # grid.z splits this sequence's windowed token tiles across CTAs; bounds are
     # uniform per CTA.
-    var n_token_tiles = ceildiv(seq_len, N_TOKENS)
+    var n_token_tiles = ceildiv(win_tokens, N_TOKENS)
     var tiles_per_slice = ceildiv(n_token_tiles, Int(grid_dim.z))
     var nt_start = Int(block_idx.z) * tiles_per_slice
 
     # Bail uniformly (every thread) before the helper's first collective op
     # (TMA mbar / tcgen05 alloc); a divergent early return would deadlock them.
     # OOB keys keep the caller's `-inf` fill.
-    if key_start >= num_keys or seq_len <= 0 or nt_start >= n_token_tiles:
+    if key_start >= num_rows or win_tokens <= 0 or nt_start >= n_token_tiles:
         return
     var n_local = min(tiles_per_slice, n_token_tiles - nt_start)
 
@@ -698,6 +771,10 @@ def _fp8_index_score_kernel_sm100_split[
         BM_key,
         N_TOKENS,
         _is_cache_length_accurate,
+        kpool,
+        VLEngine=VLEngine,
+        QSEngine=QSEngine,
+        OutEngine=OutEngine,
     ](
         q_tma,
         k_tma,
@@ -710,6 +787,8 @@ def _fp8_index_score_kernel_sm100_split[
         causal,
         nt_start,
         n_local,
+        out_row_begin,
+        out_row_end,
     )
 
 
@@ -722,18 +801,20 @@ def fp8_index_score_sm100[
     depth: Int,
     _is_cache_length_accurate: Bool,
     N_TOKENS_ALT: Int = 0,
+    kpool: Int = 1,
 ](
-    output: TileTensor[DType.float32, ...],
+    output: TileTensor[.float32, ...],
     q: TileTensor[mut=False, dtype, ...],
-    q_s: TileTensor[mut=False, DType.float32, ...],
+    q_s: TileTensor[mut=False, .float32, ...],
     k_operand: KOperand,
     ks_operand: KSOperand,
-    valid_length: TileTensor[mut=False, DType.uint32, ...],
+    valid_length: TileTensor[mut=False, .uint32, ...],
     batch_size: Int,
     max_seq_len: Int,
     max_num_keys: Int,
     causal: Bool,
     ctx: DeviceContext,
+    out_row_begin: Int = 0,
 ) raises:
     """Launch the SM100 tensor-core FP8 indexer scorer into `output`.
 
@@ -759,6 +840,10 @@ def fp8_index_score_sm100[
             Silently inert at head counts and sequence lengths where any of that
             fails, so one constant is safe across TP ranks. Intended value: the
             speculative decode width (`num_draft_tokens + 1`) or a divisor of it.
+        kpool: Tokens per pooled cache row. `1` scores one row per token;
+            `k > 1` scores one pooled key per `k` consecutive tokens, so
+            every candidate count and the caller's `top_k` are
+            pool-granular.
 
     Args:
         output: Score buffer `[total_seq, max_num_keys]`, f32.
@@ -776,6 +861,12 @@ def fp8_index_score_sm100[
             sees keys up to cache_len + t); forbidden slots are never
             written, and the bounded top-k never reads them.
         ctx: Device context.
+        out_row_begin: Global token row that `output` row 0 holds. `output`
+            covers `[out_row_begin, out_row_begin + output.dim[0]())`, so a
+            caller that cannot afford the whole `total_seq x max_num_keys`
+            matrix scores it a row-window at a time. The default covers every
+            row, and every quantity the window touches then reduces to its
+            unwindowed form.
     """
     # The N-tile packs N_TOKENS = 128 // num_heads whole query tokens, so any
     # divisor of 128 is structurally admissible; the gate lists the validated
@@ -803,6 +894,12 @@ def fp8_index_score_sm100[
     )
     comptime MMA_N = 128
     comptime N_TOKENS = MMA_N // num_heads
+
+    # Rows of the score matrix this launch fills, and the global window they map
+    # to. Grid sizing below uses the window; ROUTING deliberately does not, so
+    # chunking a batch cannot silently move it to a different kernel.
+    var out_rows = Int(output.dim[0]())
+    var win_seq_len = min(max_seq_len, out_rows)
 
     var total_q_rows = Int(q.dim[0]()) * num_heads
     var q_tma_tile = create_split_tma[
@@ -834,16 +931,25 @@ def fp8_index_score_sm100[
     # prefix or a NULL mask regressed it). The penalty is per-CTA occupancy, not grid
     # underfill.
     #
-    # TODO(cme): the kernel now targets 2 CTAs/SM, halving that deficit, so BOTH
-    # thresholds are stale in the conservative direction -- re-measure them. Left as-is
-    # so a routing change cannot be confused with the kernel change. nh in {4, 8}
+    # TODO(cme): the kernel now targets 2 CTAs/SM, halving that deficit, so the nh=64
+    # threshold is stale in the conservative direction -- re-measure it. nh in {4, 8}
     # reach only the key-split arm below.
+    #
+    # At nh=32 the thresholds are gone entirely: `UNIFY` sends every shape to the
+    # warp-specialized kernel. What they excluded was not a slow corner but a hole --
+    # `max_num_keys <= max_seq_len` is false the moment a request has any cached
+    # prefix, so every chunked-prefill continuation fell to the scorer, which is
+    # 1.37-2.00x slower there, and the 448-tile floor sent 256/512/1024-token chunks
+    # the same way at 1.25x. The two shapes the scorer still wins are a 3-token tail
+    # over a shallow cache (~1.1x on a ~6 us call) and shallow-cache decode (a wash);
+    # neither justifies keeping a second kernel family alive.
+    comptime UNIFY = num_heads == 32
     comptime if (
         num_heads == 64 or num_heads == 32 or num_heads == 8 or num_heads == 4
     ):
         var token_tiles = ceildiv(max_seq_len, N_TOKENS)
-        var to_prefill = False
-        comptime if num_heads == 64 or num_heads == 32:
+        var to_prefill = UNIFY
+        comptime if num_heads == 64:
             comptime min_tiles = (
                 _PREFILL_MIN_TOKEN_TILES if num_heads
                 == 64 else _PREFILL_MIN_TOKEN_TILES_NH32
@@ -861,9 +967,8 @@ def fp8_index_score_sm100[
         # CTAs for a batch-8 GLM MTP step at 107K keys. Deliberately NOT gated
         # on `causal`: `fp8_index` hard-codes it to False, so a causal gate
         # would leave the benchmark measuring the route it is meant to replace.
-        to_prefill = to_prefill or (
-            token_tiles <= _KEYSPLIT_MAX_TOKEN_TILES
-            and ceildiv(max_num_keys, BM_key) >= _KEYSPLIT_MIN_KEY_TILES
+        to_prefill = to_prefill or _is_keysplit_shape[num_heads, BM_key](
+            max_seq_len, max_num_keys
         )
         if to_prefill:
             # Optional alternate N-tile, taken when it divides the run and the default
@@ -877,9 +982,22 @@ def fp8_index_score_sm100[
             # `_S_TMEM_STAGES * align_up(MMA_N, 32)` rounded up to a power of two is
             # what buys or loses the second co-resident CTA: 6 tokens at nh=32 needs
             # 384 -> 512 columns and drops to 1 CTA/SM, while 3 tokens needs 192 -> 256
-            # and keeps 2. The 6-token tile was measured a WASH in cycles, because
-            # halving the consumer warps per SM cost what the work cut saved. See
+            # and keeps 2. This arm therefore stays on the 2-CTA/SM side. See
             # `_ctas_per_sm` in the prefill file.
+            #
+            # A 192-column WIDE tile covering the whole 6-token step used to claim
+            # this width ahead of here, buying tile exactness with residency and
+            # handing the consumer warps back through a second warpgroup. Measured
+            # against it on B200, min over 5 reps x 3 processes: the 96-column
+            # divisor is faster on every decode cell that moves, 1.07x at (b8, 32K
+            # keys) to 1.28x at (b32, 8K), geomean 1.17x over those five and 1.12x
+            # over all seven. Two things it wins that the wide tile could not: the
+            # second co-resident CTA, and the q-scale hoist, which keys on the
+            # column count and so fits at 96 -- worth 48 `ld.shared` per key tile
+            # per thread, 8.8% of the wide tile's loop body. Streaming the key range
+            # twice, once per 3-token block, costs nothing measurable: `grid_dim` is
+            # (batch, token_block, key_part), so an entry's two blocks land in the
+            # same key-part slab and share L2.
             #
             # The hint is a TOKEN count, so one caller-side constant reaches every head
             # count and is inert where it cannot apply: 3 is 24 columns at nh=8, not a
@@ -940,6 +1058,10 @@ def fp8_index_score_sm100[
                         BM_key,
                         N_ALT,
                         _is_cache_length_accurate,
+                        kpool,
+                        VLEngine=type_of(valid_length.as_immut()).Engine,
+                        QSEngine=q_s.Engine,
+                        OutEngine=output.Engine,
                     ](
                         rebind[QTMATileT[dtype, MMA_N_ALT, depth]](q_tma_alt),
                         rebind[KTMATileT[dtype, BM_key, depth]](k_tma_tile),
@@ -953,6 +1075,7 @@ def fp8_index_score_sm100[
                         max_num_keys,
                         Int(causal),
                         ctx,
+                        out_row_begin,
                     )
                     return
             fp8_index_score_sm100_prefill[
@@ -964,6 +1087,10 @@ def fp8_index_score_sm100[
                 BM_key,
                 N_TOKENS,
                 _is_cache_length_accurate,
+                kpool,
+                VLEngine=type_of(valid_length.as_immut()).Engine,
+                QSEngine=q_s.Engine,
+                OutEngine=output.Engine,
             ](
                 rebind[QTMATileT[dtype, N_TOKENS * num_heads, depth]](
                     q_tma_tile
@@ -979,96 +1106,123 @@ def fp8_index_score_sm100[
                 max_num_keys,
                 Int(causal),
                 ctx,
+                out_row_begin,
             )
             return
 
-    comptime kernel_flat = _fp8_index_score_kernel_sm100[
-        dtype,
-        KOperand,
-        KSOperand,
-        type_of(valid_length.as_immut()).LayoutType,
-        type_of(q_s).LayoutType,
-        type_of(output).LayoutType,
-        num_heads,
-        depth,
-        BM_key,
-        N_TOKENS,
-        _is_cache_length_accurate,
-    ]
-    comptime kernel_split = _fp8_index_score_kernel_sm100_split[
-        dtype,
-        KOperand,
-        KSOperand,
-        type_of(valid_length.as_immut()).LayoutType,
-        type_of(q_s).LayoutType,
-        type_of(output).LayoutType,
-        num_heads,
-        depth,
-        BM_key,
-        N_TOKENS,
-        _is_cache_length_accurate,
-    ]
+    # The K-resident scorer, and the token-slice split that feeds it. Guarded
+    # rather than merely unreachable: dead straight-line code still instantiates
+    # its kernels, so without this `comptime if` a unified nh=32 build would
+    # keep compiling two kernel families it can never launch. With it, "the
+    # scorer never runs for GLM-5.2" is checkable from the emitted blob set.
+    comptime if not UNIFY:
+        comptime kernel_flat = _fp8_index_score_kernel_sm100[
+            dtype,
+            KOperand,
+            KSOperand,
+            type_of(valid_length.as_immut()).LayoutType,
+            type_of(q_s).LayoutType,
+            type_of(output).LayoutType,
+            num_heads,
+            depth,
+            BM_key,
+            N_TOKENS,
+            _is_cache_length_accurate,
+            kpool,
+            VLEngine=type_of(valid_length.as_immut()).Engine,
+            QSEngine=q_s.Engine,
+            OutEngine=output.Engine,
+        ]
+        comptime kernel_split = _fp8_index_score_kernel_sm100_split[
+            dtype,
+            KOperand,
+            KSOperand,
+            type_of(valid_length.as_immut()).LayoutType,
+            type_of(q_s).LayoutType,
+            type_of(output).LayoutType,
+            num_heads,
+            depth,
+            BM_key,
+            N_TOKENS,
+            _is_cache_length_accurate,
+            kpool,
+            VLEngine=type_of(valid_length.as_immut()).Engine,
+            QSEngine=q_s.Engine,
+            OutEngine=output.Engine,
+        ]
 
-    comptime q1_offset = _Q1SmemOffset[dtype, BM_key, MMA_N, depth]
-    comptime smem_bytes = q1_offset + MMA_N * depth * size_of[Scalar[dtype]]()
-    var smem_bytes_rt = q1_offset if max_seq_len <= N_TOKENS else smem_bytes
+        comptime q1_offset = _Q1SmemOffset[dtype, BM_key, MMA_N, depth]
+        comptime smem_bytes = q1_offset + MMA_N * depth * size_of[
+            Scalar[dtype]
+        ]()
+        var smem_bytes_rt = q1_offset if win_seq_len <= N_TOKENS else smem_bytes
 
-    # Split each sequence's token tiles over grid.z only when the key-tile
-    # grid leaves SMs idle (batch-1 prefill at 2K keys is 32 CTAs on ~148
-    # SMs), targeting `_SLICE_CTAS_PER_SM` CTAs per SM. Slices re-stage the
-    # (L2-hot) K tile and halve the per-slice pipeline depth, so a grid already
-    # at one wave never splits (a 256-CTA GLM MTP-decode shape measured -29%
-    # when split), and a slice never gets fewer than `_SLICE_MIN_TOKEN_TILES`.
-    #
-    # The fill arm FLOORS, for the same reason as the prefill kernel's twin
-    # (`sparse_index_fp8_sm100_prefill.mojo`): it wants the largest slice count
-    # whose grid still fits the target, and `ceildiv` overshoots it by
-    # construction, buying a second wave that carries a handful of CTAs.
-    comptime sm_count = ctx.default_device_info.sm_count
-    var base_ctas = batch_size * ceildiv(max_num_keys, BM_key)
-    var num_slices = 1
-    if base_ctas < sm_count:
-        num_slices = max(
-            1,
-            min(
-                (_SLICE_CTAS_PER_SM * sm_count) // base_ctas,
-                ceildiv(ceildiv(max_seq_len, N_TOKENS), _SLICE_MIN_TOKEN_TILES),
-            ),
-        )
+        # Split each sequence's token tiles over grid.z only when the key-tile
+        # grid leaves SMs idle (batch-1 prefill at 2K keys is 32 CTAs on ~148
+        # SMs), targeting `_SLICE_CTAS_PER_SM` CTAs per SM. Slices re-stage the
+        # (L2-hot) K tile and halve the per-slice pipeline depth, so a grid already
+        # at one wave never splits (a 256-CTA GLM MTP-decode shape measured -29%
+        # when split), and a slice never gets fewer than `_SLICE_MIN_TOKEN_TILES`.
+        #
+        # The fill arm FLOORS, for the same reason as the prefill kernel's twin
+        # (`sparse_index_fp8_sm100_prefill.mojo`): it wants the largest slice count
+        # whose grid still fits the target, and `ceildiv` overshoots it by
+        # construction, buying a second wave that carries a handful of CTAs.
+        comptime sm_count = ctx.default_device_info.sm_count
+        var base_ctas = batch_size * ceildiv(max_num_keys, BM_key)
+        var num_slices = 1
+        if base_ctas < sm_count:
+            num_slices = max(
+                1,
+                min(
+                    (_SLICE_CTAS_PER_SM * sm_count) // base_ctas,
+                    ceildiv(
+                        ceildiv(win_seq_len, N_TOKENS), _SLICE_MIN_TOKEN_TILES
+                    ),
+                ),
+            )
 
-    if num_slices > 1:
-        ctx.enqueue_function[kernel_split](
-            rebind[QTMATileT[dtype, MMA_N, depth]](q_tma_tile),
-            rebind[KTMATileT[dtype, BM_key, depth]](k_tma_tile),
-            k_operand,
-            ks_operand,
-            valid_length.as_immut(),
-            q_s,
-            output,
-            Int32(max_num_keys),
-            Int32(causal),
-            grid_dim=(batch_size, ceildiv(max_num_keys, BM_key), num_slices),
-            block_dim=_NTHREADS,
-            shared_mem_bytes=smem_bytes_rt,
-            func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
-                UInt32(smem_bytes)
-            ),
-        )
-    else:
-        ctx.enqueue_function[kernel_flat](
-            rebind[QTMATileT[dtype, MMA_N, depth]](q_tma_tile),
-            rebind[KTMATileT[dtype, BM_key, depth]](k_tma_tile),
-            k_operand,
-            ks_operand,
-            valid_length.as_immut(),
-            q_s,
-            output,
-            Int32(max_num_keys),
-            Int32(causal),
-            grid_dim=(batch_size, ceildiv(max_num_keys, BM_key), 1),
-            block_dim=_NTHREADS,
-            shared_mem_bytes=smem_bytes_rt,
-            func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
-                UInt32(smem_bytes)
-            ),
-        )
+        if num_slices > 1:
+            ctx.enqueue_function[kernel_split](
+                rebind[QTMATileT[dtype, MMA_N, depth]](q_tma_tile),
+                rebind[KTMATileT[dtype, BM_key, depth]](k_tma_tile),
+                k_operand,
+                ks_operand,
+                valid_length.as_immut(),
+                q_s,
+                output,
+                Int32(max_num_keys),
+                Int32(causal),
+                Int32(out_row_begin),
+                Int32(out_row_begin + out_rows),
+                grid_dim=(
+                    batch_size,
+                    ceildiv(max_num_keys, BM_key),
+                    num_slices,
+                ),
+                block_dim=_NTHREADS,
+                shared_mem_bytes=smem_bytes_rt,
+                func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
+                    UInt32(smem_bytes)
+                ),
+            )
+        else:
+            ctx.enqueue_function[kernel_flat](
+                rebind[QTMATileT[dtype, MMA_N, depth]](q_tma_tile),
+                rebind[KTMATileT[dtype, BM_key, depth]](k_tma_tile),
+                k_operand,
+                ks_operand,
+                valid_length.as_immut(),
+                q_s,
+                output,
+                Int32(max_num_keys),
+                Int32(causal),
+                Int32(out_row_begin),
+                Int32(out_row_begin + out_rows),
+                grid_dim=(batch_size, ceildiv(max_num_keys, BM_key), 1),
+                block_dim=_NTHREADS,
+                shared_mem_bytes=smem_bytes_rt,
+                func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
+                    UInt32(smem_bytes)
+                ),
+            )

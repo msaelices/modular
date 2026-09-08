@@ -89,8 +89,8 @@ def matmul_naive(mut C: Matrix, A: Matrix, B: Matrix):
 
 # Perform 2D tiling on the iteration space defined by end_x and end_y
 def tile[
-    tiled_fn: Tile2DFunc, tile_x: Int, tile_y: Int
-](end_x: Int, end_y: Int):
+    tile_x: Int, tile_y: Int
+](end_x: Int, end_y: Int, tiled_fn: Some[Tile2DFunc]):
     for y in range(0, end_y, tile_y):
         for x in range(0, end_x, tile_x):
             tiled_fn[tile_x, tile_y](x, y)
@@ -109,13 +109,13 @@ def matmul_unrolled(mut C: Matrix, A: Matrix, B: Matrix):
     comptime assert N % tile_n == 0, "N must be a multiple of tile_n"
     comptime assert K % tile_k == 0, "K must be a multiple of tile_k"
 
-    @__parameter
-    def calc_row(m0: Int):
+    def calc_row(m0: Int) {mut C, imm}:
         for m in range(tile_m * m0, tile_m * m0 + tile_m):
             _ = m  # FIXME: param closures not noticing access.
 
-            @__parameter
-            def calc_tile[tile_x: Int, tile_y: Int](x: Int, y: Int):
+            def calc_tile[
+                tile_x: Int, tile_y: Int
+            ](x: Int, y: Int) {mut C, imm}:
                 comptime for _k in range(tile_y):
                     var k = _k + y
                     var A_val = A[m, k]
@@ -138,9 +138,9 @@ def matmul_unrolled(mut C: Matrix, A: Matrix, B: Matrix):
                         unroll_factor=unroll_factor,
                     ](dot)
 
-            tile[calc_tile, tile_n, tile_k](C.cols, B.rows)
+            tile[tile_n, tile_k](C.cols, B.rows, calc_tile)
 
-    sync_parallelize[calc_row](C.rows // tile_m)
+    sync_parallelize(calc_row, C.rows // tile_m)
 
 
 def matmul_tiled_layout(mut C: Matrix, A: Matrix, B: Matrix):
@@ -168,8 +168,7 @@ def matmul_tiled_layout(mut C: Matrix, A: Matrix, B: Matrix):
     comptime assert N % tile_n == 0, "N must be a multiple of tile_n"
     comptime assert K % tile_k == 0, "K must be a multiple of tile_k"
 
-    @__parameter
-    def calc_row(m_1: Int):
+    def calc_row(m_1: Int) {imm}:
         for k_1 in range(K // tile_k):
             for n_1 in range(N // tile_n):
                 var lhs_view = lhs.tile[tile_m, tile_k](m_1, k_1)
@@ -202,7 +201,7 @@ def matmul_tiled_layout(mut C: Matrix, A: Matrix, B: Matrix):
                             unroll_factor=unroll_factor,
                         ](dot)
 
-    sync_parallelize[calc_row](M // tile_m)
+    sync_parallelize(calc_row, M // tile_m)
 
 
 def matmul_tiled_layout_cache(mut C: Matrix, A: Matrix, B: Matrix):
@@ -230,8 +229,7 @@ def matmul_tiled_layout_cache(mut C: Matrix, A: Matrix, B: Matrix):
     comptime assert N % tile_n == 0, "N must be a multiple of tile_n"
     comptime assert K % tile_k == 0, "K must be a multiple of tile_k"
 
-    @__parameter
-    def calc_row(m_1: Int):
+    def calc_row(m_1: Int) {imm}:
         var rhs_cache = LayoutTensor[
             dtype, Layout.row_major(tile_k, tile_n), MutAnyOrigin
         ].stack_allocation()
@@ -268,7 +266,7 @@ def matmul_tiled_layout_cache(mut C: Matrix, A: Matrix, B: Matrix):
                             unroll_factor=unroll_factor,
                         ](dot)
 
-    sync_parallelize[calc_row](M // tile_m)
+    sync_parallelize(calc_row, M // tile_m)
 
 
 def matmul_layout_transposed(mut C: Matrix, A: Matrix, B: Matrix):
@@ -300,8 +298,7 @@ def matmul_layout_transposed(mut C: Matrix, A: Matrix, B: Matrix):
         tile_k % vec_size == 0
     ), "tile_k must be a multiple of vec_size"
 
-    @__parameter
-    def calc_row(m_1: Int):
+    def calc_row(m_1: Int) {imm}:
         var rhs_cache = LayoutTensor[
             dtype, Layout.row_major(tile_n, tile_k), MutAnyOrigin
         ].stack_allocation()
@@ -338,7 +335,7 @@ def matmul_layout_transposed(mut C: Matrix, A: Matrix, B: Matrix):
 
                         dst_view[m, n] += sum.reduce_add()
 
-    sync_parallelize[calc_row](M // tile_m)
+    sync_parallelize(calc_row, M // tile_m)
 
 
 @always_inline

@@ -59,9 +59,9 @@ struct DataType(TrivialRegisterPassable):
             DType.float8_e8m0fnu,
         ), "Unsupported dtype"
 
-        comptime if dtype == DType.float32:
+        comptime if dtype == .float32:
             return Self.FLOAT32
-        elif dtype == DType.float16:
+        elif dtype == .float16:
             return Self.FLOAT16
         elif dtype in (DType.float8_e4m3fn, DType.float8_e8m0fnu, DType.uint8):
             return Self.UINT8
@@ -228,15 +228,6 @@ struct TensorMap(ImplicitlyCopyable):
         before it can be used for tensor operations.
         """
         self.data = StaticTuple[UInt8, 128]()
-
-    @always_inline
-    def __init__(out self, *, copy: Self):
-        """Copy constructor for TensorMap.
-
-        Args:
-            copy: The TensorMap instance to copy from.
-        """
-        self.data = copy.data
 
 
 @always_inline
