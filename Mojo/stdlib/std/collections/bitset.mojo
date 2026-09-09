@@ -653,17 +653,16 @@ struct BitSet[size: Int](Boolable, Copyable, Defaultable, Sized, Writable):
             two sets.
         """
 
-        @parameter
         @always_inline
         def _xor[
             simd_width: Int
         ](
-            left: SIMD[DType.int64, simd_width],
-            right: SIMD[DType.int64, simd_width],
-        ) -> SIMD[DType.int64, simd_width]:
+            left: SIMD[.int64, simd_width],
+            right: SIMD[.int64, simd_width],
+        ) -> SIMD[.int64, simd_width]:
             return left ^ right
 
-        return Self._vectorize_apply[_xor](self, other)
+        return Self._vectorize_apply(self, other, _xor)
 
     def __or__(self, other: Self) -> Self:
         """Returns the union of `self` and `other`.
